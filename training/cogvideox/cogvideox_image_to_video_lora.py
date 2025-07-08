@@ -890,7 +890,7 @@ def main(args):
 
                 # Validation
                 should_run_validation = args.validation_prompt is not None and (
-                    args.validation_steps is not None and (global_step-1) % args.validation_steps == 0
+                    args.validation_steps is not None and (global_step) % args.validation_steps == 0
                 )
                 if should_run_validation:
                     run_validation(args, accelerator, transformer, scheduler, model_config, weight_dtype, global_step)

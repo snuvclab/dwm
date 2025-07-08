@@ -39,14 +39,13 @@ VIDEO_COLUMN="videos.txt"
 
 # Launch experiments with different hyperparameters
 
-output_dir="outputs/lab_00_naive/"
+output_dir="outputs/lab_00_b64/"
 
 cmd="accelerate launch --config_file $ACCELERATE_CONFIG_FILE --gpu_ids $GPU_IDS training/cogvideox/cogvideox_image_to_video_lora.py \
     --pretrained_model_name_or_path THUDM/CogVideoX-5b-I2V \
     --data_root $DATA_ROOT \
     --caption_column $CAPTION_COLUMN \
     --video_column $VIDEO_COLUMN \
-    --id_token BW_STYLE \
     --height_buckets 480 \
     --width_buckets 720 \
     --frame_buckets 49 \
@@ -63,7 +62,7 @@ cmd="accelerate launch --config_file $ACCELERATE_CONFIG_FILE --gpu_ids $GPU_IDS 
     --mixed_precision bf16 \
     --output_dir $output_dir \
     --max_num_frames 49 \
-    --train_batch_size 2 \
+    --train_batch_size 16 \
     --max_train_steps $MAX_TRAIN_STEPS \
     --checkpointing_steps 1000 \
     --gradient_accumulation_steps 1 \
@@ -84,6 +83,7 @@ cmd="accelerate launch --config_file $ACCELERATE_CONFIG_FILE --gpu_ids $GPU_IDS 
     --report_to wandb \
     --load_tensors \
     --nccl_timeout 1800"
+
         
 echo "Running command: $cmd"
 eval $cmd
