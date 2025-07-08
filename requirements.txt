@@ -2,6 +2,7 @@ accelerate>=1.2.1
 bitsandbytes
 coloredlogs>=15.0.1
 colorlog>=6.9.0
+deepspeed
 diffusers>=0.32.2
 easydict>=1.13
 einops>=0.8.0

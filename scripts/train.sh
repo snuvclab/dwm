@@ -18,7 +18,7 @@ export TORCH_NCCL_ENABLE_MONITORING=0
 export TOKENIZERS_PARALLELISM=true
 export OMP_NUM_THREADS=16
 
-GPU_IDS="0,1"
+GPU_IDS="4,5,6,7"
 
 # Training Configurations
 # Experiment with as many hyperparameters as you want!
@@ -28,12 +28,12 @@ OPTIMIZER="adamw"
 MAX_TRAIN_STEPS="5000"
 
 # Single GPU uncompiled training
-ACCELERATE_CONFIG_FILE="accelerate_configs/deepspeed.yaml"
+ACCELERATE_CONFIG_FILE="accelerate_configs/deepspeed_4.yaml"
 
 # Absolute path to where the data is located. Make sure to have read the README for how to prepare data.
 # This example assumes you downloaded an already prepared dataset from HF CLI as follows:
 #   huggingface-cli download --repo-type dataset Wild-Heart/Disney-VideoGeneration-Dataset --local-dir /path/to/my/datasets/disney-dataset
-DATA_ROOT="/virtual_lab/jhb_vclab/taeksoo/data/world_model/lab_00/processed"
+DATA_ROOT="/fsx/taeksoo/data/world_model/lab_00/processed"
 CAPTION_COLUMN="prompts.txt"
 VIDEO_COLUMN="videos.txt"
 
@@ -53,7 +53,7 @@ cmd="accelerate launch --config_file $ACCELERATE_CONFIG_FILE --gpu_ids $GPU_IDS 
     --dataloader_num_workers 8 \
     --pin_memory \
     --validation_prompt \"An egocentric view of a person walking around the SNUVCLAB office.:::An egocentric view of a person walking around the SNUVCLAB office.:::An egocentric view of a person walking around the SNUVCLAB office.:::An egocentric view of a person walking around the SNUVCLAB office.:::An egocentric view of a person walking around the SNUVCLAB office.:::An egocentric view of a person walking around the SNUVCLAB office.\" \
-    --validation_images \"/virtual_lab/jhb_vclab/taeksoo/data/world_model/lab_00/validation/00264.png:::/virtual_lab/jhb_vclab/taeksoo/data/world_model/lab_00/validation/00434.png:::/virtual_lab/jhb_vclab/taeksoo/data/world_model/lab_00/validation/00574.png:::/virtual_lab/jhb_vclab/taeksoo/data/world_model/lab_00/validation/00934.png:::/virtual_lab/jhb_vclab/taeksoo/data/world_model/lab_00/validation/01614.png:::/virtual_lab/jhb_vclab/taeksoo/data/world_model/lab_00/validation/02699.png\"
+    --validation_images \"/fsx/taeksoo/data/world_model/lab_00/validation/00264.png:::/fsx/taeksoo/data/world_model/lab_00/validation/00434.png:::/fsx/taeksoo/data/world_model/lab_00/validation/00574.png:::/fsx/taeksoo/data/world_model/lab_00/validation/00934.png:::/fsx/taeksoo/data/world_model/lab_00/validation/01614.png:::/fsx/taeksoo/data/world_model/lab_00/validation/02699.png\"
     --validation_prompt_separator ::: \
     --num_validation_videos 1 \
     --validation_steps 500 \
