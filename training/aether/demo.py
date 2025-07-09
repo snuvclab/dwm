@@ -2,6 +2,7 @@ import argparse
 import os
 import random
 from typing import List, Optional, Tuple
+import pickle
 
 import imageio.v3 as iio
 import numpy as np
@@ -16,13 +17,13 @@ from diffusers import (
 from transformers import AutoTokenizer, T5EncoderModel
 
 
-rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
+# rootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
-from aether.pipelines.aetherv1_pipeline_cogvideox import (  # noqa: E402
+from aetherv1_pipeline_cogvideox import (  # noqa: E402
     AetherV1PipelineCogVideoX,
     AetherV1PipelineOutput,
 )
-from aether.utils.postprocess_utils import (  # noqa: E402
+from utils.postprocess_utils import (  # noqa: E402
     align_camera_extrinsics,
     apply_transformation,
     colorize_depth,
@@ -33,7 +34,7 @@ from aether.utils.postprocess_utils import (  # noqa: E402
     project,
     raymap_to_poses,
 )
-from aether.utils.visualize_utils import predictions_to_glb  # noqa: E402
+from utils.visualize_utils import predictions_to_glb  # noqa: E402
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -493,12 +494,12 @@ def save_output(
     iio.imwrite(
         f"{filename}_rgb.mp4",
         (np.clip(rgb, 0, 1) * 255).astype(np.uint8),
-        fps=12,
+        fps=8,
     )
     iio.imwrite(
         f"{filename}_disparity.mp4",
         (colorize_depth(disparity) * 255).astype(np.uint8),
-        fps=12,
+        fps=8,
     )
 
     print("Building GLB scene")
@@ -509,6 +510,8 @@ def save_output(
             "depths": 1 / np.clip(disparity[frame_idx : frame_idx + 1], 1e-8, 1e8),
             "camera_poses": poses[frame_idx : frame_idx + 1],
         }
+        with open(f"{filename}_predictions.pkl", "wb") as f:
+            pickle.dump(predictions, f)
         scene_3d = predictions_to_glb(
             predictions,
             filter_by_frames="all",
@@ -540,6 +543,7 @@ def main() -> None:
         assert args.goal is None, "Goal is not required for reconstruction task."
 
         video = iio.imread(args.video).astype(np.float32) / 255.0
+        video = video[:49]
         image, goal = None, None
     elif args.task == "prediction":
         assert args.image is not None, "Image is required for prediction task."

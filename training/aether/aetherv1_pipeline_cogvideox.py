@@ -19,7 +19,7 @@ from diffusers.utils.torch_utils import randn_tensor
 from einops import rearrange
 from transformers import AutoTokenizer, T5EncoderModel
 
-from aether.utils.preprocess_utils import imcrop_center
+from utils.preprocess_utils import imcrop_center
 
 
 def get_3d_rotary_pos_embed(
@@ -420,8 +420,8 @@ class AetherV1PipelineCogVideoX(CogVideoXImageToVideoPipeline):
         if num_frames is None:
             raise ValueError("`num_frames` is required.")
 
-        if num_frames not in [17, 25, 33, 41]:
-            raise ValueError("`num_frames` has to be one of [17, 25, 33, 41].")
+        # if num_frames not in [17, 25, 33, 41]:
+        #     raise ValueError("`num_frames` has to be one of [17, 25, 33, 41].")
 
         if fps not in [8, 10, 12, 15, 24]:
             raise ValueError("`fps` has to be one of [8, 10, 12, 15, 24].")
