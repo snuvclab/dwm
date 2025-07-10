@@ -420,13 +420,14 @@ def blend_and_merge_window_results(
             ]
         )
 
-    return merged_rgb, merged_disparity, merged_poses, pointmaps
+    return merged_rgb, merged_disparity, merged_poses, pointmaps, intrinsics
 
 
 def save_output(
     rgb: np.ndarray,
     disparity: np.ndarray,
     poses: Optional[np.ndarray] = None,
+    intrinsics: Optional[List[np.ndarray]] = None,
     raymap: Optional[np.ndarray] = None,
     pointmap: Optional[np.ndarray] = None,
     args: argparse.Namespace = None,
@@ -441,7 +442,7 @@ def save_output(
         )
         window_results = [window_result]
         window_indices = [0]
-        _, _, poses_from_blend, pointmap = blend_and_merge_window_results(
+        _, _, poses_from_blend, pointmap, intrinsics = blend_and_merge_window_results(
             window_results, window_indices, args
         )
 
@@ -451,36 +452,36 @@ def save_output(
 
     if poses is None:
         assert raymap is not None, "Raymap is required for saving poses."
-        poses, _, _ = raymap_to_poses(raymap, ray_o_scale_inv=0.1)
+        poses, fov_x, fov_y = raymap_to_poses(raymap, ray_o_scale_inv=0.1)
 
-    # Fix the problem of point cloud being upside down and left-right reversed
-    # Flip Y axis and X axis for both pointmap and camera poses
-    flipped_pointmap = pointmap.copy()
-    flipped_pointmap[..., 1] = -flipped_pointmap[..., 1]  # flip Y axis (up and down)
-    flipped_pointmap[..., 0] = -flipped_pointmap[..., 0]  # flip X axis (left and right)
+    # # Fix the problem of point cloud being upside down and left-right reversed
+    # # Flip Y axis and X axis for both pointmap and camera poses
+    # flipped_pointmap = pointmap.copy()
+    # flipped_pointmap[..., 1] = -flipped_pointmap[..., 1]  # flip Y axis (up and down)
+    # flipped_pointmap[..., 0] = -flipped_pointmap[..., 0]  # flip X axis (left and right)
 
-    # Flip camera poses
-    flipped_poses = poses.copy()
-    # Flip Y axis and X axis of camera orientation
-    flipped_poses[..., 1, :3] = -flipped_poses[
-        ..., 1, :3
-    ]  # flip Y axis of camera orientation
-    flipped_poses[..., 0, :3] = -flipped_poses[
-        ..., 0, :3
-    ]  # flip X axis of camera orientation
-    flipped_poses[..., :3, 1] = -flipped_poses[
-        ..., :3, 1
-    ]  # flip Y axis of camera orientation
-    flipped_poses[..., :3, 0] = -flipped_poses[
-        ..., :3, 0
-    ]  # flip X axis of camera orientation
-    # Flip Y axis and X axis of camera position
-    flipped_poses[..., 1, 3] = -flipped_poses[..., 1, 3]  # flip Y axis position
-    flipped_poses[..., 0, 3] = -flipped_poses[..., 0, 3]  # flip X axis position
+    # # Flip camera poses
+    # flipped_poses = poses.copy()
+    # # Flip Y axis and X axis of camera orientation
+    # flipped_poses[..., 1, :3] = -flipped_poses[
+    #     ..., 1, :3
+    # ]  # flip Y axis of camera orientation
+    # flipped_poses[..., 0, :3] = -flipped_poses[
+    #     ..., 0, :3
+    # ]  # flip X axis of camera orientation
+    # flipped_poses[..., :3, 1] = -flipped_poses[
+    #     ..., :3, 1
+    # ]  # flip Y axis of camera orientation
+    # flipped_poses[..., :3, 0] = -flipped_poses[
+    #     ..., :3, 0
+    # ]  # flip X axis of camera orientation
+    # # Flip Y axis and X axis of camera position
+    # flipped_poses[..., 1, 3] = -flipped_poses[..., 1, 3]  # flip Y axis position
+    # flipped_poses[..., 0, 3] = -flipped_poses[..., 0, 3]  # flip X axis position
 
-    # Use the flipped versions for output
-    pointmap = flipped_pointmap
-    poses = flipped_poses
+    # # Use the flipped versions for output
+    # pointmap = flipped_pointmap
+    # poses = flipped_poses
 
     if args.task == "reconstruction":
         filename = f"reconstruction_{args.video.split('/')[-1].split('.')[0]}"
@@ -509,18 +510,19 @@ def save_output(
             "images": rgb[frame_idx : frame_idx + 1],
             "depths": 1 / np.clip(disparity[frame_idx : frame_idx + 1], 1e-8, 1e8),
             "camera_poses": poses[frame_idx : frame_idx + 1],
+            "intrinsics": intrinsics[frame_idx]
         }
-        with open(f"{filename}_predictions.pkl", "wb") as f:
+        with open(f"{filename}_predictions_{frame_idx:02d}.pkl", "wb") as f:
             pickle.dump(predictions, f)
-        scene_3d = predictions_to_glb(
-            predictions,
-            filter_by_frames="all",
-            show_cam=True,
-            max_depth=args.max_depth,
-            rtol=args.rtol,
-            frame_rel_idx=float(frame_idx) / pointmap.shape[0],
-        )
-        scene_3d.export(f"{filename}_pointcloud_frame_{frame_idx}.glb")
+        # scene_3d = predictions_to_glb(
+        #     predictions,
+        #     filter_by_frames="all",
+        #     show_cam=True,
+        #     max_depth=args.max_depth,
+        #     rtol=args.rtol,
+        #     frame_rel_idx=float(frame_idx) / pointmap.shape[0],
+        # )
+        # scene_3d.export(f"{filename}_pointcloud_frame_{frame_idx}.glb")
     print("GLB Scene built")
 
 
@@ -640,11 +642,13 @@ def main() -> None:
             merged_disparity,
             merged_poses,
             pointmaps,
+            intrinsics
         ) = blend_and_merge_window_results(window_results, window_indices, args)
         save_output(
             rgb=merged_rgb,
             disparity=merged_disparity,
             poses=merged_poses,
+            intrinsics=intrinsics,
             pointmap=pointmaps,
             args=args,
         )
