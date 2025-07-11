@@ -22,7 +22,7 @@ DTYPE=fp32
 # For Image-to-Video finetuning, make sure to pass `--save_image_latents`
 CMD_WITHOUT_PRE_ENCODING="\
   torchrun --nproc_per_node=$NUM_GPUS \
-    training/cogvideox/prepare_dataset.py \
+    training/aether/prepare_dataset.py \
       --model_id $MODEL_ID \
       --data_root $DATA_ROOT \
       --caption_column $CAPTION_COLUMN \
