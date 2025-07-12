@@ -121,7 +121,7 @@ class VideoDataset(Dataset):
             image_latents, image_goal_latents, video_latents, disparity_latents, prompt_embeds = self._preprocess_video(self.video_paths[index])
             
             name = self.video_paths[index].stem
-            raymap = np.load(self.data_root / "raymaps" / f"{name}.npy")
+            raymap = torch.load(self.data_root / "raymaps" / f"{name}.pt", map_location="cpu", weights_only=True)
 
             # This is hardcoded for now.
             # The VAE's temporal compression ratio is 4.
@@ -141,7 +141,7 @@ class VideoDataset(Dataset):
                 "image_goal": image_goal_latents,
                 "video": video_latents,
                 "disparity": disparity_latents,
-                "raymap": torch.tensor(raymap, dtype=torch.float32),
+                "raymap": raymap,
                 "video_metadata": {
                     "num_frames": num_frames,
                     "height": height,
@@ -248,7 +248,9 @@ class VideoDataset(Dataset):
         # The current path is something like: /a/b/c/d/videos/00001.mp4
         # We need to reach: /a/b/c/d/video_latents/00001.pt
         image_latents_path = path.parent.parent.joinpath("image_latents")
+        image_goal_latents_path = path.parent.parent.joinpath("image_goal_latents")
         video_latents_path = path.parent.parent.joinpath("video_latents")
+        disparity_latents_path = path.parent.parent.joinpath("disparity_latents")
         embeds_path = path.parent.parent.joinpath("prompt_embeds")
 
         if (
@@ -262,13 +264,17 @@ class VideoDataset(Dataset):
 
         if self.image_to_video:
             image_latent_filepath = image_latents_path.joinpath(pt_filename)
+            image_goal_latent_filepath = image_goal_latents_path.joinpath(pt_filename)
         video_latent_filepath = video_latents_path.joinpath(pt_filename)
+        disparity_latents_filepath = disparity_latents_path.joinpath(pt_filename)
         embeds_filepath = embeds_path.joinpath(pt_filename)
 
         if not video_latent_filepath.is_file() or not embeds_filepath.is_file():
             if self.image_to_video:
                 image_latent_filepath = image_latent_filepath.as_posix()
+                image_goal_latent_filepath = image_goal_latent_filepath.as_posix()
             video_latent_filepath = video_latent_filepath.as_posix()
+            disparity_latents_filepath = disparity_latents_filepath.as_posix()
             embeds_filepath = embeds_filepath.as_posix()
             raise ValueError(
                 f"The file {video_latent_filepath=} or {embeds_filepath=} could not be found. Please ensure that you've correctly executed `prepare_dataset.py`."
@@ -277,10 +283,16 @@ class VideoDataset(Dataset):
         images = (
             torch.load(image_latent_filepath, map_location="cpu", weights_only=True) if self.image_to_video else None
         )
+        images_goal = (
+            torch.load(image_goal_latent_filepath, map_location="cpu", weights_only=True)
+            if self.image_to_video
+            else None
+        )
         latents = torch.load(video_latent_filepath, map_location="cpu", weights_only=True)
+        disparity_latents = torch.load(disparity_latents_filepath, map_location="cpu", weights_only=True)
         embeds = torch.load(embeds_filepath, map_location="cpu", weights_only=True)
 
-        return images, latents, embeds
+        return images, images_goal, latents, disparity_latents, embeds
 
 
 class VideoDatasetWithResizing(VideoDataset):

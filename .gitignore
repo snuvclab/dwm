@@ -194,4 +194,4 @@ data/
 tmp/
 outputs/
 wandb/
-data_processing/DepthAnyVideo
+data_processing/Video-Depth-Anything
