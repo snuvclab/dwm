@@ -321,6 +321,7 @@ def serialize_artifacts(
     disparity_dir: Optional[pathlib.Path] = None,
     disparity_latents_dir: Optional[pathlib.Path] = None,
     raymap_dir: Optional[pathlib.Path] = None,
+    raymap_abs_dir: Optional[pathlib.Path] = None,
     prompts_dir: Optional[pathlib.Path] = None,
     prompt_embeds_dir: Optional[pathlib.Path] = None,
     images: Optional[torch.Tensor] = None,
@@ -332,6 +333,7 @@ def serialize_artifacts(
     disparity: Optional[torch.Tensor] = None,
     disparity_latents: Optional[torch.Tensor] = None,
     raymap: Optional[torch.Tensor] = None,
+    raymap_abs: Optional[torch.Tensor] = None,
     prompts: Optional[List[str]] = None,
     prompt_embeds: Optional[torch.Tensor] = None,
 ) -> None:
@@ -348,6 +350,7 @@ def serialize_artifacts(
         (disparity, disparity_dir, functools.partial(save_video, fps=fps), "mp4"),
         (disparity_latents, disparity_latents_dir, torch.save, "pt"),
         (raymap, raymap_dir, torch.save, "pt"),
+        (raymap_abs, raymap_abs_dir, torch.save, "pt"),
         (prompts, prompts_dir, save_prompt, "txt"),
         (prompt_embeds, prompt_embeds_dir, torch.save, "pt"),
         (metadata, videos_dir, save_metadata, "txt"),
@@ -416,6 +419,7 @@ def main():
     disparity_dir = tmp_dir.joinpath(f"disparity/{rank}")
     disparity_latents_dir = tmp_dir.joinpath(f"disparity_latents/{rank}")
     raymap_dir = tmp_dir.joinpath(f"raymaps/{rank}")
+    raymap_abs_dir = tmp_dir.joinpath(f"raymaps_abs/{rank}")
     prompts_dir = tmp_dir.joinpath(f"prompts/{rank}")
     prompt_embeds_dir = tmp_dir.joinpath(f"prompt_embeds/{rank}")
 
@@ -428,6 +432,7 @@ def main():
     disparity_dir.mkdir(parents=True, exist_ok=True)
     disparity_latents_dir.mkdir(parents=True, exist_ok=True)
     raymap_dir.mkdir(parents=True, exist_ok=True)
+    raymap_abs_dir.mkdir(parents=True, exist_ok=True)
     prompts_dir.mkdir(parents=True, exist_ok=True)
     prompt_embeds_dir.mkdir(parents=True, exist_ok=True)
 
@@ -496,12 +501,16 @@ def main():
         raymap = [x["raymap"] for x in data[0]]
         raymap = torch.stack(raymap).to(dtype=weight_dtype, non_blocking=True)
 
+        raymap_abs = [x["raymap_abs"] for x in data[0]]
+        raymap_abs = torch.stack(raymap_abs).to(dtype=weight_dtype, non_blocking=True)
+
         return {
             "images": images,
             "images_goal": images_goal,
             "videos": videos,
             "disparity": disparity,
             "raymap": raymap,
+            "raymap_abs": raymap_abs,
             "prompts": prompts,
         }
 
@@ -549,6 +558,7 @@ def main():
             video_latents = None
             disparity_latents = None
             raymap = None
+            raymap_abs = None
             prompt_embeds = None
 
             if args.save_image_latents:
@@ -607,6 +617,7 @@ def main():
                 disparity_latents = vae._encode(disparity_temp)
 
                 raymap = batch["raymap"].to(device, non_blocking=True)
+                raymap_abs = batch["raymap_abs"].to(device, non_blocking=True)
 
 
             if images is not None:
@@ -629,6 +640,7 @@ def main():
                     "disparity_dir": disparity_dir,
                     "disparity_latents_dir": disparity_latents_dir,
                     "raymap_dir": raymap_dir,
+                    "raymap_abs_dir": raymap_abs_dir,
                     "prompts_dir": prompts_dir,
                     "prompt_embeds_dir": prompt_embeds_dir,
                     "images": images,
@@ -640,6 +652,7 @@ def main():
                     "disparity": disparity,
                     "disparity_latents": disparity_latents,
                     "raymap": raymap,
+                    "raymap_abs": raymap_abs,
                     "prompts": prompts,
                     "prompt_embeds": prompt_embeds,
                 }
@@ -677,6 +690,7 @@ def main():
             ("disparity", "mp4"),
             ("disparity_latents", "pt"),
             ("raymaps", "pt"),
+            ("raymaps_abs", "pt"),
             ("prompts", "txt"),
             ("prompt_embeds", "pt"),
             ("videos", "txt"),
@@ -740,6 +754,7 @@ def main():
                     "disparity": f"disparity/{stem}.mp4",
                     "disparity_latent": f"disparity_latents/{stem}.pt",
                     "raymap": f"raymaps/{stem}.pt",
+                    "raymap_abs": f"raymaps_abs/{stem}.pt",
                     "metadata": metadata,
                 }
                 file.write(json.dumps(data) + "\n")
