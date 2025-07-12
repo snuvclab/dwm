@@ -185,7 +185,9 @@ class VideoDataset(Dataset):
             )
 
         with open(prompt_path, "r", encoding="utf-8") as file:
-            prompts = [line.strip() for line in file.readlines() if len(line.strip()) > 0]
+            # prompts = ["" for line in file.readlines() if len(line.strip()) > 0]
+            # prompts = [line.strip() for line in file.readlines() if len(line.strip()) > 0]
+            prompts = [line.strip() for line in file.readlines()]
         with open(video_path, "r", encoding="utf-8") as file:
             video_paths = [self.data_root.joinpath(line.strip()) for line in file.readlines() if len(line.strip()) > 0]
 
