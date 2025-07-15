@@ -112,13 +112,13 @@ def main():
     point_nodes: list[viser.PointCloudHandle] = []
     
     # GT camera poses
-    with open(f"/home/taeksoo/Desktop/temp/gt_pose.pkl", "rb") as f:
-        gt_pose = pickle.load(f)
+    with open(f"//media/taeksoo/HDD3/aria/WM_lab_00_data/trajectories/00038.npy", "rb") as f:
+        gt_pose = np.load(f)
 
     for i in tqdm(range(num_frames)):
-        with open(f"/home/taeksoo/Desktop/temp/prediction_car_predictions_{i:02d}.pkl", "rb") as f:
+        with open(f"/media/taeksoo/SSD1/github1/world_model/outputs/00038/prediction_00038_predictions_{i:02d}.pkl", "rb") as f:
             data = pickle.load(f)
-        frame = cv2.imread(f"/home/taeksoo/Desktop/temp/{i+1:02d}.png")
+        frame = cv2.imread(f"/media/taeksoo/SSD1/github1/world_model/outputs/00038/frames/{i+1:02d}.png")
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
         frame_nodes.append(server.scene.add_frame(f"/frames/t{i}", show_axes=False))
@@ -158,7 +158,7 @@ def main():
 
 
         # Ground truth camera poses
-        fov = gt_pose[1][i]
+        # fov = gt_pose[i]
         aspect = frame.shape[1] / frame.shape[0]
         server.scene.add_camera_frustum(
             f"/frames/t{i}/frustum_gt",
@@ -166,8 +166,8 @@ def main():
             aspect=aspect,
             scale=0.15,
             image=frame[::4, ::4],
-            wxyz=tf.SO3.from_matrix(gt_pose[0][i][:3, :3]).wxyz,
-            position=gt_pose[0][i][:3, 3],
+            wxyz=tf.SO3.from_matrix(gt_pose[i][:3, :3]).wxyz,
+            position=gt_pose[i][:3, 3],
         )
         # Add some axes.
         server.scene.add_frame(

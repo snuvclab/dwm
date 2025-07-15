@@ -1,4 +1,5 @@
 import cv2
+import imageio.v3 as iio
 import os
 from glob import glob
 import numpy as np
@@ -35,49 +36,87 @@ end_image_idx = args.end_idx  # End at
 output_size = None  # Set this if you want to resize (e.g., (720, 480))
 
 # Create output directory
+if not image_folder.exists():
+    raise FileNotFoundError(f"Image folder {image_folder} does not exist.")
 if image_folder.exists(): os.makedirs(video_output_folder, exist_ok=True)
 if disparity_folder.exists(): os.makedirs(disparity_output_folder, exist_ok=True)
 if cam_param_folder.exists(): os.makedirs(trajectory_output_folder, exist_ok=True)
 if human_pose_folder.exists(): os.makedirs(human_pose_output_folder, exist_ok=True)
 
-# Get sorted list of image paths
-image_paths = sorted(glob(os.path.join(image_folder, "*.png")))
+# Get sorted list of paths
+image_paths = sorted(image_folder.glob("*.png"))
 image_paths = image_paths[start_image_idx:end_image_idx]
-cam_param_paths = [image_path.replace("images", "cam_params").replace(".png", ".npy") for image_path in image_paths]
+
+if disparity_folder.exists():
+    disparity_paths = sorted(disparity_folder.glob("*.png"))
+    disparity_paths = disparity_paths[start_image_idx:end_image_idx]
+
+if cam_param_folder.exists():
+    cam_param_paths = sorted(cam_param_folder.glob("*.npy"))
+    cam_param_paths = cam_param_paths[start_image_idx:end_image_idx]
+
+if human_pose_folder.exists():
+    human_pose_paths = sorted(human_pose_folder.glob("*.npy"))
+    human_pose_paths = human_pose_paths[start_image_idx:end_image_idx]
+
 
 num_images = len(image_paths)
-
 # Generate clips
 clip_idx = 0
 for start_idx in tqdm(range(0, num_images - clip_length + 1, stride)):
     clip_frames = image_paths[start_idx : start_idx + clip_length]
-    clip_cam_params = cam_param_paths[start_idx : start_idx + clip_length]
+    if disparity_folder.exists():
+        clip_disparity = disparity_paths[start_idx : start_idx + clip_length]
+    if cam_param_folder.exists():
+        clip_cam_params = cam_param_paths[start_idx : start_idx + clip_length]
+    if human_pose_folder.exists():
+        clip_human_poses = human_pose_paths[start_idx : start_idx + clip_length]
 
-    # Read first frame to get video dimensions
-    frame = cv2.imread(clip_frames[0])
-    if output_size:
-        frame = cv2.resize(frame, output_size)
-    height, width = frame.shape[:2]
 
-    # Define video writer
+    # RGB video output
     out_path = os.path.join(video_output_folder, f"{clip_idx:05}.mp4")
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(out_path, fourcc, fps, (width, height))
-
+    frames = []
     for frame_path in clip_frames:
-        frame = cv2.imread(frame_path)
+        frame = iio.imread(frame_path)
         if output_size:
             frame = cv2.resize(frame, output_size)
-        out.write(frame)
-    out.release()
+        frames.append(frame)
+    iio.imwrite(
+        out_path,
+        np.stack(frames),
+        fps=fps,
+        codec='libx264'
+    )
 
-    # Save trajectory
-    cam_params = [np.load(cam_param_path) for cam_param_path in clip_cam_params]
-    T0_inv = np.linalg.inv(cam_params[0])
-    relative_trajectory = np.array([T0_inv @ T for T in cam_params]) # relative to the first frame
-    absolute_trajectory = np.array(cam_params) # absolute trajectory in world coordinates
+    # Disparity video output
+    if disparity_folder.exists():
+        out_path = os.path.join(disparity_output_folder, f"{clip_idx:05}_disparity.mp4")
+        disparity_frames = []
+        for disparity_path in clip_disparity:
+            disparity_frame = iio.imread(disparity_path)
+            if output_size:
+                disparity_frame = cv2.resize(disparity_frame, output_size)
+            disparity_frames.append(disparity_frame)
+        iio.imwrite(
+            out_path,
+            np.stack(disparity_frames),
+            fps=fps,
+            codec='libx264'
+        )
 
-    np.save(os.path.join(trajectory_output_folder, f"{clip_idx:05}.npy"), relative_trajectory)
-    np.save(os.path.join(trajectory_output_folder, f"{clip_idx:05}_abs.npy"), absolute_trajectory)
+    # Camera trajectory output
+    if cam_param_folder.exists():
+        cam_params = [np.load(cam_param_path) for cam_param_path in clip_cam_params]
+        T0_inv = np.linalg.inv(cam_params[0])
+        relative_trajectory = np.array([T0_inv @ T for T in cam_params]) # relative to the first frame
+        absolute_trajectory = np.array(cam_params) # absolute trajectory in world coordinates
+
+        np.save(os.path.join(trajectory_output_folder, f"{clip_idx:05}.npy"), relative_trajectory)
+        np.save(os.path.join(trajectory_output_folder, f"{clip_idx:05}_abs.npy"), absolute_trajectory)
+
+    # Human pose output
+    if human_pose_folder.exists():
+        human_poses = [np.load(human_pose_path) for human_pose_path in clip_human_poses]
+        np.save(os.path.join(human_pose_output_folder, f"{clip_idx:05}.npy"), human_poses)
 
     clip_idx += 1

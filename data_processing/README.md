@@ -7,10 +7,10 @@ This repository contains utilities and scripts for processing visual and motion 
 1. **Generate motion sequences**
    - Script: `python data_processing/make_sequences.py --data_root DATA_ROOT`
    - Function: Constructs video/trajectory/motion sequences from:
-     - Image frames
-     - Disparity maps
-     - Camera poses
-     - Human poses
+     - Image frames (required)
+     - Disparity maps (not required)
+     - Camera poses (not required)
+     - Human poses (not required)
 
     ```
     DATA_ROOT/
@@ -23,12 +23,15 @@ This repository contains utilities and scripts for processing visual and motion 
     ├── human_pose/
     │ └── 00000.npy
     ```
+2. **Estimate disparity if needed**
+   - Script: `python data_processing/DepthAnyVideo/run_infer.py --data_path PATH_TO_VIDEOS_FOLDER`
+   - Function: Estimate disparity from rgb videos. Need to create env using "data_processing/DepthAnyVideo/requirements.txt"
 
-2. **Convert camera pose to raymaps**
+3. **Convert camera pose to raymaps**
    - Script: `training/aether/utils/camera_pose_to_raymap.py`
    - Function: Transforms 6-DoF camera poses into per-pixel ray direction maps.
 
-3. **Encode data into latents for training**
+4. **Encode data into latents for training**
    - Script: `training/prepare_dataset.sh`
    - Function: Processes and encodes the data into latent representations for more efficient training.
 
