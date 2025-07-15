@@ -12,7 +12,8 @@ This repository contains utilities and scripts for processing visual and motion 
      - Camera poses
      - Human poses
 
-     project_root/
+    ```
+    project_root/
     ├── data_processing/
     │ └── make_sequences.py
     ├── training/
@@ -29,6 +30,7 @@ This repository contains utilities and scripts for processing visual and motion 
     │ ├── sequences/
     │ ├── raymaps/
     │ └── latents/
+    ```
 
 2. **Convert camera pose to raymaps**
    - Script: `training/aether/utils/camera_pose_to_raymap.py`
