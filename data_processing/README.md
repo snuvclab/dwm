@@ -1,4 +1,4 @@
-# Internal Codebase Overview
+# Data Processing Pipeline
 
 This repository contains utilities and scripts for processing visual and motion data to prepare it for model training.
 
@@ -6,11 +6,29 @@ This repository contains utilities and scripts for processing visual and motion 
 
 1. **Generate motion sequences**
    - Script: `data_processing/make_sequences.py`
-   - Function: Constructs motion/video/trajectory sequences from:
+   - Function: Constructs video/trajectory/motion sequences from:
      - Image frames
      - Disparity maps
      - Camera poses
      - Human poses
+
+     project_root/
+    ├── data_processing/
+    │ └── make_sequences.py
+    ├── training/
+    │ ├── prepare_dataset.sh
+    │ └── aether/
+    │ └── utils/
+    │ └── camera_pose_to_raymap.py
+    ├── data/
+    │ ├── images/
+    │ ├── disparities/
+    │ ├── camera_poses/
+    │ └── human_poses/
+    ├── output/
+    │ ├── sequences/
+    │ ├── raymaps/
+    │ └── latents/
 
 2. **Convert camera pose to raymaps**
    - Script: `training/aether/utils/camera_pose_to_raymap.py`
