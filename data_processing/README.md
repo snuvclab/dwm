@@ -55,11 +55,3 @@ This repository contains utilities and scripts for processing visual and motion 
 
 - All scripts are designed for internal use and may assume specific data formats or folder structures.
 - Please align on dependencies and environments before running any scripts.
-
-## Contact
-
-For any clarifications or setup help, please reach out via your usual comms channel.
-
----
-
-*This README is for internal collaboration purposes only.*
