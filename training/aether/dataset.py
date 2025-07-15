@@ -153,6 +153,7 @@ class VideoDataset(Dataset):
 
             name = self.video_paths[index].stem
             raymap = np.load(self.data_root / "raymaps" / f"{name}.npy")
+            raymap_abs = np.load(self.data_root / "raymaps" / f"{name}_abs.npy")
 
             return {
                 "prompt": self.id_token + self.prompts[index],
@@ -161,6 +162,7 @@ class VideoDataset(Dataset):
                 "video": video,
                 "disparity": disparity,
                 "raymap": torch.tensor(raymap, dtype=torch.float32),
+                "raymap_abs": torch.tensor(raymap_abs, dtype=torch.float32),
                 "video_metadata": {
                     "num_frames": video.shape[0],
                     "height": video.shape[2],
@@ -185,9 +187,9 @@ class VideoDataset(Dataset):
             )
 
         with open(prompt_path, "r", encoding="utf-8") as file:
-            # prompts = ["" for line in file.readlines() if len(line.strip()) > 0]
+            prompts = ["" for line in file.readlines()]
             # prompts = [line.strip() for line in file.readlines() if len(line.strip()) > 0]
-            prompts = [line.strip() for line in file.readlines()]
+            # prompts = [line.strip() for line in file.readlines()]
         with open(video_path, "r", encoding="utf-8") as file:
             video_paths = [self.data_root.joinpath(line.strip()) for line in file.readlines() if len(line.strip()) > 0]
 
