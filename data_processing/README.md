@@ -35,6 +35,7 @@ This repository contains utilities and scripts for processing visual and motion 
    - Script: `training/prepare_dataset.sh`
    - Function: Processes and encodes the data into latent representations for more efficient training.
 
+   ```
    DATA_ROOT/
     ├── videos.txt (lists videos for training videos/00000.mp4)
     ├── prompts.txt (lists prompts for training, should have equal number of lines with videos.txt)
