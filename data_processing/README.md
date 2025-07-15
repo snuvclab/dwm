@@ -2,9 +2,9 @@
 
 This repository contains utilities and scripts for processing visual and motion data to prepare it for model training.
 
-## Overview
+## Steps
 
-1. **Generate motion sequences**
+1. **Generate sequences from frames**
    - Script: `python data_processing/make_sequences.py --data_root DATA_ROOT`
    - Function: Constructs video/trajectory/motion sequences from:
      - Image frames (required)
@@ -28,8 +28,8 @@ This repository contains utilities and scripts for processing visual and motion 
    - Function: Estimate disparity from rgb videos. Need to create env using "data_processing/DepthAnyVideo/requirements.txt"
 
 3. **Convert camera pose to raymaps**
-   - Script: `training/aether/utils/camera_pose_to_raymap.py`
-   - Function: Transforms 6-DoF camera poses into per-pixel ray direction maps.
+   - Script: `python training/aether/utils/camera_pose_to_raymap.py --data_root DATA_ROOT`
+   - Function: Transforms Fx4x4 camera poses(world2cam) into Fx6xHxW raymaps. 
 
 4. **Encode data into latents for training**
    - Script: `training/prepare_dataset.sh`
