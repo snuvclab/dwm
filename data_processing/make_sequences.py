@@ -4,29 +4,44 @@ from glob import glob
 import numpy as np
 from tqdm import tqdm
 import argparse
+from pathlib import Path
 
-vrsfile = "/media/taeksoo/HDD3/aria/WM_lab_00.vrs"
+parser = argparse.ArgumentParser(description="Generate video and trajectory sequences from images and camera parameters.")
+parser.add_argument("--data_root", type=str, required=True, help="Root directory containing folders of image and camera parameter data.")
+parser.add_argument("--start_idx", type=int, default=0, help="Starting index for image sequence.")
+parser.add_argument("--end_idx", type=int, default=-1, help="Ending index for image sequence.")
+args = parser.parse_args()
 
-# Parameters
-name = vrsfile.split("/")[-1].split(".")[0]
-image_folder = f"/media/taeksoo/HDD3/aria/{name}_data/images"
-video_output_folder = f"/media/taeksoo/HDD3/aria/{name}_data/videos"
-trajectory_output_folder = f"/media/taeksoo/HDD3/aria/{name}_data/trajectories"
 
+# input folders
+image_folder = Path(args.data_root) / "images"
+disparity_folder = Path(args.data_root) / "disparity"
+cam_param_folder = Path(args.data_root) / "cam_params"
+human_pose_folder = Path(args.data_root) / "human_poses"
+
+# output folders
+output_folder = Path(args.data_root) / "sequences"
+video_output_folder = Path(output_folder) / "videos"
+disparity_output_folder = Path(output_folder) / "disparity"
+trajectory_output_folder = Path(output_folder) / "trajectory"
+human_pose_output_folder = Path(output_folder) / "human_motions"
+
+# parameters
 clip_length = 49
 stride = 10
 fps = 8
-start_image_idx = 42  # Start from the first image
-end_image_idx = 2704  # End at the 1000th image
-
+start_image_idx = args.start_idx  # Start from
+end_image_idx = args.end_idx  # End at
 output_size = None  # Set this if you want to resize (e.g., (720, 480))
 
 # Create output directory
-os.makedirs(video_output_folder, exist_ok=True)
-os.makedirs(trajectory_output_folder, exist_ok=True)
+if image_folder.exists(): os.makedirs(video_output_folder, exist_ok=True)
+if disparity_folder.exists(): os.makedirs(disparity_output_folder, exist_ok=True)
+if cam_param_folder.exists(): os.makedirs(trajectory_output_folder, exist_ok=True)
+if human_pose_folder.exists(): os.makedirs(human_pose_output_folder, exist_ok=True)
 
 # Get sorted list of image paths
-image_paths = sorted(glob(os.path.join(image_folder, "*.png")))  # or .jpg
+image_paths = sorted(glob(os.path.join(image_folder, "*.png")))
 image_paths = image_paths[start_image_idx:end_image_idx]
 cam_param_paths = [image_path.replace("images", "cam_params").replace(".png", ".npy") for image_path in image_paths]
 

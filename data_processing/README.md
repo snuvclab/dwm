@@ -5,7 +5,7 @@ This repository contains utilities and scripts for processing visual and motion 
 ## Overview
 
 1. **Generate motion sequences**
-   - Script: `data_processing/make_sequences.py`
+   - Script: `python data_processing/make_sequences.py --data_root DATA_ROOT`
    - Function: Constructs video/trajectory/motion sequences from:
      - Image frames
      - Disparity maps
@@ -13,23 +13,15 @@ This repository contains utilities and scripts for processing visual and motion 
      - Human poses
 
     ```
-    project_root/
-    ├── data_processing/
-    │ └── make_sequences.py
-    ├── training/
-    │ ├── prepare_dataset.sh
-    │ └── aether/
-    │ └── utils/
-    │ └── camera_pose_to_raymap.py
-    ├── data/
-    │ ├── images/
-    │ ├── disparities/
-    │ ├── camera_poses/
-    │ └── human_poses/
-    ├── output/
-    │ ├── sequences/
-    │ ├── raymaps/
-    │ └── latents/
+    DATA_ROOT/
+    ├── image/
+    │ └── 00000.png
+    ├── disparity/
+    │ └── 00000.png
+    ├── cam_param/
+    │ └── 00000.npy
+    ├── human_pose/
+    │ └── 00000.npy
     ```
 
 2. **Convert camera pose to raymaps**
