@@ -262,7 +262,7 @@ def run_validation(
 
     with open(args.validation_set, "r") as f:
         validation_set = f.readlines()
-    validation_set = [video.strip() for video in validation_set]
+    validation_set = [video.strip() for video in validation_set][::3]
     validation_prompts = [args.data_root + f"/prompts/{name}.txt" for name in validation_set]
     validation_images = [args.data_root + f"/images/{name}.png" for name in validation_set]
     validation_images_goal = [args.data_root + f"/images_goal/{name}.png" for name in validation_set]

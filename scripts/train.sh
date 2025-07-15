@@ -34,15 +34,16 @@ ACCELERATE_CONFIG_FILE="accelerate_configs/deepspeed_4.yaml"
 # This example assumes you downloaded an already prepared dataset from HF CLI as follows:
 #   huggingface-cli download --repo-type dataset Wild-Heart/Disney-VideoGeneration-Dataset --local-dir /path/to/my/datasets/disney-dataset
 DATA_ROOT="/fsx/taeksoo/data/world_model/lab_00/processed"
-CAPTION_COLUMN="prompts.txt"
-VIDEO_COLUMN="videos.txt"
+CAPTION_COLUMN="prompts_train.txt"
+VIDEO_COLUMN="videos_train.txt"
 
 # Launch experiments with different hyperparameters
 
-output_dir="outputs/lab_00_b64/"
+output_dir="outputs/aether_lab_00/"
 
-cmd="accelerate launch --config_file $ACCELERATE_CONFIG_FILE --gpu_ids $GPU_IDS training/cogvideox/cogvideox_image_to_video_lora.py \
-    --pretrained_model_name_or_path THUDM/CogVideoX-5b-I2V \
+cmd="accelerate launch --config_file $ACCELERATE_CONFIG_FILE --gpu_ids $GPU_IDS training/aether/aether_lora.py \
+    --pretrained_cogvideox_name_or_path THUDM/CogVideoX-5b-I2V \
+    --pretrained_aether_name_or_path AetherWorldModel/AetherV1 \
     --data_root $DATA_ROOT \
     --caption_column $CAPTION_COLUMN \
     --video_column $VIDEO_COLUMN \
@@ -51,14 +52,12 @@ cmd="accelerate launch --config_file $ACCELERATE_CONFIG_FILE --gpu_ids $GPU_IDS 
     --frame_buckets 49 \
     --dataloader_num_workers 8 \
     --pin_memory \
-    --validation_prompt \"An egocentric view of a person walking around the SNUVCLAB office.:::An egocentric view of a person walking around the SNUVCLAB office.:::An egocentric view of a person walking around the SNUVCLAB office.:::An egocentric view of a person walking around the SNUVCLAB office.:::An egocentric view of a person walking around the SNUVCLAB office.:::An egocentric view of a person walking around the SNUVCLAB office.\" \
-    --validation_images \"/fsx/taeksoo/data/world_model/lab_00/validation/00264.png:::/fsx/taeksoo/data/world_model/lab_00/validation/00434.png:::/fsx/taeksoo/data/world_model/lab_00/validation/00574.png:::/fsx/taeksoo/data/world_model/lab_00/validation/00934.png:::/fsx/taeksoo/data/world_model/lab_00/validation/01614.png:::/fsx/taeksoo/data/world_model/lab_00/validation/02699.png\"
-    --validation_prompt_separator ::: \
+    --validation_set "/fsx/taeksoo/data/world_model/lab_00/processed/videos_test.txt" \
     --num_validation_videos 1 \
     --validation_steps 500 \
     --seed 42 \
     --rank 128 \
-    --lora_alpha 64 \
+    --lora_alpha 128 \
     --mixed_precision bf16 \
     --output_dir $output_dir \
     --max_num_frames 49 \
@@ -73,7 +72,6 @@ cmd="accelerate launch --config_file $ACCELERATE_CONFIG_FILE --gpu_ids $GPU_IDS 
     --lr_num_cycles 1 \
     --enable_slicing \
     --enable_tiling \
-    --noised_image_dropout 0.05 \
     --optimizer $OPTIMIZER \
     --beta1 0.9 \
     --beta2 0.95 \
