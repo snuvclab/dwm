@@ -25,11 +25,13 @@ This repository contains utilities and scripts for processing visual and motion 
     ```
 2. **Estimate disparity if needed**
    - Script: `python data_processing/DepthAnyVideo/run_infer.py --data_path PATH_TO_VIDEOS_FOLDER`
-   - Function: Estimate disparity from rgb videos. Need to create env using "data_processing/DepthAnyVideo/requirements.txt"
+   - Function: Estimate disparity from rgb videos.
+   - Requirements: Create a new env using "data_processing/DepthAnyVideo/requirements.txt"
 
 3. **Convert camera pose to raymaps**
    - Script: `python training/aether/utils/camera_pose_to_raymap.py --data_root DATA_ROOT`
-   - Function: Transforms Fx4x4 camera trajectories (world2cam) into Fx6xHxW raymaps. Requires "Path(args.data_root) / "cam_params" / "intrinsics.npy" (3x3) to exist.
+   - Function: Transforms Fx4x4 camera trajectories (world2cam) into Fx6xHxW raymaps.
+   - Requirements: "Path(args.data_root) / "cam_params" / "intrinsics.npy" (3x3) should exist.
 
 4. **Encode data into latents for training**
    - Script: `training/prepare_dataset.sh`
