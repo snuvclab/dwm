@@ -29,11 +29,24 @@ This repository contains utilities and scripts for processing visual and motion 
 
 3. **Convert camera pose to raymaps**
    - Script: `python training/aether/utils/camera_pose_to_raymap.py --data_root DATA_ROOT`
-   - Function: Transforms Fx4x4 camera poses(world2cam) into Fx6xHxW raymaps. 
+   - Function: Transforms Fx4x4 camera trajectories (world2cam) into Fx6xHxW raymaps. Requires "Path(args.data_root) / "cam_params" / "intrinsics.npy" (3x3) to exist.
 
 4. **Encode data into latents for training**
    - Script: `training/prepare_dataset.sh`
    - Function: Processes and encodes the data into latent representations for more efficient training.
+
+   DATA_ROOT/
+    ├── videos.txt (lists videos for training videos/00000.mp4)
+    ├── prompts.txt (lists prompts for training, should have equal number of lines with videos.txt)
+    ├── videos/
+    │ └── 00000.mp4
+    ├── disparity/
+    │ └── 00000.mp4
+    ├── raymaps/
+    │ └── 00000.npy
+    ├── human_motions/
+    │ └── 00000.npy
+    ```
 
 ## Notes
 
