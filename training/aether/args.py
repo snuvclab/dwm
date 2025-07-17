@@ -351,6 +351,14 @@ def _get_training_args(parser: argparse.ArgumentParser) -> None:
             "otherwise. Please read the comments in https://github.com/a-r-r-o-w/cogvideox-factory/issues/26 to understand why."
         ),
     )
+    parser.add_argument(
+        "--use_empty_prompts",
+        action="store_true",
+        default=False,
+        help=(
+            "Whether to use empty prompts for training."
+        ),
+    )
 
 
 def _get_optimizer_args(parser: argparse.ArgumentParser) -> None:
