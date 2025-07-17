@@ -4,6 +4,7 @@ import os
 import random
 from glob import glob
 from tqdm import tqdm
+import imageio.v3 as iio
 
 from easydict import EasyDict
 import numpy as np
@@ -84,6 +85,13 @@ if "__main__" == __name__:
         default=720,  # decrease for faster inference and lower memory usage
         help="Maximum resolution for inference.",
     )
+    parser.add_argument(
+        "--output_type",
+        type=str,
+        default="mp4",
+        choices=["mp4", "npy"],
+        help="Output file type.",
+    )
 
     parser.add_argument("--seed", type=int, default=None, help="Random seed.")
 
@@ -163,7 +171,22 @@ if "__main__" == __name__:
         # }
         # with open(f"{output_dir}/{file_name}.pkl", "wb") as f:
         #     pickle.dump(out, f)
-        np.save(f"{output_dir}/{file_name}.npy", disparity)
+        if args.output_type == "mp4":
+            iio.imwrite(
+                f"{output_dir}/{file_name}.mp4",
+                (np.sqrt(disparity) * 255.0).astype(np.uint8),
+                fps=fps,
+                codec='libx264'
+            )
+        elif args.output_type == "npy":
+            np.save(f"{output_dir}/{file_name}.npy", disparity)
+        else:
+            raise ValueError(f"Unsupported output type: {args.output_type}")
+        
+
+        # disparity_mp4 = iio.imread(f"{output_dir}/{file_name}.mp4") / 255.0
+        # disparity_mp4 = disparity_mp4[:, :, :, 0]
+        # break
     
     # disparity_colored = pipe_out.disparity_colored
     # image = pipe_out.image
