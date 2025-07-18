@@ -751,6 +751,7 @@ def main(args):
         "load_tensors": args.load_tensors,
         "random_flip": args.random_flip,
         "image_to_video": True,
+        "disparity_format": args.disparity_format,
     }
     if args.video_reshape_mode is None:
         train_dataset = VideoDatasetWithResizing(**dataset_init_kwargs)

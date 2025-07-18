@@ -107,6 +107,14 @@ def _get_dataset_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Whether or not to use the pinned memory setting in pytorch dataloader.",
     )
+    parser.add_argument(
+        "--disparity_format",
+        type=str,
+        choices=["npy", "video"],
+        default="npy",
+        help="Format for disparity data: 'npy' for NPY files, 'video' for MP4 video files.",
+    )
+
 
 
 def _get_validation_args(parser: argparse.ArgumentParser) -> None:
