@@ -29,7 +29,7 @@ human_pose_output_folder = Path(output_folder) / "human_motions"
 
 # parameters
 clip_length = 49
-stride = 10
+stride = 5
 fps = 8
 start_image_idx = args.start_idx  # Start from
 end_image_idx = args.end_idx  # End at

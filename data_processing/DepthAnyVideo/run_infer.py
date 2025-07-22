@@ -179,7 +179,7 @@ if "__main__" == __name__:
                 codec='libx264'
             )
         elif args.output_type == "npy":
-            np.save(f"{output_dir}/{file_name}.npy", disparity)
+            np.save(f"{output_dir}/{file_name}.npz", disparity.astype(np.float16))
         else:
             raise ValueError(f"Unsupported output type: {args.output_type}")
         

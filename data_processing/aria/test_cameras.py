@@ -1,7 +1,7 @@
 import random
 import time
 import numpy as np
-import os
+import os, sys
 import cv2
 from tqdm import tqdm
 
@@ -11,11 +11,14 @@ import viser.transforms as tf
 import projectaria_tools.core.mps as mps
 from projectaria_tools.core.mps.utils import filter_points_from_confidence
 
+from egoallo import fncsmpl, fncsmpl_extensions
+import trimesh
+import torch
                         
 def main():
-    global_points_path = "/media/taeksoo/HDD3/aria/mps_WM_lab_00_vrs/slam/semidense_points.csv.gz"
-    data_path = "/media/taeksoo/HDD3/aria/WM_lab_00_data"
-    num_frames = 200
+    global_points_path = "/media/taeksoo/HDD3/aria/lab_01/mps_lab_01_vrs/slam/semidense_points.csv.gz"
+    data_path = "/media/taeksoo/HDD3/aria/lab_01/lab_01_data"
+    num_frames = 300
     points = mps.read_global_point_cloud(global_points_path)
 
     # filter the point cloud using thresholds on the inverse depth and distance standard deviation
@@ -80,7 +83,7 @@ def main():
         gui_prev_frame = server.gui.add_button("Prev Frame", disabled=True)
         gui_playing = server.gui.add_checkbox("Playing", False)
         gui_framerate = server.gui.add_slider(
-            "FPS", min=1, max=60, step=0.1, initial_value=30
+            "FPS", min=1, max=60, step=0.1, initial_value=10
         )
         gui_framerate_options = server.gui.add_button_group(
             "FPS options", ("10", "20", "30", "60")
@@ -129,10 +132,22 @@ def main():
     )
 
     frame_nodes: list[viser.FrameHandle] = []
+    smpl_nodes: list[viser.FrameHandle] = []
+
+    model_path = '/media/taeksoo/SSD1/github1/egoallo/data/smplh/neutral/model.npz'
+    device = "cuda"
+
+    # Create the SMPLH model
+    smplh_model = fncsmpl.SmplhModel.load(model_path).to(device)
+
+    # load parameter
+    params = np.load("/media/taeksoo/HDD3/aria/lab_01/egoallo.npz")
+
     
-    for i in tqdm(range(num_frames)):
-        j = 5 * i
+    for i in tqdm(range(0, 0+num_frames)):
+        j = 2 * i
         frame = cv2.imread(f"{data_path}/images/{j:05d}.png")
+        cv2.imwrite(f"/home/taeksoo/Desktop/temp/{i:05d}.png", frame)
 
         frame_nodes.append(server.scene.add_frame(f"/frames/t{j}", show_axes=False))
 
@@ -157,6 +172,32 @@ def main():
             f"/frames/t{j}/frustum/axes",
             axes_length=0.3,
             axes_radius=0.01,
+        )
+
+
+        # Add SMPLH mesh
+        # with shape
+        k = 1 * j
+        smplh_shape = smplh_model.with_shape(betas=torch.tensor(params['betas'][:, k, :], device=device))
+
+        local_quats = torch.cat([
+            torch.tensor(params['body_quats'][:, k, :], device=device),
+            torch.tensor(params['left_hand_quats'][:, k, :], device=device),
+            torch.tensor(params['right_hand_quats'][:, k, :], device=device),
+        ], dim=1)
+        smplh_pose = smplh_shape.with_pose(T_world_root=torch.tensor(params['Ts_world_root'][:, k, :], device=device),
+                                        local_quats=local_quats)
+        mesh = smplh_pose.lbs()
+
+        vertex_colors = np.array([180, 248, 200])
+        mesh_out = trimesh.Trimesh(vertices=mesh.verts.cpu().numpy()[0],
+                                faces=mesh.faces.cpu().numpy(),
+                                vertex_colors=np.repeat(vertex_colors[None, :], mesh.verts.shape[1], axis=0))
+        smpl_nodes.append(
+            server.scene.add_mesh_trimesh(
+                f"/frames/t{k}/smplh",
+                mesh=mesh_out,
+            )
         )
 
     

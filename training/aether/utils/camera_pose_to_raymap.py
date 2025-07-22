@@ -21,13 +21,13 @@ def main(args):
         Rt = np.load(traj)
 
         name = traj.stem.replace("_abs", "")
-        disparity = np.load(disp_dir / f"{name}.npy")
+        disparity = np.load(disp_dir / f"{name}.npz")['disparity']
         dmax = disparity.max()
 
         raymap = camera_pose_to_raymap(Rt, np.tile(K, (len(Rt), 1, 1)), ray_o_scale_factor=10.0, dmax=dmax)
-        np.save(out_dir / f"{traj.stem}.npy", raymap)
+        np.savez_compressed(out_dir / f"{traj.stem}.npz", raymap=raymap)
 
-        break
+        
         
     
 
