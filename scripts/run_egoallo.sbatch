@@ -7,8 +7,11 @@
 #SBATCH --output=out/run_egoallo_aria_%j.out
 #SBATCH --error=out/run_egoallo_aria_%j.err
 
-cmd="bash data_processing/egoallo/run_egoallo.sh /virtual_lab/jhb_vclab/world_model/data/aria/aria_digital_twins/Apartment_release_clean_seq131_M1292"
+folder="$1"
+echo "Running egoallo on folder: $folder"
 
-echo "Running command: $cmd"
-eval $cmd
-echo -ne "-------------------- Finished executing script --------------------\n\n"
+bash data_processing/egoallo/run_egoallo.sh "$folder"
+exit_code=$?
+
+echo -ne "-------------------- Finished executing SLURM job --------------------\n\n"
+exit $exit_code

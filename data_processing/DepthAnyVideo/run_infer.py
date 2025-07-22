@@ -88,7 +88,7 @@ if "__main__" == __name__:
     parser.add_argument(
         "--output_type",
         type=str,
-        default="mp4",
+        default="npy",
         choices=["mp4", "npy"],
         help="Output file type.",
     )
