@@ -196,3 +196,4 @@ outputs/
 wandb/
 data_processing/Video-Depth-Anything
 data_processing/EgoLife/EgoGPT/large-v3.pt
+data_processing/egoallo
