@@ -152,8 +152,8 @@ class VideoDataset(Dataset):
             image, image_goal, video, disparity, _ = self._preprocess_video(self.video_paths[index])
 
             name = self.video_paths[index].stem
-            raymap = np.load(self.data_root / "raymaps" / f"{name}.npy")
-            raymap_abs = np.load(self.data_root / "raymaps" / f"{name}_abs.npy")
+            raymap = np.load(self.data_root / "raymaps" / f"{name}.npz")['raymap']
+            raymap_abs = np.load(self.data_root / "raymaps" / f"{name}_abs.npz")['raymap']
 
             return {
                 "prompt": self.id_token + self.prompts[index],
@@ -239,7 +239,7 @@ class VideoDataset(Dataset):
             image = frames[:1].clone() if self.image_to_video else None
             image_goal = frames[-1:].clone() if self.image_to_video else None
 
-            disparity = np.load(self.data_root / "disparity" / f"{path.stem}.npy")
+            disparity = np.load(self.data_root / "disparity" / f"{path.stem}.npz")['disparity']
             disparity = torch.tensor(disparity, dtype=torch.float32).unsqueeze(1)  # Add batch dimension
             disparity = disparity.repeat(1, 3, 1, 1)  # Repeat across channels
 
@@ -326,7 +326,7 @@ class VideoDatasetWithResizing(VideoDataset):
             image = frames[:1].clone() if self.image_to_video else None
             image_goal = frames[-1:].clone() if self.image_to_video else None
 
-            disparity = np.load(self.data_root / "disparity" / f"{path.stem}.npy")
+            disparity = np.load(self.data_root / "disparity" / f"{path.stem}.npz")['disparity']
             disparity = torch.tensor(disparity, dtype=torch.float32).unsqueeze(1).repeat(1, 3, 1, 1)  # Add batch and channel dimensions
 
             return image, image_goal, frames, disparity, None
