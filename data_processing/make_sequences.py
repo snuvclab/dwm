@@ -6,11 +6,13 @@ import numpy as np
 from tqdm import tqdm
 import argparse
 from pathlib import Path
+import json
 
 parser = argparse.ArgumentParser(description="Generate video and trajectory sequences from images and camera parameters.")
 parser.add_argument("--data_root", type=str, required=True, help="Root directory containing folders of image and camera parameter data.")
-parser.add_argument("--start_idx", type=int, default=0, help="Starting index for image sequence.")
+parser.add_argument("--start_idx", type=int, default=1, help="Starting index for image sequence.")
 parser.add_argument("--end_idx", type=int, default=-1, help="Ending index for image sequence.")
+parser.add_argument("--stride", type=int, default=10, help="Stride for selecting frames in the sequence.")
 args = parser.parse_args()
 
 
@@ -18,7 +20,7 @@ args = parser.parse_args()
 image_folder = Path(args.data_root) / "images"
 disparity_folder = Path(args.data_root) / "disparity"
 cam_param_folder = Path(args.data_root) / "cam_params"
-human_pose_folder = Path(args.data_root) / "human_poses"
+egoallo_human_pose_file = Path(args.data_root) / "egoallo.npz"
 
 # output folders
 output_folder = Path(args.data_root) / "sequences"
@@ -29,7 +31,7 @@ human_pose_output_folder = Path(output_folder) / "human_motions"
 
 # parameters
 clip_length = 49
-stride = 5
+stride = args.stride
 fps = 8
 start_image_idx = args.start_idx  # Start from
 end_image_idx = args.end_idx  # End at
@@ -41,7 +43,18 @@ if not image_folder.exists():
 if image_folder.exists(): os.makedirs(video_output_folder, exist_ok=True)
 if disparity_folder.exists(): os.makedirs(disparity_output_folder, exist_ok=True)
 if cam_param_folder.exists(): os.makedirs(trajectory_output_folder, exist_ok=True)
-if human_pose_folder.exists(): os.makedirs(human_pose_output_folder, exist_ok=True)
+if egoallo_human_pose_file.exists(): os.makedirs(human_pose_output_folder, exist_ok=True)
+
+# save arguments to a JSON file
+with open(f"{str(output_folder)}/args.json", "w") as f:
+    args = {
+        "clip_length": clip_length,
+        "stride": stride,
+        "fps": fps,
+        "start_image_idx": start_image_idx,
+        "end_image_idx": end_image_idx,
+    }
+    json.dump(args, f, indent=4)
 
 # Get sorted list of paths
 image_paths = sorted(image_folder.glob("*.png"))
@@ -55,9 +68,15 @@ if cam_param_folder.exists():
     cam_param_paths = sorted(cam_param_folder.glob("*.npy"))
     cam_param_paths = cam_param_paths[start_image_idx:end_image_idx]
 
-if human_pose_folder.exists():
-    human_pose_paths = sorted(human_pose_folder.glob("*.npy"))
-    human_pose_paths = human_pose_paths[start_image_idx:end_image_idx]
+if egoallo_human_pose_file.exists():
+    smplh_data = np.load(egoallo_human_pose_file)
+    smplh_data = {key: smplh_data[key].astype(np.float32) for key in smplh_data.files} 
+    for key in smplh_data:
+        if key in ["Ts_world_root", "body_quats", "left_hand_quats", "right_hand_quats", "betas"]:
+            smplh_data[key] = smplh_data[key][:, start_image_idx-1:end_image_idx-1] # egoallo predicts from the second frame
+
+print(f"Total images: {len(image_paths)}")
+print(f"Total poses: {smplh_data['Ts_world_root'].shape[1] if egoallo_human_pose_file.exists() else 0}")
 
 
 num_images = len(image_paths)
@@ -69,10 +88,23 @@ for start_idx in tqdm(range(0, num_images - clip_length + 1, stride)):
         clip_disparity = disparity_paths[start_idx : start_idx + clip_length]
     if cam_param_folder.exists():
         clip_cam_params = cam_param_paths[start_idx : start_idx + clip_length]
-    if human_pose_folder.exists():
-        clip_human_poses = human_pose_paths[start_idx : start_idx + clip_length]
-
-
+    if egoallo_human_pose_file.exists():
+        clip_smplh = {}
+        for key in smplh_data:
+            if key == 'Ts_world_root':
+                clip_smplh["global_orient_quat"] = smplh_data[key][0, start_idx : start_idx + clip_length, :4] # global orientation in quaternion format Fx4
+                clip_smplh["transl"] = smplh_data[key][0, start_idx : start_idx + clip_length, 4:] # translation Fx3
+            elif key == 'body_quats':
+                clip_smplh["body_pose_quat"] = smplh_data[key][0, start_idx : start_idx + clip_length, :] # body pose in quaternion format FxN_jx4
+            elif key == 'left_hand_quats':
+                clip_smplh["left_hand_pose_quat"] = smplh_data[key][0, start_idx : start_idx + clip_length, :] # left hand pose in quaternion format FxN_jx4
+            elif key == 'right_hand_quats':
+                clip_smplh["right_hand_pose_quat"] = smplh_data[key][0, start_idx : start_idx + clip_length, :] # right hand pose in quaternion format FxN_jx4
+            elif key == 'betas':
+                clip_smplh["betas"] = smplh_data[key][0, start_idx : start_idx + clip_length, :] # shape parameters FxN_betas_smplh
+            else:
+                continue # Skip any other keys
+    
     # RGB video output
     out_path = os.path.join(video_output_folder, f"{clip_idx:05}.mp4")
     frames = []
@@ -115,8 +147,14 @@ for start_idx in tqdm(range(0, num_images - clip_length + 1, stride)):
         np.save(os.path.join(trajectory_output_folder, f"{clip_idx:05}_abs.npy"), absolute_trajectory)
 
     # Human pose output
-    if human_pose_folder.exists():
-        human_poses = [np.load(human_pose_path) for human_pose_path in clip_human_poses]
-        np.save(os.path.join(human_pose_output_folder, f"{clip_idx:05}.npy"), human_poses)
+    if egoallo_human_pose_file.exists():
+        np.savez_compressed(os.path.join(human_pose_output_folder, f"{clip_idx:05}.npz"), **clip_smplh)
 
     clip_idx += 1
+
+with open(f"{output_folder}/videos.txt", "w") as f:
+    for i in range(clip_idx):
+        f.write(f"videos/{i:05}.mp4\n")
+with open(f"{output_folder}/prompts.txt", "w") as f:
+    for i in range(clip_idx):
+        f.write(f"\n")
