@@ -41,6 +41,8 @@ class VideoDataset(Dataset):
         load_tensors: bool = False,
         random_flip: Optional[float] = None,
         image_to_video: bool = False,
+        disparity_format: str = "npy",  # "npy" or "video"
+        enable_pose_conditioning: bool = False,  # Whether to enable SMPL-X pose conditioning
     ) -> None:
         super().__init__()
 
@@ -56,6 +58,12 @@ class VideoDataset(Dataset):
         self.load_tensors = load_tensors
         self.random_flip = random_flip
         self.image_to_video = image_to_video
+        self.disparity_format = disparity_format
+        self.enable_pose_conditioning = enable_pose_conditioning
+
+        # Validate disparity format
+        if disparity_format not in ["npy", "video"]:
+            raise ValueError(f"disparity_format must be 'npy' or 'video', got {disparity_format}")
 
         self.resolutions = [
             (f, h, w) for h in self.height_buckets for w in self.width_buckets for f in self.frame_buckets
@@ -135,6 +143,9 @@ class VideoDataset(Dataset):
             height = video_latents.size(2) * 8
             width = video_latents.size(3) * 8
 
+            # Load SMPL pose parameters
+            pose_params = self._load_smpl_pose_params(name)
+
             return {
                 "prompt": prompt_embeds,
                 "image": image_latents,
@@ -142,6 +153,7 @@ class VideoDataset(Dataset):
                 "video": video_latents,
                 "disparity": disparity_latents,
                 "raymap": raymap,
+                "pose_params": pose_params,
                 "video_metadata": {
                     "num_frames": num_frames,
                     "height": height,
@@ -155,6 +167,9 @@ class VideoDataset(Dataset):
             raymap = np.load(self.data_root / "raymaps" / f"{name}.npy")
             raymap_abs = np.load(self.data_root / "raymaps" / f"{name}_abs.npy")
 
+            # Load SMPL pose parameters
+            pose_params = self._load_smpl_pose_params(name)
+
             return {
                 "prompt": self.id_token + self.prompts[index],
                 "image": image,
@@ -163,6 +178,7 @@ class VideoDataset(Dataset):
                 "disparity": disparity,
                 "raymap": torch.tensor(raymap, dtype=torch.float32),
                 "raymap_abs": torch.tensor(raymap_abs, dtype=torch.float32),
+                "pose_params": pose_params,
                 "video_metadata": {
                     "num_frames": video.shape[0],
                     "height": video.shape[2],
@@ -239,9 +255,31 @@ class VideoDataset(Dataset):
             image = frames[:1].clone() if self.image_to_video else None
             image_goal = frames[-1:].clone() if self.image_to_video else None
 
-            disparity = np.load(self.data_root / "disparity" / f"{path.stem}.npy")
-            disparity = torch.tensor(disparity, dtype=torch.float32).unsqueeze(1)  # Add batch dimension
-            disparity = disparity.repeat(1, 3, 1, 1)  # Repeat across channels
+            # Load disparity data based on format
+            if self.disparity_format == "npy":
+                disparity = np.load(self.data_root / "disparity" / f"{path.stem}.npy")
+                disparity = torch.tensor(disparity, dtype=torch.float32).unsqueeze(1)  # Add batch dimension
+                disparity = disparity.repeat(1, 3, 1, 1)  # Repeat across channels
+            else:  # video format
+                disparity_video_path = self.data_root / "disparity_video" / f"{path.stem}.mp4"
+                if not disparity_video_path.exists():
+                    raise FileNotFoundError(f"Disparity video not found: {disparity_video_path}")
+                
+                disparity_reader = decord.VideoReader(uri=disparity_video_path.as_posix())
+                disparity_num_frames = len(disparity_reader)
+                
+                # Use same frame sampling as main video
+                indices = list(range(0, disparity_num_frames, disparity_num_frames // self.max_num_frames))
+                disparity_frames = disparity_reader.get_batch(indices)
+                disparity_frames = disparity_frames[: self.max_num_frames].float()
+                disparity_frames = disparity_frames.permute(0, 3, 1, 2).contiguous()
+                
+                # Convert to grayscale if RGB and normalize
+                if disparity_frames.shape[1] == 3:
+                    disparity_frames = disparity_frames.mean(dim=1, keepdim=True)
+                
+                # Repeat single channel to 3 channels to match VAE expectations
+                disparity = disparity_frames.repeat(1, 3, 1, 1)
 
             return image, image_goal, frames, disparity, None
 
@@ -298,6 +336,34 @@ class VideoDataset(Dataset):
 
         return images, images_goal, latents, disparity_latents, embeds
 
+    def _load_smpl_pose_params(self, name: str) -> Optional[torch.Tensor]:
+        """
+        Load SMPL pose parameters for a given video name.
+        
+        Args:
+            name: Video name (e.g., "0a761819_2023-01-14@22-06-10_00000")
+            
+        Returns:
+            SMPL pose parameters as torch.Tensor with shape (1, num_frames, 63) or None if not found
+        """
+        if not self.enable_pose_conditioning:
+            return None
+
+        try:
+            # Try to load from smplx_poses directory
+            pose_file = self.data_root / "smplx_poses" / f"{name}_smplx_body.npy"
+            if pose_file.exists():
+                pose_params = np.load(pose_file)
+                # Ensure shape is (1, num_frames, 63) for SMPLX body pose
+                if pose_params.ndim == 2:
+                    pose_params = pose_params.reshape(-1, 63)
+                return torch.tensor(pose_params, dtype=torch.float32)
+            else:
+                raise FileNotFoundError(f"SMPL-X pose parameters not found for {name}")
+        except Exception as e:
+            print(f"Warning: Could not load SMPL-X pose parameters for {name}: {e}")
+            return None
+
 
 class VideoDatasetWithResizing(VideoDataset):
     def __init__(self, *args, **kwargs) -> None:
@@ -326,8 +392,33 @@ class VideoDatasetWithResizing(VideoDataset):
             image = frames[:1].clone() if self.image_to_video else None
             image_goal = frames[-1:].clone() if self.image_to_video else None
 
-            disparity = np.load(self.data_root / "disparity" / f"{path.stem}.npy")
-            disparity = torch.tensor(disparity, dtype=torch.float32).unsqueeze(1).repeat(1, 3, 1, 1)  # Add batch and channel dimensions
+            # Load disparity data based on format
+            if self.disparity_format == "npy":
+                disparity = np.load(self.data_root / "disparity" / f"{path.stem}.npy")
+                disparity = torch.tensor(disparity, dtype=torch.float32).unsqueeze(1).repeat(1, 3, 1, 1)  # Add batch and channel dimensions
+            else:  # video format
+                disparity_video_path = self.data_root / "disparity_video" / f"{path.stem}.mp4"
+                if not disparity_video_path.exists():
+                    raise FileNotFoundError(f"Disparity video not found: {disparity_video_path}")
+                
+                disparity_reader = decord.VideoReader(uri=disparity_video_path.as_posix())
+                disparity_num_frames = len(disparity_reader)
+                
+                # Use same frame sampling as main video
+                indices = list(range(0, disparity_num_frames, disparity_num_frames // nearest_frame_bucket))
+                disparity_frames = disparity_reader.get_batch(indices)
+                disparity_frames = disparity_frames[:nearest_frame_bucket].float()
+                disparity_frames = disparity_frames.permute(0, 3, 1, 2).contiguous()
+                
+                # Resize disparity frames to match video resolution
+                disparity_frames_resized = torch.stack([resize(frame, nearest_res) for frame in disparity_frames], dim=0)
+                
+                # Convert to grayscale if RGB and normalize
+                if disparity_frames_resized.shape[1] == 3:
+                    disparity_frames_resized = disparity_frames_resized.mean(dim=1, keepdim=True)
+                
+                # Repeat single channel to 3 channels to match VAE expectations
+                disparity = disparity_frames_resized.repeat(1, 3, 1, 1)
 
             return image, image_goal, frames, disparity, None
 
@@ -393,8 +484,36 @@ class VideoDatasetWithResizeAndRectangleCrop(VideoDataset):
             frames = torch.stack([self.video_transforms(frame) for frame in frames_resized], dim=0)
 
             image = frames[:1].clone() if self.image_to_video else None
+            image_goal = frames[-1:].clone() if self.image_to_video else None
 
-            return image, frames, None
+            # Load disparity data based on format
+            if self.disparity_format == "npy":
+                disparity = np.load(self.data_root / "disparity" / f"{path.stem}.npy")
+                disparity = torch.tensor(disparity, dtype=torch.float32).unsqueeze(1).repeat(1, 3, 1, 1)  # Add batch and channel dimensions
+            else:  # video format
+                disparity_video_path = self.data_root / "disparity_video" / f"{path.stem}.mp4"
+                if not disparity_video_path.exists():
+                    raise FileNotFoundError(f"Disparity video not found: {disparity_video_path}")
+                
+                disparity_reader = decord.VideoReader(uri=disparity_video_path.as_posix())
+                disparity_num_frames = len(disparity_reader)
+                
+                # Use same frame sampling as main video
+                indices = list(range(0, disparity_num_frames, disparity_num_frames // nearest_frame_bucket))
+                disparity_frames = disparity_reader.get_batch(indices)
+                disparity_frames = disparity_frames[:nearest_frame_bucket].float()
+                disparity_frames = disparity_frames.permute(0, 3, 1, 2).contiguous()
+                
+                # Resize disparity frames to match video resolution
+                disparity_frames_resized = torch.stack([resize(frame, nearest_res) for frame in disparity_frames], dim=0)
+                
+                # Convert to grayscale if RGB and normalize
+                if disparity_frames_resized.shape[1] == 3:
+                    disparity_frames_resized = disparity_frames_resized.mean(dim=1, keepdim=True)
+                
+                disparity = disparity_frames_resized
+
+            return image, image_goal, frames, disparity, None
 
     def _find_nearest_resolution(self, height, width):
         nearest_res = min(self.resolutions, key=lambda x: abs(x[1] - height) + abs(x[2] - width))
