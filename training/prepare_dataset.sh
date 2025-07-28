@@ -5,7 +5,7 @@ MODEL_ID="THUDM/CogVideoX-5b-I2V"
 NUM_GPUS=2
 
 # For more details on the expected data format, please refer to the README.
-DATA_ROOT="/virtual_lab/jhb_vclab/taeksoo/data/world_model/lab_00"  # This needs to be the path to the base directory where your videos are located.
+DATA_ROOT="/virtual_lab/jhb_vclab/world_model/data/lab_01/sequences"  # This needs to be the path to the base directory where your videos are located.
 CAPTION_COLUMN="prompts.txt"
 VIDEO_COLUMN="videos.txt"
 OUTPUT_DIR="$DATA_ROOT/processed"

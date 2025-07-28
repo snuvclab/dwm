@@ -88,7 +88,7 @@ if "__main__" == __name__:
     parser.add_argument(
         "--output_type",
         type=str,
-        default="mp4",
+        default="npy",
         choices=["mp4", "npy"],
         help="Output file type.",
     )
@@ -179,7 +179,7 @@ if "__main__" == __name__:
                 codec='libx264'
             )
         elif args.output_type == "npy":
-            np.save(f"{output_dir}/{file_name}.npy", disparity)
+            np.savez_compressed(f"{output_dir}/{file_name}.npz", disparity=disparity.astype(np.float16))
         else:
             raise ValueError(f"Unsupported output type: {args.output_type}")
         

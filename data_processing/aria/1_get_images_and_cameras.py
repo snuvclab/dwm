@@ -90,18 +90,18 @@ def read_trajectory_csv_to_dict(file_iterable_csv: str) -> TimedPoses:
 
 
 
-vrsfile = "/media/taeksoo/HDD3/aria/WM_lab_00.vrs"
+vrsfile = "/media/taeksoo/HDD3/aria/lab_01/lab_01.vrs"
 provider = data_provider.create_vrs_data_provider(vrsfile)
 stream_id = provider.get_stream_id_from_label("camera-rgb")
 
 name = vrsfile.split("/")[-1].split(".")[0]
-image_output_dir = f"/media/taeksoo/HDD3/aria/{name}_data/images"
-camera_output_dir = f"/media/taeksoo/HDD3/aria/{name}_data/cam_params"
+image_output_dir = f"/media/taeksoo/HDD3/aria/lab_01/{name}_data/images"
+camera_output_dir = f"/media/taeksoo/HDD3/aria/lab_01/{name}_data/cam_params"
 os.makedirs(image_output_dir, exist_ok=True)
 os.makedirs(camera_output_dir, exist_ok=True)
 
 num_frames = provider.get_num_data(stream_id)
-closed_loop_traj_path = f"/media/taeksoo/HDD3/aria/mps_{name}_vrs/slam/closed_loop_trajectory.csv"
+closed_loop_traj_path = f"/media/taeksoo/HDD3/aria/lab_01/mps_{name}_vrs/slam/closed_loop_trajectory.csv"
 t_world_devices = read_trajectory_csv_to_dict(closed_loop_traj_path)
 name_to_camera = get_camera_calibs(provider)
 

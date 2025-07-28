@@ -41,7 +41,7 @@ class VideoDataset(Dataset):
         load_tensors: bool = False,
         random_flip: Optional[float] = None,
         image_to_video: bool = False,
-        disparity_format: str = "npy",  # "npy" or "video"
+        disparity_format: str = "npy",  # "npy", "npz", or "video"
         enable_pose_conditioning: bool = False,  # Whether to enable SMPL-X pose conditioning
     ) -> None:
         super().__init__()
@@ -62,8 +62,8 @@ class VideoDataset(Dataset):
         self.enable_pose_conditioning = enable_pose_conditioning
 
         # Validate disparity format
-        if disparity_format not in ["npy", "video"]:
-            raise ValueError(f"disparity_format must be 'npy' or 'video', got {disparity_format}")
+        if disparity_format not in ["npy", "npz", "video"]:
+            raise ValueError(f"disparity_format must be 'npy', 'npz', or 'video', got {disparity_format}")
 
         self.resolutions = [
             (f, h, w) for h in self.height_buckets for w in self.width_buckets for f in self.frame_buckets
@@ -164,8 +164,8 @@ class VideoDataset(Dataset):
             image, image_goal, video, disparity, _ = self._preprocess_video(self.video_paths[index])
 
             name = self.video_paths[index].stem
-            raymap = np.load(self.data_root / "raymaps" / f"{name}.npy")
-            raymap_abs = np.load(self.data_root / "raymaps" / f"{name}_abs.npy")
+            raymap = np.load(self.data_root / "raymaps" / f"{name}.npz")['raymap']
+            raymap_abs = np.load(self.data_root / "raymaps" / f"{name}_abs.npz")['raymap']
 
             # Load SMPL pose parameters
             pose_params = self._load_smpl_pose_params(name)
@@ -258,6 +258,10 @@ class VideoDataset(Dataset):
             # Load disparity data based on format
             if self.disparity_format == "npy":
                 disparity = np.load(self.data_root / "disparity" / f"{path.stem}.npy")
+                disparity = torch.tensor(disparity, dtype=torch.float32).unsqueeze(1)  # Add batch dimension
+                disparity = disparity.repeat(1, 3, 1, 1)  # Repeat across channels
+            elif self.disparity_format == "npz":
+                disparity = np.load(self.data_root / "disparity" / f"{path.stem}.npz")['disparity']
                 disparity = torch.tensor(disparity, dtype=torch.float32).unsqueeze(1)  # Add batch dimension
                 disparity = disparity.repeat(1, 3, 1, 1)  # Repeat across channels
             else:  # video format
@@ -396,6 +400,9 @@ class VideoDatasetWithResizing(VideoDataset):
             if self.disparity_format == "npy":
                 disparity = np.load(self.data_root / "disparity" / f"{path.stem}.npy")
                 disparity = torch.tensor(disparity, dtype=torch.float32).unsqueeze(1).repeat(1, 3, 1, 1)  # Add batch and channel dimensions
+            elif self.disparity_format == "npz":
+                disparity = np.load(self.data_root / "disparity" / f"{path.stem}.npz")['disparity']
+                disparity = torch.tensor(disparity, dtype=torch.float32).unsqueeze(1).repeat(1, 3, 1, 1)  # Add batch and channel dimensions
             else:  # video format
                 disparity_video_path = self.data_root / "disparity_video" / f"{path.stem}.mp4"
                 if not disparity_video_path.exists():
@@ -489,6 +496,9 @@ class VideoDatasetWithResizeAndRectangleCrop(VideoDataset):
             # Load disparity data based on format
             if self.disparity_format == "npy":
                 disparity = np.load(self.data_root / "disparity" / f"{path.stem}.npy")
+                disparity = torch.tensor(disparity, dtype=torch.float32).unsqueeze(1).repeat(1, 3, 1, 1)  # Add batch and channel dimensions
+            elif self.disparity_format == "npz":
+                disparity = np.load(self.data_root / "disparity" / f"{path.stem}.npz")['disparity']
                 disparity = torch.tensor(disparity, dtype=torch.float32).unsqueeze(1).repeat(1, 3, 1, 1)  # Add batch and channel dimensions
             else:  # video format
                 disparity_video_path = self.data_root / "disparity_video" / f"{path.stem}.mp4"

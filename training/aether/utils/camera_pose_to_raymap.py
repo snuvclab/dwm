@@ -83,8 +83,18 @@ def main(args):
             args.disparity_format = "video"
             print(f"Auto-detected video format in {disp_video_dir}")
         elif disp_dir.exists():
-            args.disparity_format = "npy"
-            print(f"Auto-detected npy format in {disp_dir}")
+            # Check if npz files exist first, then npy
+            npz_files = list(disp_dir.glob("*.npz"))
+            npy_files = list(disp_dir.glob("*.npy"))
+            if npz_files:
+                args.disparity_format = "npz"
+                print(f"Auto-detected npz format in {disp_dir}")
+            elif npy_files:
+                args.disparity_format = "npy"
+                print(f"Auto-detected npy format in {disp_dir}")
+            else:
+                print(f"Error: No disparity files found in {disp_dir}")
+                return
         else:
             print(f"Error: Neither {disp_video_dir} nor {disp_dir} exist")
             return
@@ -112,13 +122,19 @@ def main(args):
                 continue
                 
         else:
-            # Handle NPY format (original behavior)
-            disparity_path = disp_dir / f"{name}.npy"
-            if not disparity_path.exists():
-                print(f"Warning: Disparity file {disparity_path} not found, skipping...")
-                continue
-                
-            disparity = np.load(disparity_path)
+            # Handle NPY/NPZ format
+            if args.disparity_format == "npz":
+                disparity_path = disp_dir / f"{name}.npz"
+                if not disparity_path.exists():
+                    print(f"Warning: Disparity file {disparity_path} not found, skipping...")
+                    continue
+                disparity = np.load(disparity_path)['disparity']
+            else:  # npy format
+                disparity_path = disp_dir / f"{name}.npy"
+                if not disparity_path.exists():
+                    print(f"Warning: Disparity file {disparity_path} not found, skipping...")
+                    continue
+                disparity = np.load(disparity_path)
             dmax = disparity.max()
 
             # If disparity is 3D (T, H, W), extract frames
@@ -138,7 +154,7 @@ def main(args):
 
         # Generate raymap using the maximum disparity value
         raymap = camera_pose_to_raymap(Rt, np.tile(K, (len(Rt), 1, 1)), ray_o_scale_factor=10.0, dmax=dmax)
-        np.save(out_dir / f"{traj.stem}.npy", raymap)
+        np.savez_compressed(out_dir / f"{traj.stem}.npz", raymap=raymap)
 
         print(f"Generated raymap for {name} with dmax={dmax:.6f}")
 
@@ -150,8 +166,8 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Convert camera pose to raymap.")
     parser.add_argument("--data_root", type=str, required=True, help="Data root dir.")
-    parser.add_argument("--disparity_format", type=str, choices=["video", "npy", "auto"], 
-                       default="auto", help="Format of disparity data: video (MP4) or npy files")
+    parser.add_argument("--disparity_format", type=str, choices=["video", "npy", "npz", "auto"], 
+                       default="auto", help="Format of disparity data: video (MP4), npy, or npz files")
     parser.add_argument("--reverse_sqrt", action="store_true", default=True,
                        help="Whether to square disparity values to reverse sqrt operation from exr_to_disparity.py")
     parser.add_argument("--no_reverse_sqrt", action="store_true", default=False,
