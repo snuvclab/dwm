@@ -9,8 +9,8 @@ from pathlib import Path
 import argparse
 
 # === User Configuration ===
-# DEFAULT_RECORDINGS_PATH = "../nas1/public_dataset/trumans/Recordings_blend"
-DEFAULT_RECORDINGS_PATH = "./Recordings_blend"
+DEFAULT_RECORDINGS_PATH = "../../nas1/public_dataset/trumans/Recordings_blend"
+# DEFAULT_RECORDINGS_PATH = "./Recordings_blend"
 DEFAULT_SAVE_PATH = "/home/byungjun/workspace/trumans_ego/ego_render_new"
 SCRIPT_PATH = "blender_ego_rgb_depth_optimized.py"
 NUM_GPUS = 8
@@ -52,15 +52,22 @@ def signal_handler(signum, frame):
 
 
 
-def load_rendering_status_report():
+def load_rendering_status_report(report_path=None):
     """Load the rendering status report from check_rendering_status.py."""
-    report_file = "rendering_status_report.json"
+    if report_path is None:
+        report_file = "rendering_status_report.json"
+    else:
+        report_file = report_path
+    
     if os.path.exists(report_file):
         try:
             with open(report_file, 'r') as f:
                 return json.load(f)
         except Exception as e:
-            print(f"Warning: Could not load rendering status report: {e}")
+            print(f"Warning: Could not load rendering status report from {report_file}: {e}")
+    else:
+        if report_path is not None:
+            print(f"Warning: Rendering status report not found at {report_file}")
     return None
 
 def get_animation_names(blend_file):
@@ -280,6 +287,7 @@ def main():
     parser.add_argument("--force", action="store_true", help="Force re-render even if already done")
     parser.add_argument("--max-gpus", type=int, default=NUM_GPUS, help="Maximum number of GPUs to use")
     parser.add_argument("--use-status-report", action="store_true", help="Use rendering status report from check_rendering_status.py")
+    parser.add_argument("--status-report-path", type=str, help="Custom path to rendering status report JSON file")
     parser.add_argument("--partial-render", action="store_true", default=True, help="Enable partial re-rendering of failed animations (default: True)")
     parser.add_argument("--full-scene", action="store_true", help="Force full scene re-rendering instead of partial re-rendering")
     parser.add_argument("--status-only", action="store_true", help="Only show current rendering status and exit")
@@ -333,10 +341,11 @@ def main():
     
     # Load status report if requested
     status_report = None
-    if args.use_status_report:
-        status_report = load_rendering_status_report()
+    if args.use_status_report or args.status_report_path:
+        status_report = load_rendering_status_report(args.status_report_path)
         if status_report:
-            print("✓ Using rendering status report from check_rendering_status.py")
+            report_source = args.status_report_path if args.status_report_path else "check_rendering_status.py"
+            print(f"✓ Using rendering status report from {report_source}")
             print(f"  Status report contains data for {len(status_report.get('rendered_scenes_details', {}))} scenes")
             
             # Show summary from status report
@@ -374,9 +383,12 @@ def main():
             
             print(f"  This will significantly reduce Blender query overhead")
         else:
-            print("⚠️  Status report not found, falling back to basic file system check")
+            if args.status_report_path:
+                print(f"⚠️  Status report not found at {args.status_report_path}, falling back to basic file system check")
+            else:
+                print("⚠️  Status report not found, falling back to basic file system check")
     else:
-        print("ℹ️  No status report specified. Use --use-status-report for faster checking.")
+        print("ℹ️  No status report specified. Use --use-status-report or --status-report-path for faster checking.")
     
     # Check what's already rendered
     rendered_scenes = {}
@@ -385,9 +397,9 @@ def main():
     for blend_file in blend_jobs:
         blend_name = Path(blend_file).stem
         directory_name = os.path.basename(os.path.dirname(blend_file))
-        # Use blend_name for consistency with status report, but show directory_name for user-friendly output
-        scene_name = blend_name
-        display_name = directory_name  # For user-friendly display
+        # Use directory_name as scene key for consistency with status report and actual output folders
+        scene_name = directory_name
+        display_name = directory_name  # For user-friendly display (same as scene_name in this case)
         is_rendered, rendered_anims, missing_anims, all_anims = check_already_rendered(blend_file, args.save_path, status_report)
         
         if is_rendered:
@@ -496,8 +508,8 @@ def main():
                 directory_name = os.path.basename(os.path.dirname(blend_file))
                 output_path = os.path.join(args.save_path, directory_name)
                 
-                if blend_name not in rendered_scenes and blend_name not in processed_scenes:
-                    processed_scenes.add(blend_name)
+                if directory_name not in rendered_scenes and directory_name not in processed_scenes:
+                    processed_scenes.add(directory_name)
                     
                     # Check if this scene has animations
                     _, _, _, all_anims = check_already_rendered(blend_file, args.save_path, status_report)
@@ -541,7 +553,7 @@ def main():
                 print(f"   Processed scenes: {sorted(list(processed_scenes))}")
                 
                 # Find scenes that might be missing
-                all_scene_names = set(Path(f).stem for f in blend_jobs)
+                all_scene_names = set(os.path.basename(os.path.dirname(f)) for f in blend_jobs)
                 counted_scenes = set(rendered_scenes.keys()) | processed_scenes
                 missing_scenes = all_scene_names - counted_scenes
                 if missing_scenes:
@@ -593,21 +605,21 @@ def main():
             
             # First pass: count rendered animations
             for blend_file in blend_jobs:
-                blend_name = Path(blend_file).stem
-                if blend_name in rendered_scenes:
-                    total_expected += len(rendered_scenes[blend_name])
+                directory_name = os.path.basename(os.path.dirname(blend_file))
+                if directory_name in rendered_scenes:
+                    total_expected += len(rendered_scenes[directory_name])
             
             # Second pass: count actual missing animations from scenes that have animations
             actual_missing_total = 0
             for blend_file in blend_jobs:
-                blend_name = Path(blend_file).stem
-                if blend_name not in rendered_scenes:
+                directory_name = os.path.basename(os.path.dirname(blend_file))
+                if directory_name not in rendered_scenes:
                     # Force real-time Blender query instead of using status report for accuracy
                     _, _, missing_anims, all_anims = check_already_rendered(blend_file, args.save_path, None)  # Pass None to force Blender query
                     if all_anims:  # Scene has animations
                         actual_missing_total += len(missing_anims)
                         total_expected += len(all_anims)  # Add all animations (rendered + missing)
-                        if status_report and "rendered_scenes_details" in status_report and blend_name in status_report["rendered_scenes_details"]:
+                        if status_report and "rendered_scenes_details" in status_report and directory_name in status_report["rendered_scenes_details"]:
                             scenes_with_status += 1
                         else:
                             scenes_with_default += 1
@@ -640,12 +652,12 @@ def main():
             # Fallback to manual detection
             scenes_with_no_anims = []
             for blend_file in blend_jobs:
-                blend_name = Path(blend_file).stem
-                if blend_name not in rendered_scenes:
+                directory_name = os.path.basename(os.path.dirname(blend_file))
+                if directory_name not in rendered_scenes:
                     # Force real-time Blender query for accuracy
                     _, _, _, all_anims = check_already_rendered(blend_file, args.save_path, None)  # Pass None to force Blender query
                     if not all_anims:
-                        scenes_with_no_anims.append(blend_name)
+                        scenes_with_no_anims.append(directory_name)
             
             if scenes_with_no_anims:
                 print(f"Found {len(scenes_with_no_anims)} scenes with no animations:")
@@ -692,14 +704,14 @@ def main():
             scenes_with_missing_anims = 0
             
             for blend_file in blend_jobs:
-                blend_name = Path(blend_file).stem
-                if blend_name not in rendered_scenes:
+                directory_name = os.path.basename(os.path.dirname(blend_file))
+                if directory_name not in rendered_scenes:
                     # Force real-time Blender query for accuracy
                     _, _, missing_anims, all_anims = check_already_rendered(blend_file, args.save_path, None)  # Pass None to force Blender query
                     if all_anims and missing_anims:  # Scene has animations but some are missing
                         scenes_with_missing_anims += 1
                         missing_animations_total += len(missing_anims)
-                        print(f"  {blend_name}: {len(missing_anims)} missing animations")
+                        print(f"  {directory_name}: {len(missing_anims)} missing animations")
                         if len(missing_anims) <= 5:  # Show animation names if not too many
                             for anim in missing_anims:
                                 print(f"    ⚠️  {anim}")
