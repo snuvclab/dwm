@@ -189,44 +189,48 @@ def log_validation(
         disparities.append(output.disparity)
         raymaps.append(output.raymap)
 
-    for tracker in accelerator.trackers:
-        phase_name = "test" if is_final_validation else "validation"
-        if tracker.name == "wandb":
-            video_filenames = []
-            for i, video in enumerate(videos):
-                name = name.split("/")[-1].split(".")[0]
-                filename = os.path.join(args.output_dir, f"step_{step}_{phase_name}_{pipeline_args['task']}_{name}.mp4")
-                export_to_video(video, filename, fps=8)
-                video_filenames.append(filename)
+        # for tracker in accelerator.trackers:
+        #     phase_name = "test" if is_final_validation else "validation"
+        #     if tracker.name == "wandb":
+        video_filenames = []
+        for i, video in enumerate(videos):
+            name = name.split("/")[-1].split(".")[0]
+            filename = os.path.join(args.output_dir, f"step_{step}", f"{pipeline_args['task']}", f"{name}.mp4")
+            print(f"Exporting video to {filename}")
+            os.makedirs(os.path.dirname(filename), exist_ok=True)
+            export_to_video(video, filename, fps=8)
+            video_filenames.append(filename)
 
-            tracker.log(
-                {
-                    phase_name: [
-                        wandb.Video(filename, caption=f"step_{step}_{phase_name}_{pipeline_args['task']}_{name}.mp4")
-                        for i, filename in enumerate(video_filenames)
-                    ]
-                }
-            )
+        # tracker.log(
+        #     {
+        #         phase_name: [
+        #             wandb.Video(filename, caption=f"step_{step}_{phase_name}_{pipeline_args['task']}_{name}.mp4")
+        #             for i, filename in enumerate(video_filenames)
+        #         ]
+        #     }
+        # )
 
-            for i, disparity in enumerate(disparities):
-                name = name.split("/")[-1].split(".")[0]
-                filename = os.path.join(args.output_dir, f"step_{step}_{phase_name}_{pipeline_args['task']}_{name}_disp.mp4")
-                export_to_video(colorize_depth(disparity), filename, fps=8)
-                video_filenames.append(filename)
+        for i, disparity in enumerate(disparities):
+            name = name.split("/")[-1].split(".")[0]
+            filename = os.path.join(args.output_dir, f"step_{step}", f"{pipeline_args['task']}", f"{name}_disp.mp4")
+            export_to_video(colorize_depth(disparity), filename, fps=8)
+            filename = os.path.join(args.output_dir, f"step_{step}", f"{pipeline_args['task']}", f"{name}_disp.npz")
+            np.savez_compressed(filename, disparity=disparity.cpu().numpy())
+            video_filenames.append(filename)
 
-            tracker.log(
-                {
-                    phase_name: [
-                        wandb.Video(filename, caption=f"step_{step}_{phase_name}_{pipeline_args['task']}_{name}_disp.mp4")
-                        for i, filename in enumerate(video_filenames)
-                    ]
-                }
-            )
+        # tracker.log(
+        #     {
+        #         phase_name: [
+        #             wandb.Video(filename, caption=f"step_{step}_{phase_name}_{pipeline_args['task']}_{name}_disp.mp4")
+        #             for i, filename in enumerate(video_filenames)
+        #         ]
+        #     }
+        # )
 
-            for i, raymap in enumerate(raymaps):
-                name = name.split("/")[-1].split(".")[0]
-                filename = os.path.join(args.output_dir, f"step_{step}_{phase_name}_{pipeline_args['task']}_{name}_raymap.npy")
-                np.save(filename, raymap)
+        for i, raymap in enumerate(raymaps):
+            name = name.split("/")[-1].split(".")[0]
+            filename = os.path.join(args.output_dir, f"step_{step}", f"{pipeline_args['task']}", f"{name}_raymap.npy")
+            np.save(filename, raymap)
 
     return videos
 
@@ -260,22 +264,36 @@ def run_validation(
     if args.enable_model_cpu_offload:
         pipe.enable_model_cpu_offload()
 
-    with open(args.validation_set, "r") as f:
-        validation_set = f.readlines()
-    validation_set = [video.strip() for video in validation_set][::3]
-    validation_prompts = [args.data_root + f"/prompts/{name}.txt" for name in validation_set]
-    validation_images = [args.data_root + f"/images/{name}.png" for name in validation_set]
-    validation_images_goal = [args.data_root + f"/images_goal/{name}.png" for name in validation_set]
-    validation_videos = [args.data_root + f"/videos/{name}.mp4" for name in validation_set]
-    validation_raymaps = [args.data_root + f"/raymaps/{name}.pt" for name in validation_set]
+    data_root = Path(args.data_root)
 
+    with open(data_root / args.validation_set, "r") as f:
+        validation_set = f.read().splitlines()
+    validation_set = [video.strip() for video in validation_set]
+
+    validation_prompts = [data_root / Path(sequence).parent.parent / "prompts" / f"{Path(sequence).stem}.txt" for sequence in validation_set]
+    validation_images = [data_root / Path(sequence).parent.parent / "images" / f"{Path(sequence).stem}.png" for sequence in validation_set]
+    validation_images_goal = [data_root / Path(sequence).parent.parent / "images_goal" / f"{Path(sequence).stem}.png" for sequence in validation_set]
+    validation_videos = [data_root / sequence for sequence in validation_set]
+    validation_raymaps = [data_root / Path(sequence).parent.parent / "raymaps" / f"{Path(sequence).stem}.pt" for sequence in validation_set]
+    validation_human_poses = [data_root / Path(sequence).parent.parent.parent / "human_motions" / f"{Path(sequence).stem}.npz" for sequence in validation_set]
+
+    all_indices = list(range(len(validation_images)))
+    shard_indices = all_indices[accelerator.process_index::accelerator.num_processes]
+    print(f"Shard indices for process {accelerator.process_index}: {shard_indices}")
+
+    validation_prompts = [validation_prompts[i] for i in shard_indices]
+    validation_images = [validation_images[i] for i in shard_indices]
+    validation_images_goal = [validation_images_goal[i] for i in shard_indices]
+    validation_videos = [validation_videos[i] for i in shard_indices]
+    validation_raymaps = [validation_raymaps[i] for i in shard_indices]
+    validation_human_poses = [validation_human_poses[i] for i in shard_indices]
 
     # planning with camera
     for validation_image, validation_image_goal, validation_raymap, validation_prompt in zip(validation_images, validation_images_goal, validation_raymaps, validation_prompts):
         pipeline_args = {
             "task": "planning",
-            "image": load_image(validation_image),
-            "goal": load_image(validation_image_goal),
+            "image": load_image(str(validation_image)),
+            "goal": load_image(str(validation_image_goal)),
             "raymap": torch.load(validation_raymap, map_location="cpu", weights_only=True).numpy(),
             "height": args.height,
             "width": args.width,
@@ -288,15 +306,15 @@ def run_validation(
             accelerator=accelerator,
             pipeline_args=pipeline_args,
             step=step,
-            name=validation_image.replace(".png", "_cam.png")
+            name=str(validation_image).replace(".png", "_cam.png")
         )
 
     # planning
     for validation_image, validation_image_goal, validation_prompt in zip(validation_images, validation_images_goal, validation_prompts):
         pipeline_args = {
             "task": "planning",
-            "image": load_image(validation_image),
-            "goal": load_image(validation_image_goal),
+            "image": load_image(str(validation_image)),
+            "goal": load_image(str(validation_image_goal)),
             "height": args.height,
             "width": args.width,
             "num_frames": args.max_num_frames,
@@ -308,7 +326,7 @@ def run_validation(
             accelerator=accelerator,
             pipeline_args=pipeline_args,
             step=step,
-            name=validation_image
+            name=str(validation_image)
         )
 
 
@@ -316,7 +334,7 @@ def run_validation(
     for validation_image, validation_raymap, validation_prompt in zip(validation_images, validation_raymaps, validation_prompts):
         pipeline_args = {
             "task": "prediction",
-            "image": load_image(validation_image),
+            "image": load_image(str(validation_image)),
             "raymap": torch.load(validation_raymap, map_location="cpu", weights_only=True).numpy(),
             "height": args.height,
             "width": args.width,
@@ -329,14 +347,14 @@ def run_validation(
             accelerator=accelerator,
             pipeline_args=pipeline_args,
             step=step,
-            name=validation_image.replace(".png", "_cam.png")
+            name=str(validation_image).replace(".png", "_cam.png")
         )
 
     # prediction
     for validation_image, validation_prompt in zip(validation_images, validation_prompts):
         pipeline_args = {
             "task": "prediction",
-            "image": load_image(validation_image),
+            "image": load_image(str(validation_image)),
             "height": args.height,
             "width": args.width,
             "num_frames": args.max_num_frames,
@@ -348,14 +366,14 @@ def run_validation(
             accelerator=accelerator,
             pipeline_args=pipeline_args,
             step=step,
-            name=validation_image
+            name=str(validation_image)
         )
 
     # reconstruction
     for validation_video, validation_prompt in zip(validation_videos, validation_prompts):
         pipeline_args = {
             "task": "reconstruction",
-            "video": iio.imread(validation_video).astype(np.float32) / 255.0,
+            "video": iio.imread(str(validation_video)).astype(np.float32) / 255.0,
             "height": args.height,
             "width": args.width,
             "num_frames": args.max_num_frames,
@@ -367,7 +385,7 @@ def run_validation(
             accelerator=accelerator,
             pipeline_args=pipeline_args,
             step=step,
-            name=validation_video
+            name=str(validation_video)
         )
 
     
@@ -958,15 +976,6 @@ def main(args):
 
                 reconstruction_condition = video_latents
 
-                p_c_c = random.random()
-                if p_c_c < 0.3:
-                    visual_condition = planning_condition
-                elif p_c_c < 0.7:
-                    visual_condition = prediction_condition
-                elif p_c_c < 0.98:
-                    visual_condition = reconstruction_condition
-                else:
-                    visual_condition = torch.zeros_like(video_latents)
 
                 # camera condition
                 raymap = torch.cat(
@@ -980,13 +989,25 @@ def main(args):
                     ],
                     dim=1,
                 )
-                camera_conditions = rearrange(
+                gt_camera_conditions = rearrange(
                     raymap,
                     "b (n t) c h w -> b t (n c) h w",
                     n=VAE_SCALE_FACTOR_TEMPORAL,
                 )
-                if random.random() < 0.5:
-                    camera_conditions = torch.zeros_like(camera_conditions)
+
+                p_c_v = random.random()
+                if p_c_v < 0.3:
+                    visual_condition = planning_condition
+                elif p_c_v < 0.7:
+                    visual_condition = prediction_condition
+                elif p_c_v < 0.98:
+                    visual_condition = reconstruction_condition
+                else:
+                    visual_condition = torch.zeros_like(video_latents)
+
+                p_c_c = random.random()
+                if p_c_c < 0.5:
+                    camera_conditions = torch.zeros_like(gt_camera_conditions)
 
                 final_condition = torch.cat([visual_condition, camera_conditions], dim=2)
 
@@ -1008,7 +1029,7 @@ def main(args):
                     prompt_embeds = prompts.to(dtype=weight_dtype)
 
                 # Sample noise that will be added to the latents
-                target_latents = torch.cat([video_latents, disparity_latents, camera_conditions], dim=2)
+                target_latents = torch.cat([video_latents, disparity_latents, gt_camera_conditions], dim=2)
                 noise = torch.randn_like(target_latents)
                 batch_size, num_frames, num_channels, height, width = target_latents.shape
 
@@ -1062,7 +1083,7 @@ def main(args):
                 while len(weights.shape) < len(model_pred.shape):
                     weights = weights.unsqueeze(-1)
 
-                target = torch.cat([video_latents, disparity_latents, camera_conditions], dim=2)
+                target = torch.cat([video_latents, disparity_latents, gt_camera_conditions], dim=2)
 
                 loss = torch.mean(
                     (weights * (model_pred - target) ** 2).reshape(batch_size, -1),
@@ -1123,7 +1144,7 @@ def main(args):
 
                 # Validation
                 should_run_validation = args.validation_set is not None and (
-                    args.validation_steps is not None and (global_step-1) % args.validation_steps == 0
+                    args.validation_steps is not None and (global_step) % args.validation_steps == 0
                 )
                 if should_run_validation:
                     run_validation(args, accelerator, transformer, scheduler, model_config, weight_dtype, global_step)

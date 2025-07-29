@@ -81,15 +81,16 @@ class VideoDataset(Dataset):
                 self.video_paths,
             ) = self._load_dataset_from_local_path()
         else:
-            (
-                self.prompts,
-                self.video_paths,
-            ) = self._load_dataset_from_csv()
+            # (
+            #     self.prompts,
+            #     self.video_paths,
+            # ) = self._load_dataset_from_csv()
+            self.video_paths = self._load_dataset_from_datafile()
 
-        if len(self.video_paths) != len(self.prompts):
-            raise ValueError(
-                f"Expected length of prompts and videos to be the same but found {len(self.prompts)=} and {len(self.video_paths)=}. Please ensure that the number of caption prompts and videos match in your dataset."
-            )
+        # if len(self.video_paths) != len(self.prompts):
+        #     raise ValueError(
+        #         f"Expected length of prompts and videos to be the same but found {len(self.prompts)=} and {len(self.video_paths)=}. Please ensure that the number of caption prompts and videos match in your dataset."
+        #     )
 
         self.video_transforms = transforms.Compose(
             [
@@ -129,7 +130,7 @@ class VideoDataset(Dataset):
             image_latents, image_goal_latents, video_latents, disparity_latents, prompt_embeds = self._preprocess_video(self.video_paths[index])
             
             name = self.video_paths[index].stem
-            raymap = torch.load(self.data_root / "raymaps" / f"{name}.pt", map_location="cpu", weights_only=True)
+            raymap = torch.load(self.video_paths[index].parent.parent / "raymaps" / f"{name}.pt", map_location="cpu", weights_only=True)
 
             # This is hardcoded for now.
             # The VAE's temporal compression ratio is 4.
@@ -228,6 +229,13 @@ class VideoDataset(Dataset):
             )
 
         return prompts, video_paths
+    
+    def _load_dataset_from_datafile(self) -> List[str]:
+        with open(self.data_root / self.dataset_file, "r") as f:
+            video_paths = [self.data_root.joinpath(line.strip()) for line in f.readlines() if len(line.strip()) > 0]
+        video_paths = [self.data_root.joinpath(path) for path in video_paths]
+
+        return video_paths
 
     def _preprocess_video(self, path: Path) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         r"""
