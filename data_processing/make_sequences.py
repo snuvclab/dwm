@@ -144,9 +144,10 @@ def extract_smplx_body_pose(smplx_data):
 
 parser = argparse.ArgumentParser(description="Generate video and trajectory sequences from images and camera parameters.")
 parser.add_argument("--data_root", type=str, required=True, help="Root directory containing folders of image and camera parameter data.")
-parser.add_argument("--start_idx", type=int, default=1, help="Starting index for image sequence.")
+parser.add_argument("--start_idx", type=int, default=0, help="Starting index for image sequence.")
 parser.add_argument("--end_idx", type=int, default=-1, help="Ending index for image sequence.")
-parser.add_argument("--stride", type=int, default=10, help="Stride for selecting frames in the sequence.")
+parser.add_argument("--stride", type=int, default=25, help="Stride for selecting frames in the sequence.")
+parser.add_argument("--sample_every_nth", type=int, default=3, help="Sample every nth frame for the sequence.")
 parser.add_argument("--disparity_format", type=str, choices=["image", "npy", "npz"], default="npz", 
                    help="Format for disparity output: 'image' for MP4 video, 'npy' for concatenated frames, 'npz' for compressed frames")
 
@@ -184,6 +185,7 @@ human_pose_output_folder = Path(output_folder) / "human_motions"
 # parameters
 clip_length = 49
 stride = args.stride
+sample_every_nth = args.sample_every_nth
 fps = 8
 start_image_idx = args.start_idx  # Start from
 end_image_idx = args.end_idx  # End at
@@ -204,6 +206,7 @@ with open(f"{str(output_folder)}/args.json", "w") as f:
     args_dict = {
         "clip_length": clip_length,
         "stride": stride,
+        "sample_every_nth": sample_every_nth,
         "fps": fps,
         "start_image_idx": start_image_idx,
         "end_image_idx": end_image_idx,
@@ -261,7 +264,7 @@ if args.dataset_type == "trumans":
     
     # Determine SMPLX pose data path
     if args.smplx_base_path:
-        smplx_pose_path = Path(args.smplx_base_path) / f"{action_name}.pkl"
+        smplx_pose_path = Path(args.smplx_base_path) / f"{action_name}_smplx_results.pkl"
     else:
         smplx_pose_path = Path("./data/trumans/smplx_result") / f"{action_name}_smplx_results.pkl"
     
@@ -332,7 +335,7 @@ num_images = len(image_paths)
 
 # Generate clips
 clip_idx = 0
-for start_idx in tqdm(range(0, num_images - clip_length + 1, stride)):
+for start_idx in tqdm(range(0, num_images - clip_length * sample_every_nth + 1, stride * sample_every_nth)):
     # Check if this clip already exists (if skip_existing_clips is enabled)
     if args.skip_existing_clips:
         video_exists = os.path.exists(os.path.join(video_output_folder, f"{clip_idx:05}.mp4"))
@@ -357,13 +360,13 @@ for start_idx in tqdm(range(0, num_images - clip_length + 1, stride)):
             clip_idx += 1
             continue
     
-    clip_frames = image_paths[start_idx : start_idx + clip_length]
+    clip_frames = image_paths[start_idx : start_idx + clip_length * sample_every_nth : sample_every_nth]
     if disparity_folder.exists():
-        clip_disparity = disparity_paths[start_idx : start_idx + clip_length]
+        clip_disparity = disparity_paths[start_idx : start_idx + clip_length * sample_every_nth : sample_every_nth]
     if depth_folder.exists():
-        clip_depth = depth_paths[start_idx : start_idx + clip_length]
+        clip_depth = depth_paths[start_idx : start_idx + clip_length * sample_every_nth : sample_every_nth]
     if cam_param_folder.exists():
-        clip_cam_params = cam_param_paths[start_idx : start_idx + clip_length]
+        clip_cam_params = cam_param_paths[start_idx : start_idx + clip_length * sample_every_nth : sample_every_nth]
     
     # Prepare egoallo human pose data for this clip (ARIA datasets)
     clip_smplh = None
@@ -371,16 +374,16 @@ for start_idx in tqdm(range(0, num_images - clip_length + 1, stride)):
         clip_smplh = {}
         for key in smplh_data:
             if key == 'Ts_world_root':
-                clip_smplh["global_orient_quat"] = smplh_data[key][0, start_idx : start_idx + clip_length, :4] # global orientation in quaternion format Fx4
-                clip_smplh["transl"] = smplh_data[key][0, start_idx : start_idx + clip_length, 4:] # translation Fx3
+                clip_smplh["global_orient_quat"] = smplh_data[key][0, start_idx : start_idx + clip_length * sample_every_nth : sample_every_nth, :4] # global orientation in quaternion format Fx4
+                clip_smplh["transl"] = smplh_data[key][0, start_idx : start_idx + clip_length * sample_every_nth : sample_every_nth, 4:] # translation Fx3
             elif key == 'body_quats':
-                clip_smplh["body_pose_quat"] = smplh_data[key][0, start_idx : start_idx + clip_length, :] # body pose in quaternion format FxN_jx4
+                clip_smplh["body_pose_quat"] = smplh_data[key][0, start_idx : start_idx + clip_length * sample_every_nth : sample_every_nth, :] # body pose in quaternion format FxN_jx4
             elif key == 'left_hand_quats':
-                clip_smplh["left_hand_pose_quat"] = smplh_data[key][0, start_idx : start_idx + clip_length, :] # left hand pose in quaternion format FxN_jx4
+                clip_smplh["left_hand_pose_quat"] = smplh_data[key][0, start_idx : start_idx + clip_length * sample_every_nth : sample_every_nth, :] # left hand pose in quaternion format FxN_jx4
             elif key == 'right_hand_quats':
-                clip_smplh["right_hand_pose_quat"] = smplh_data[key][0, start_idx : start_idx + clip_length, :] # right hand pose in quaternion format FxN_jx4
+                clip_smplh["right_hand_pose_quat"] = smplh_data[key][0, start_idx : start_idx + clip_length * sample_every_nth : sample_every_nth, :] # right hand pose in quaternion format FxN_jx4
             elif key == 'betas':
-                clip_smplh["betas"] = smplh_data[key][0, start_idx : start_idx + clip_length, :] # shape parameters FxN_betas_smplh
+                clip_smplh["betas"] = smplh_data[key][0, start_idx : start_idx + clip_length * sample_every_nth : sample_every_nth, :] # shape parameters FxN_betas_smplh
             else:
                 continue # Skip any other keys
     
@@ -490,29 +493,38 @@ for start_idx in tqdm(range(0, num_images - clip_length + 1, stride)):
         if args.disparity_format == "image":
             # Save as MP4 video
             out_path = os.path.join(disparity_output_folder, f"{clip_idx:05}.mp4")
-            disparity_frames = []
-            for i, disparity in enumerate(disparity_stack):
-                # Convert to 8-bit grayscale (0-255)
-                disparity_8bit = (disparity * 255).astype(np.uint8)
-                if output_size:
-                    disparity_8bit = cv2.resize(disparity_8bit, output_size)
-                disparity_frames.append(disparity_8bit)
-            iio.imwrite(
-                out_path,
-                np.stack(disparity_frames),
-                fps=fps,
-                codec='libx264'
-            )
+            if not args.dry_run:
+                disparity_frames = []
+                for i, disparity in enumerate(disparity_stack):
+                    # Convert to 8-bit grayscale (0-255)
+                    disparity_8bit = (disparity * 255).astype(np.uint8)
+                    if output_size:
+                        disparity_8bit = cv2.resize(disparity_8bit, output_size)
+                    disparity_frames.append(disparity_8bit)
+                iio.imwrite(
+                    out_path,
+                    np.stack(disparity_frames),
+                    fps=fps,
+                    codec='libx264'
+                )
+            else:
+                print(f"Would create disparity video: {out_path}")
         elif args.disparity_format == "npy":
             # Save as concatenated NPY file
             out_path = os.path.join(disparity_output_folder, f"{clip_idx:05}.npy")
-            # Stack frames and save as NPY
-            np.save(out_path, disparity_stack.astype(np.float32))
+            if not args.dry_run:
+                # Stack frames and save as NPY
+                np.save(out_path, disparity_stack.astype(np.float32))
+            else:
+                print(f"Would create disparity npy: {out_path}")
         else:  # npz format
             # Save as compressed NPZ file
             out_path = os.path.join(disparity_output_folder, f"{clip_idx:05}.npz")
-            # Stack frames and save as compressed NPZ
-            np.savez_compressed(out_path, disparity=disparity_stack.astype(np.float16))
+            if not args.dry_run:
+                # Stack frames and save as compressed NPZ
+                np.savez_compressed(out_path, disparity=disparity_stack.astype(np.float16))
+            else:
+                print(f"Would create disparity npz: {out_path}")
 
     # Camera trajectory output
     if cam_param_folder.exists():
@@ -543,12 +555,12 @@ for start_idx in tqdm(range(0, num_images - clip_length + 1, stride)):
             # Extract the corresponding frames for this clip
             # Note: This assumes SMPLX data has the same number of frames as images
             clip_start = start_idx
-            clip_end = start_idx + clip_length
+            clip_end = start_idx + clip_length * sample_every_nth
             
             # Ensure we don't go out of bounds
             if clip_end <= body_pose.shape[0]:
                 if not args.dry_run:
-                    clip_body_pose = body_pose[clip_start:clip_end]
+                    clip_body_pose = body_pose[clip_start:clip_end:sample_every_nth]
                     
                     # Prepare SMPLX data in the same format as ARIA egoallo data
                     smplx_clip_data = {}
@@ -562,7 +574,7 @@ for start_idx in tqdm(range(0, num_images - clip_length + 1, stride)):
                             
                         if value.shape[0] == body_pose.shape[0]:
                             # Only include parameters that have the same number of frames
-                            smplx_clip_data[key] = value[clip_start:clip_end].astype(np.float32)
+                            smplx_clip_data[key] = value[clip_start:clip_end:sample_every_nth].astype(np.float32)
                         elif len(value.shape) == 1:
                             # Handle scalar parameters (like betas) that don't have frame dimension
                             smplx_clip_data[key] = value.astype(np.float32)
