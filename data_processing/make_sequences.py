@@ -147,14 +147,16 @@ parser.add_argument("--data_root", type=str, required=True, help="Root directory
 parser.add_argument("--start_idx", type=int, default=1, help="Starting index for image sequence.")
 parser.add_argument("--end_idx", type=int, default=-1, help="Ending index for image sequence.")
 parser.add_argument("--stride", type=int, default=10, help="Stride for selecting frames in the sequence.")
-parser.add_argument("--disparity_format", type=str, choices=["image", "npy"], default="image", 
-                   help="Format for disparity output: 'image' for MP4 video, 'npy' for concatenated frames")
-parser.add_argument("--use_depth", action="store_true", help="Convert depth to disparity with per-clip normalization")
+parser.add_argument("--disparity_format", type=str, choices=["image", "npy", "npz"], default="npz", 
+                   help="Format for disparity output: 'image' for MP4 video, 'npy' for concatenated frames, 'npz' for compressed frames")
+
 parser.add_argument("--no_sqrt_disparity", action="store_true", help="Disable square root of disparity (default: enabled)")
 parser.add_argument("--skip_existing_clips", action="store_true", help="Skip clips that already exist")
 parser.add_argument("--smplx_base_path", type=str, default=None, 
                    help="Base path for SMPLX result files (default: {data_root}/../smplx_result)")
-parser.add_argument("--skip_smplx", action="store_true", help="Skip SMPLX processing")
+
+parser.add_argument("--dataset_type", type=str, choices=["aria", "trumans"], default="trumans",
+                   help="Dataset type: 'aria' for egoallo data, 'trumans' for SMPLX data. Auto-detected if not specified.")
 parser.add_argument("--dry_run", action="store_true", help="Show what would be processed without actually processing")
 args = parser.parse_args()
 
@@ -165,7 +167,6 @@ disparity_folder = Path(args.data_root) / "disparity"
 depth_folder = Path(args.data_root) / "depth"
 cam_param_folder = Path(args.data_root) / "cam_params"
 egoallo_human_pose_file = Path(args.data_root) / "egoallo.npz"
-human_pose_folder = Path(args.data_root) / "human_poses"  # For SMPLX human pose files
 
 # output folders
 output_folder = Path(args.data_root) / "sequences"
@@ -174,7 +175,7 @@ video_output_folder = Path(output_folder) / "videos"
 # Set disparity output folder based on format
 if args.disparity_format == "image":
     disparity_output_folder = Path(output_folder) / "disparity_video"  # Compatible with camera_pose_to_raymap.py
-else:  # npy format
+else:  # npy or npz format
     disparity_output_folder = Path(output_folder) / "disparity"
 
 trajectory_output_folder = Path(output_folder) / "trajectory"
@@ -196,7 +197,7 @@ if image_folder.exists(): os.makedirs(video_output_folder, exist_ok=True)
 if disparity_folder.exists(): os.makedirs(disparity_output_folder, exist_ok=True)
 if depth_folder.exists(): os.makedirs(disparity_output_folder, exist_ok=True)
 if cam_param_folder.exists(): os.makedirs(trajectory_output_folder, exist_ok=True)
-if egoallo_human_pose_file.exists(): os.makedirs(human_pose_output_folder, exist_ok=True)
+
 
 # save arguments to a JSON file
 with open(f"{str(output_folder)}/args.json", "w") as f:
@@ -225,79 +226,106 @@ if cam_param_folder.exists():
     cam_param_paths = sorted(cam_param_folder.glob("*.npy"))
     cam_param_paths = cam_param_paths[start_image_idx:end_image_idx]
 
-# Load egoallo human pose data if available
+# Auto-detect dataset type if not specified
+if args.dataset_type is None:
+    if egoallo_human_pose_file.exists():
+        args.dataset_type = "aria"
+        print(f"🔍 Auto-detected dataset type: ARIA (found egoallo.npz)")
+    else:
+        args.dataset_type = "trumans"
+        print(f"🔍 Auto-detected dataset type: Trumans (SMPLX processing enabled)")
+
+print(f"📊 Dataset type: {args.dataset_type.upper()}")
+
+# Load egoallo human pose data if available (ARIA datasets)
 smplh_data = None
-if egoallo_human_pose_file.exists():
+if args.dataset_type == "aria" and egoallo_human_pose_file.exists():
+    print(f"📁 Loading egoallo data from: {egoallo_human_pose_file}")
     smplh_data = np.load(egoallo_human_pose_file)
     smplh_data = {key: smplh_data[key].astype(np.float32) for key in smplh_data.files} 
     for key in smplh_data:
         if key in ["Ts_world_root", "body_quats", "left_hand_quats", "right_hand_quats", "betas"]:
             smplh_data[key] = smplh_data[key][:, start_image_idx-1:end_image_idx-1] # egoallo predicts from the second frame
+    print(f"✅ Loaded egoallo data with keys: {list(smplh_data.keys())}")
+elif args.dataset_type == "aria" and not egoallo_human_pose_file.exists():
+    print(f"⚠️  Warning: ARIA dataset specified but egoallo.npz not found at {egoallo_human_pose_file}")
 
-# Load SMPLX human pose data if available
-human_pose_paths = None
-if human_pose_folder.exists():
-    human_pose_paths = sorted(human_pose_folder.glob("cam*.npy"))
-    human_pose_paths = human_pose_paths[start_image_idx:end_image_idx]
 
-print(f"Total images: {len(image_paths)}")
-if egoallo_human_pose_file.exists() and smplh_data is not None:
-    print(f"Total egoallo poses: {smplh_data['Ts_world_root'].shape[1]}")
-if human_pose_folder.exists() and human_pose_paths is not None:
-    print(f"Total SMPLX poses: {len(human_pose_paths)}")
 
-# Find corresponding SMPLX file based on the current action folder
+# Load SMPLX pose data from pickle file (Trumans datasets)
 smplx_data = None
-if not args.skip_smplx:
-    # Extract timestamp from the current data root path
-    # Expected structure: .../action_folder_timestamp/
-    data_root_name = Path(args.data_root).name
-    print(f"Looking for SMPLX data for action folder: {data_root_name}")
+if args.dataset_type == "trumans":
+    # Extract action name from data_root stem
+    action_name = Path(args.data_root).stem
+    print(f"🔍 Looking for SMPLX pose data for action: {action_name}")
     
-    # First, check if there's a SMPLX file in the current action directory
-    local_smplx_file = Path(args.data_root) / f"{data_root_name}_smplx_results.pkl"
-    if local_smplx_file.exists():
-        print(f"Found local SMPLX file: {local_smplx_file}")
-        smplx_data = load_smplx_data(local_smplx_file)
+    # Determine SMPLX pose data path
+    if args.smplx_base_path:
+        smplx_pose_path = Path(args.smplx_base_path) / f"{action_name}.pkl"
     else:
-        # Determine SMPLX base path for external directory
-        if args.smplx_base_path:
-            smplx_base_path = Path(args.smplx_base_path)
-        else:
-            smplx_base_path = Path(args.data_root).parent.parent / "smplx_result"
-        
-        if smplx_base_path.exists():
-            # Try to find SMPLX file with the same timestamp as the action folder
-            smplx_file_pattern = f"{data_root_name}_smplx_results.pkl"
-            smplx_file_path = smplx_base_path / smplx_file_pattern
-            
-            if smplx_file_path.exists():
-                print(f"Found matching SMPLX file: {smplx_file_path}")
-                smplx_data = load_smplx_data(smplx_file_path)
+        smplx_pose_path = Path("./data/trumans/smplx_result") / f"{action_name}_smplx_results.pkl"
+    
+    if smplx_pose_path.exists():
+        print(f"📁 Loading SMPLX pose data from: {smplx_pose_path}")
+        try:
+            smplx_data = load_smplx_data(smplx_pose_path)
+            if smplx_data is not None:
+                print(f"✅ Loaded SMPLX pose data with keys: {list(smplx_data.keys())}")
+                # Check if we have body_pose data
+                if 'body_pose' in smplx_data:
+                    print(f"📊 SMPLX body pose shape: {smplx_data['body_pose'].shape}")
+                else:
+                    print(f"⚠️  Warning: No 'body_pose' key found in SMPLX data")
             else:
-                print(f"SMPLX file not found: {smplx_file_path}")
-                # List available SMPLX files for debugging
-                available_smplx_files = list(smplx_base_path.glob("*_smplx_results.pkl"))
-                print(f"Available SMPLX files: {[f.name for f in available_smplx_files[:5]]}")
-        else:
-            print(f"SMPLX base directory not found: {smplx_base_path}")
-    
-    # Process SMPLX data if found
-    if smplx_data is not None:
-        body_pose = extract_smplx_body_pose(smplx_data)
-        if body_pose is not None:
-            print(f"SMPLX body pose shape: {body_pose.shape}")
-            print(f"SMPLX data keys: {list(smplx_data.keys())}")
-        else:
-            print("Warning: Could not extract body pose from SMPLX data")
-            smplx_data = None
+                print(f"❌ Failed to load SMPLX pose data from {smplx_pose_path}")
+        except Exception as e:
+            print(f"❌ Error loading SMPLX pose data: {e}")
     else:
-        print("No SMPLX data found")
-elif args.skip_smplx:
-    print("Skipping SMPLX processing as requested")
+        print(f"ℹ️  SMPLX pose file not found: {smplx_pose_path}")
+        # List available SMPLX files for debugging
+        smplx_dir = smplx_pose_path.parent
+        if smplx_dir.exists():
+            available_files = list(smplx_dir.glob("*.pkl"))
+            print(f"📁 Available SMPLX files: {[f.stem for f in available_files[:5]]}")
+        else:
+            print(f"❌ SMPLX directory not found: {smplx_dir}")
 
-# Create SMPLX output folder if we have SMPLX data
-if smplx_data is not None:
+# Check for depth files (Trumans datasets have .exr depth files)
+if args.dataset_type == "trumans" and depth_folder.exists():
+    print(f"📁 Found depth folder: {depth_folder}")
+    print(f"ℹ️  Trumans dataset - will convert .exr depth to disparity")
+elif args.dataset_type == "aria" and depth_folder.exists():
+    print(f"⚠️  Warning: ARIA dataset but depth folder found at {depth_folder}")
+    print(f"ℹ️  ARIA datasets typically don't have depth files")
+elif args.dataset_type == "aria" and not depth_folder.exists():
+    print(f"ℹ️  ARIA dataset - no depth files (expected)")
+elif args.dataset_type == "trumans" and not depth_folder.exists():
+    print(f"⚠️  Warning: Trumans dataset but no depth folder found at {depth_folder}")
+    print(f"ℹ️  Trumans datasets typically have .exr depth files")
+
+print(f"📊 Total images: {len(image_paths)}")
+if args.dataset_type == "aria" and smplh_data is not None:
+    print(f"📊 Total egoallo poses: {smplh_data['Ts_world_root'].shape[1]}")
+elif args.dataset_type == "trumans" and smplx_data is not None:
+    if 'body_pose' in smplx_data:
+        print(f"📊 Total SMPLX poses: {smplx_data['body_pose'].shape[0]}")
+
+# Process SMPLX pose data for Trumans datasets
+if args.dataset_type == "trumans" and smplx_data is not None:
+    # Extract body pose from the loaded SMPLX pose data
+    body_pose = extract_smplx_body_pose(smplx_data)
+    if body_pose is not None:
+        print(f"✅ SMPLX body pose extracted, shape: {body_pose.shape}")
+    else:
+        print("⚠️  Warning: Could not extract body pose from SMPLX pose data")
+        smplx_data = None
+elif args.dataset_type == "aria":
+    print("ℹ️  ARIA dataset - SMPLX processing not applicable")
+elif args.dataset_type == "trumans" and smplx_data is None:
+    print("ℹ️  No SMPLX pose data available for processing")
+
+# Create human pose output folder if we have any human pose data
+if smplx_data is not None or smplh_data is not None:
     os.makedirs(human_pose_output_folder, exist_ok=True)
 
 num_images = len(image_paths)
@@ -313,15 +341,15 @@ for start_idx in tqdm(range(0, num_images - clip_length + 1, stride)):
         # Check disparity existence based on format
         if args.disparity_format == "image":
             disparity_exists = os.path.exists(os.path.join(disparity_output_folder, f"{clip_idx:05}.mp4"))
-        else:
+        elif args.disparity_format == "npy":
             disparity_exists = os.path.exists(os.path.join(disparity_output_folder, f"{clip_idx:05}.npy"))
+        else:  # npz format
+            disparity_exists = os.path.exists(os.path.join(disparity_output_folder, f"{clip_idx:05}.npz"))
         
         # Check SMPLX existence if processing SMPLX
         smplx_exists = True  # Default to True if not processing SMPLX
         if smplx_data is not None:
-            smplx_body_exists = os.path.exists(os.path.join(human_pose_output_folder, f"{clip_idx:05}_smplx_body.npy"))
-            smplx_full_exists = os.path.exists(os.path.join(human_pose_output_folder, f"{clip_idx:05}_smplx_full.npy"))
-            smplx_exists = smplx_body_exists and smplx_full_exists
+            smplx_exists = os.path.exists(os.path.join(human_pose_output_folder, f"{clip_idx:05}.npz"))
         
         # Skip if all required files exist
         if video_exists and trajectory_exists and disparity_exists and smplx_exists:
@@ -332,14 +360,14 @@ for start_idx in tqdm(range(0, num_images - clip_length + 1, stride)):
     clip_frames = image_paths[start_idx : start_idx + clip_length]
     if disparity_folder.exists():
         clip_disparity = disparity_paths[start_idx : start_idx + clip_length]
-    if depth_folder.exists() and args.use_depth:
+    if depth_folder.exists():
         clip_depth = depth_paths[start_idx : start_idx + clip_length]
     if cam_param_folder.exists():
         clip_cam_params = cam_param_paths[start_idx : start_idx + clip_length]
     
-    # Prepare egoallo human pose data for this clip
+    # Prepare egoallo human pose data for this clip (ARIA datasets)
     clip_smplh = None
-    if egoallo_human_pose_file.exists() and smplh_data is not None:
+    if args.dataset_type == "aria" and smplh_data is not None:
         clip_smplh = {}
         for key in smplh_data:
             if key == 'Ts_world_root':
@@ -356,10 +384,7 @@ for start_idx in tqdm(range(0, num_images - clip_length + 1, stride)):
             else:
                 continue # Skip any other keys
     
-    # Prepare SMPLX human pose data for this clip
-    clip_human_poses = None
-    if human_pose_folder.exists() and human_pose_paths is not None:
-        clip_human_poses = human_pose_paths[start_idx : start_idx + clip_length]
+
 
     # RGB video output
     out_path = os.path.join(video_output_folder, f"{clip_idx:05}.mp4")
@@ -379,7 +404,7 @@ for start_idx in tqdm(range(0, num_images - clip_length + 1, stride)):
     else:
         print(f"Would create video: {out_path}")
 
-    # Disparity output
+    # Disparity output - handle existing disparity files (if any)
     if disparity_folder.exists():
         if args.disparity_format == "image":
             # Save as MP4 video
@@ -399,7 +424,7 @@ for start_idx in tqdm(range(0, num_images - clip_length + 1, stride)):
                 )
             else:
                 print(f"Would create disparity video: {out_path}")
-        else:  # npy format
+        elif args.disparity_format == "npy":
             # Save as concatenated NPY file
             out_path = os.path.join(disparity_output_folder, f"{clip_idx:05}.npy")
             if not args.dry_run:
@@ -417,8 +442,27 @@ for start_idx in tqdm(range(0, num_images - clip_length + 1, stride)):
                 np.save(out_path, disparity_sequence)
             else:
                 print(f"Would create disparity npy: {out_path}")
+        else:  # npz format
+            # Save as compressed NPZ file
+            out_path = os.path.join(disparity_output_folder, f"{clip_idx:05}.npz")
+            if not args.dry_run:
+                disparity_frames = []
+                for disparity_path in clip_disparity:
+                    disparity_frame = iio.imread(disparity_path)
+                    if output_size:
+                        disparity_frame = cv2.resize(disparity_frame, output_size)
+                    # Convert to grayscale if RGB
+                    if disparity_frame.ndim == 3 and disparity_frame.shape[-1] == 3:
+                        disparity_frame = np.mean(disparity_frame, axis=-1)
+                    disparity_frames.append(disparity_frame.astype(np.float16))
+                # Stack frames and save as compressed NPZ
+                disparity_sequence = np.stack(disparity_frames, axis=0)
+                np.savez_compressed(out_path, disparity=disparity_sequence)
+            else:
+                print(f"Would create disparity npz: {out_path}")
     
-    elif depth_folder.exists() and args.use_depth:
+    # Depth to disparity conversion (Trumans datasets)
+    elif depth_folder.exists():
         # Convert depth to disparity with per-clip normalization
         print(f"Converting depth to disparity for clip {clip_idx} with per-clip normalization")
         
@@ -459,11 +503,16 @@ for start_idx in tqdm(range(0, num_images - clip_length + 1, stride)):
                 fps=fps,
                 codec='libx264'
             )
-        else:  # npy format
+        elif args.disparity_format == "npy":
             # Save as concatenated NPY file
             out_path = os.path.join(disparity_output_folder, f"{clip_idx:05}.npy")
             # Stack frames and save as NPY
             np.save(out_path, disparity_stack.astype(np.float32))
+        else:  # npz format
+            # Save as compressed NPZ file
+            out_path = os.path.join(disparity_output_folder, f"{clip_idx:05}.npz")
+            # Stack frames and save as compressed NPZ
+            np.savez_compressed(out_path, disparity=disparity_stack.astype(np.float16))
 
     # Camera trajectory output
     if cam_param_folder.exists():
@@ -478,28 +527,21 @@ for start_idx in tqdm(range(0, num_images - clip_length + 1, stride)):
         else:
             print(f"Would create trajectory files: {clip_idx:05}.npy, {clip_idx:05}_abs.npy")
 
-    # Human pose output - egoallo format
-    if egoallo_human_pose_file.exists() and clip_smplh is not None:
+    # Human pose output - egoallo format (ARIA datasets)
+    if args.dataset_type == "aria" and clip_smplh is not None:
         if not args.dry_run:
             np.savez_compressed(os.path.join(human_pose_output_folder, f"{clip_idx:05}.npz"), **clip_smplh)
         else:
             print(f"Would create egoallo pose file: {clip_idx:05}.npz")
 
-    # Human pose output - SMPLX format
-    if human_pose_folder.exists() and clip_human_poses is not None:
-        if not args.dry_run:
-            human_poses = [np.load(human_pose_path) for human_pose_path in clip_human_poses]
-            np.save(os.path.join(human_pose_output_folder, f"{clip_idx:05}.npy"), human_poses)
-        else:
-            print(f"Would create SMPLX pose file: {clip_idx:05}.npy")
 
-    # SMPLX body pose output
-    if smplx_data is not None:
+
+    # SMPLX pose output (Trumans datasets) - same format as ARIA
+    if args.dataset_type == "trumans" and smplx_data is not None:
         body_pose = extract_smplx_body_pose(smplx_data)
         if body_pose is not None:
             # Extract the corresponding frames for this clip
             # Note: This assumes SMPLX data has the same number of frames as images
-            # You might need to adjust this based on your specific data structure
             clip_start = start_idx
             clip_end = start_idx + clip_length
             
@@ -508,22 +550,31 @@ for start_idx in tqdm(range(0, num_images - clip_length + 1, stride)):
                 if not args.dry_run:
                     clip_body_pose = body_pose[clip_start:clip_end]
                     
-                    # Save the body pose clip
-                    out_path = os.path.join(human_pose_output_folder, f"{clip_idx:05}_smplx_body.npy")
-                    np.save(out_path, clip_body_pose)
-                    
-                    # Also save additional SMPLX parameters if needed
+                    # Prepare SMPLX data in the same format as ARIA egoallo data
                     smplx_clip_data = {}
-                    for key, value in smplx_data.items():
-                        if isinstance(value, np.ndarray) and value.shape[0] == body_pose.shape[0]:
-                            # Only include parameters that have the same number of frames
-                            smplx_clip_data[key] = value[clip_start:clip_end]
                     
-                    # Save full SMPLX clip data
-                    full_out_path = os.path.join(human_pose_output_folder, f"{clip_idx:05}_smplx_full.npy")
-                    np.save(full_out_path, smplx_clip_data, allow_pickle=True)
+                    # Add all SMPLX parameters (following ARIA case pattern)
+                    for key, value in smplx_data.items():
+                        # Skip non-numerical data (NPZ can only store numpy arrays)
+                        if not isinstance(value, np.ndarray):
+                            print(f"⚠️  Skipping SMPLX key '{key}' - not a numpy array (type: {type(value)})")
+                            continue
+                            
+                        if value.shape[0] == body_pose.shape[0]:
+                            # Only include parameters that have the same number of frames
+                            smplx_clip_data[key] = value[clip_start:clip_end].astype(np.float32)
+                        elif len(value.shape) == 1:
+                            # Handle scalar parameters (like betas) that don't have frame dimension
+                            smplx_clip_data[key] = value.astype(np.float32)
+                        else:
+                            # Skip arrays with different frame count
+                            print(f"⚠️  Skipping SMPLX key '{key}' with different frame count: {value.shape[0]} vs {body_pose.shape[0]}")
+                    
+                    # Save as compressed NPZ (same format as ARIA)
+                    out_path = os.path.join(human_pose_output_folder, f"{clip_idx:05}.npz")
+                    np.savez_compressed(out_path, **smplx_clip_data)
                 else:
-                    print(f"Would create SMPLX files: {clip_idx:05}_smplx_body.npy, {clip_idx:05}_smplx_full.npy")
+                    print(f"Would create SMPLX pose file: {clip_idx:05}.npz")
             else:
                 print(f"Warning: SMPLX data doesn't have enough frames for clip {clip_idx} (need {clip_end}, have {body_pose.shape[0]})")
         else:
@@ -540,12 +591,18 @@ with open(f"{output_folder}/prompts.txt", "w") as f:
         f.write(f"\n")
 
 print(f"Generated {clip_idx} clips")
-if smplx_data is not None:
-    print(f"SMPLX body pose data processed and saved to {human_pose_output_folder}")
-    print(f"SMPLX files created: {clip_idx * 2} files ({clip_idx} body pose + {clip_idx} full SMPLX)")
-else:
-    print("No SMPLX data was processed")
-if egoallo_human_pose_file.exists():
-    print(f"Egoallo human pose data processed and saved to {human_pose_output_folder}")
-if human_pose_folder.exists():
-    print(f"SMPLX human pose data processed and saved to {human_pose_output_folder}")
+
+# Summary based on dataset type
+if args.dataset_type == "aria":
+    if smplh_data is not None:
+        print(f"✅ Egoallo human pose data processed and saved to {human_pose_output_folder}")
+    else:
+        print("ℹ️  No egoallo data was processed")
+elif args.dataset_type == "trumans":
+    if smplx_data is not None:
+        print(f"✅ SMPLX pose data processed and saved to {human_pose_output_folder}")
+        print(f"📊 SMPLX files created: {clip_idx} files (compressed NPZ format)")
+    else:
+        print("ℹ️  No SMPLX pose data was processed")
+    
+
