@@ -159,6 +159,7 @@ parser.add_argument("--smplx_base_path", type=str, default=None,
 parser.add_argument("--dataset_type", type=str, choices=["aria", "trumans"], default="trumans",
                    help="Dataset type: 'aria' for egoallo data, 'trumans' for SMPLX data. Auto-detected if not specified.")
 parser.add_argument("--dry_run", action="store_true", help="Show what would be processed without actually processing")
+parser.add_argument("--save_root", type=str, default=None, help="Root directory for saving sequences. If None, uses data_root.")
 args = parser.parse_args()
 
 
@@ -170,7 +171,10 @@ cam_param_folder = Path(args.data_root) / "cam_params"
 egoallo_human_pose_file = Path(args.data_root) / "egoallo.npz"
 
 # output folders
-output_folder = Path(args.data_root) / "sequences"
+if args.save_root:
+    output_folder = Path(args.save_root) / "sequences"
+else:
+    output_folder = Path(args.data_root) / "sequences"
 video_output_folder = Path(output_folder) / "videos"
 
 # Set disparity output folder based on format
@@ -195,6 +199,8 @@ sqrt_disparity = not args.no_sqrt_disparity
 # Create output directory
 if not image_folder.exists():
     raise FileNotFoundError(f"Image folder {image_folder} does not exist.")
+
+# Create output directories
 if image_folder.exists(): os.makedirs(video_output_folder, exist_ok=True)
 if disparity_folder.exists(): os.makedirs(disparity_output_folder, exist_ok=True)
 if depth_folder.exists(): os.makedirs(disparity_output_folder, exist_ok=True)
@@ -392,18 +398,21 @@ for start_idx in tqdm(range(0, num_images - clip_length * sample_every_nth + 1, 
     # RGB video output
     out_path = os.path.join(video_output_folder, f"{clip_idx:05}.mp4")
     if not args.dry_run:
-        frames = []
-        for frame_path in clip_frames:
-            frame = iio.imread(frame_path)
-            if output_size:
-                frame = cv2.resize(frame, output_size)
-            frames.append(frame)
-        iio.imwrite(
-            out_path,
-            np.stack(frames),
-            fps=fps,
-            codec='libx264'
-        )
+        if os.path.exists(out_path) and args.skip_existing_clips:
+            print(f"Skipping existing video: {out_path}")
+        else:
+            frames = []
+            for frame_path in clip_frames:
+                frame = iio.imread(frame_path)
+                if output_size:
+                    frame = cv2.resize(frame, output_size)
+                frames.append(frame)
+            iio.imwrite(
+                out_path,
+                np.stack(frames),
+                fps=fps,
+                codec='libx264'
+            )
     else:
         print(f"Would create video: {out_path}")
 
@@ -413,54 +422,63 @@ for start_idx in tqdm(range(0, num_images - clip_length * sample_every_nth + 1, 
             # Save as MP4 video
             out_path = os.path.join(disparity_output_folder, f"{clip_idx:05}.mp4")
             if not args.dry_run:
-                disparity_frames = []
-                for disparity_path in clip_disparity:
-                    disparity_frame = iio.imread(disparity_path)
-                    if output_size:
-                        disparity_frame = cv2.resize(disparity_frame, output_size)
-                    disparity_frames.append(disparity_frame)
-                iio.imwrite(
-                    out_path,
-                    np.stack(disparity_frames),
-                    fps=fps,
-                    codec='libx264'
-                )
+                if os.path.exists(out_path) and args.skip_existing_clips:
+                    print(f"Skipping existing disparity video: {out_path}")
+                else:
+                    disparity_frames = []
+                    for disparity_path in clip_disparity:
+                        disparity_frame = iio.imread(disparity_path)
+                        if output_size:
+                            disparity_frame = cv2.resize(disparity_frame, output_size)
+                        disparity_frames.append(disparity_frame)
+                    iio.imwrite(
+                        out_path,
+                        np.stack(disparity_frames),
+                        fps=fps,
+                        codec='libx264'
+                    )
             else:
                 print(f"Would create disparity video: {out_path}")
         elif args.disparity_format == "npy":
             # Save as concatenated NPY file
             out_path = os.path.join(disparity_output_folder, f"{clip_idx:05}.npy")
             if not args.dry_run:
-                disparity_frames = []
-                for disparity_path in clip_disparity:
-                    disparity_frame = iio.imread(disparity_path)
-                    if output_size:
-                        disparity_frame = cv2.resize(disparity_frame, output_size)
-                    # Convert to grayscale if RGB
-                    if disparity_frame.ndim == 3 and disparity_frame.shape[-1] == 3:
-                        disparity_frame = np.mean(disparity_frame, axis=-1)
-                    disparity_frames.append(disparity_frame.astype(np.float32))
-                # Stack frames and save as NPY
-                disparity_sequence = np.stack(disparity_frames, axis=0)
-                np.save(out_path, disparity_sequence)
+                if os.path.exists(out_path) and args.skip_existing_clips:
+                    print(f"Skipping existing disparity npy: {out_path}")
+                else:
+                    disparity_frames = []
+                    for disparity_path in clip_disparity:
+                        disparity_frame = iio.imread(disparity_path)
+                        if output_size:
+                            disparity_frame = cv2.resize(disparity_frame, output_size)
+                        # Convert to grayscale if RGB
+                        if disparity_frame.ndim == 3 and disparity_frame.shape[-1] == 3:
+                            disparity_frame = np.mean(disparity_frame, axis=-1)
+                        disparity_frames.append(disparity_frame.astype(np.float32))
+                    # Stack frames and save as NPY
+                    disparity_sequence = np.stack(disparity_frames, axis=0)
+                    np.save(out_path, disparity_sequence)
             else:
                 print(f"Would create disparity npy: {out_path}")
         else:  # npz format
             # Save as compressed NPZ file
             out_path = os.path.join(disparity_output_folder, f"{clip_idx:05}.npz")
             if not args.dry_run:
-                disparity_frames = []
-                for disparity_path in clip_disparity:
-                    disparity_frame = iio.imread(disparity_path)
-                    if output_size:
-                        disparity_frame = cv2.resize(disparity_frame, output_size)
-                    # Convert to grayscale if RGB
-                    if disparity_frame.ndim == 3 and disparity_frame.shape[-1] == 3:
-                        disparity_frame = np.mean(disparity_frame, axis=-1)
-                    disparity_frames.append(disparity_frame.astype(np.float16))
-                # Stack frames and save as compressed NPZ
-                disparity_sequence = np.stack(disparity_frames, axis=0)
-                np.savez_compressed(out_path, disparity=disparity_sequence)
+                if os.path.exists(out_path) and args.skip_existing_clips:
+                    print(f"Skipping existing disparity npz: {out_path}")
+                else:
+                    disparity_frames = []
+                    for disparity_path in clip_disparity:
+                        disparity_frame = iio.imread(disparity_path)
+                        if output_size:
+                            disparity_frame = cv2.resize(disparity_frame, output_size)
+                        # Convert to grayscale if RGB
+                        if disparity_frame.ndim == 3 and disparity_frame.shape[-1] == 3:
+                            disparity_frame = np.mean(disparity_frame, axis=-1)
+                        disparity_frames.append(disparity_frame.astype(np.float16))
+                    # Stack frames and save as compressed NPZ
+                    disparity_sequence = np.stack(disparity_frames, axis=0)
+                    np.savez_compressed(out_path, disparity=disparity_sequence)
             else:
                 print(f"Would create disparity npz: {out_path}")
     
@@ -494,59 +512,77 @@ for start_idx in tqdm(range(0, num_images - clip_length * sample_every_nth + 1, 
             # Save as MP4 video
             out_path = os.path.join(disparity_output_folder, f"{clip_idx:05}.mp4")
             if not args.dry_run:
-                disparity_frames = []
-                for i, disparity in enumerate(disparity_stack):
-                    # Convert to 8-bit grayscale (0-255)
-                    disparity_8bit = (disparity * 255).astype(np.uint8)
-                    if output_size:
-                        disparity_8bit = cv2.resize(disparity_8bit, output_size)
-                    disparity_frames.append(disparity_8bit)
-                iio.imwrite(
-                    out_path,
-                    np.stack(disparity_frames),
-                    fps=fps,
-                    codec='libx264'
-                )
+                if os.path.exists(out_path) and args.skip_existing_clips:
+                    print(f"Skipping existing disparity video: {out_path}")
+                else:
+                    disparity_frames = []
+                    for i, disparity in enumerate(disparity_stack):
+                        # Convert to 8-bit grayscale (0-255)
+                        disparity_8bit = (disparity * 255).astype(np.uint8)
+                        if output_size:
+                            disparity_8bit = cv2.resize(disparity_8bit, output_size)
+                        disparity_frames.append(disparity_8bit)
+                    iio.imwrite(
+                        out_path,
+                        np.stack(disparity_frames),
+                        fps=fps,
+                        codec='libx264'
+                    )
             else:
                 print(f"Would create disparity video: {out_path}")
         elif args.disparity_format == "npy":
             # Save as concatenated NPY file
             out_path = os.path.join(disparity_output_folder, f"{clip_idx:05}.npy")
             if not args.dry_run:
-                # Stack frames and save as NPY
-                np.save(out_path, disparity_stack.astype(np.float32))
+                if os.path.exists(out_path) and args.skip_existing_clips:
+                    print(f"Skipping existing disparity npy: {out_path}")
+                else:
+                    # Stack frames and save as NPY
+                    np.save(out_path, disparity_stack.astype(np.float32))
             else:
                 print(f"Would create disparity npy: {out_path}")
         else:  # npz format
             # Save as compressed NPZ file
             out_path = os.path.join(disparity_output_folder, f"{clip_idx:05}.npz")
             if not args.dry_run:
-                # Stack frames and save as compressed NPZ
-                np.savez_compressed(out_path, disparity=disparity_stack.astype(np.float16))
+                if os.path.exists(out_path) and args.skip_existing_clips:
+                    print(f"Skipping existing disparity npz: {out_path}")
+                else:
+                    # Stack frames and save as compressed NPZ
+                    np.savez_compressed(out_path, disparity=disparity_stack.astype(np.float16))
             else:
                 print(f"Would create disparity npz: {out_path}")
 
     # Camera trajectory output
     if cam_param_folder.exists():
         if not args.dry_run:
-            cam_params = [np.load(cam_param_path) for cam_param_path in clip_cam_params]
-            T0_inv = np.linalg.inv(cam_params[0])
-            relative_trajectory = np.array([T0_inv @ T for T in cam_params]) # relative to the first frame
-            absolute_trajectory = np.array(cam_params) # absolute trajectory in world coordinates
+            relative_path = os.path.join(trajectory_output_folder, f"{clip_idx:05}.npy")
+            absolute_path = os.path.join(trajectory_output_folder, f"{clip_idx:05}_abs.npy")
+            
+            # Check if both trajectory files exist
+            if os.path.exists(relative_path) and os.path.exists(absolute_path) and args.skip_existing_clips:
+                print(f"Skipping existing trajectory files: {relative_path}, {absolute_path}")
+            else:
+                cam_params = [np.load(cam_param_path) for cam_param_path in clip_cam_params]
+                T0_inv = np.linalg.inv(cam_params[0])
+                relative_trajectory = np.array([T0_inv @ T for T in cam_params]) # relative to the first frame
+                absolute_trajectory = np.array(cam_params) # absolute trajectory in world coordinates
 
-            np.save(os.path.join(trajectory_output_folder, f"{clip_idx:05}.npy"), relative_trajectory)
-            np.save(os.path.join(trajectory_output_folder, f"{clip_idx:05}_abs.npy"), absolute_trajectory)
+                np.save(relative_path, relative_trajectory)
+                np.save(absolute_path, absolute_trajectory)
         else:
             print(f"Would create trajectory files: {clip_idx:05}.npy, {clip_idx:05}_abs.npy")
 
     # Human pose output - egoallo format (ARIA datasets)
     if args.dataset_type == "aria" and clip_smplh is not None:
         if not args.dry_run:
-            np.savez_compressed(os.path.join(human_pose_output_folder, f"{clip_idx:05}.npz"), **clip_smplh)
+            pose_path = os.path.join(human_pose_output_folder, f"{clip_idx:05}.npz")
+            if os.path.exists(pose_path) and args.skip_existing_clips:
+                print(f"Skipping existing egoallo pose file: {pose_path}")
+            else:
+                np.savez_compressed(pose_path, **clip_smplh)
         else:
             print(f"Would create egoallo pose file: {clip_idx:05}.npz")
-
-
 
     # SMPLX pose output (Trumans datasets) - same format as ARIA
     if args.dataset_type == "trumans" and smplx_data is not None:
@@ -560,31 +596,34 @@ for start_idx in tqdm(range(0, num_images - clip_length * sample_every_nth + 1, 
             # Ensure we don't go out of bounds
             if clip_end <= body_pose.shape[0]:
                 if not args.dry_run:
-                    clip_body_pose = body_pose[clip_start:clip_end:sample_every_nth]
-                    
-                    # Prepare SMPLX data in the same format as ARIA egoallo data
-                    smplx_clip_data = {}
-                    
-                    # Add all SMPLX parameters (following ARIA case pattern)
-                    for key, value in smplx_data.items():
-                        # Skip non-numerical data (NPZ can only store numpy arrays)
-                        if not isinstance(value, np.ndarray):
-                            print(f"⚠️  Skipping SMPLX key '{key}' - not a numpy array (type: {type(value)})")
-                            continue
-                            
-                        if value.shape[0] == body_pose.shape[0]:
-                            # Only include parameters that have the same number of frames
-                            smplx_clip_data[key] = value[clip_start:clip_end:sample_every_nth].astype(np.float32)
-                        elif len(value.shape) == 1:
-                            # Handle scalar parameters (like betas) that don't have frame dimension
-                            smplx_clip_data[key] = value.astype(np.float32)
-                        else:
-                            # Skip arrays with different frame count
-                            print(f"⚠️  Skipping SMPLX key '{key}' with different frame count: {value.shape[0]} vs {body_pose.shape[0]}")
-                    
-                    # Save as compressed NPZ (same format as ARIA)
                     out_path = os.path.join(human_pose_output_folder, f"{clip_idx:05}.npz")
-                    np.savez_compressed(out_path, **smplx_clip_data)
+                    if os.path.exists(out_path) and args.skip_existing_clips:
+                        print(f"Skipping existing SMPLX pose file: {out_path}")
+                    else:
+                        clip_body_pose = body_pose[clip_start:clip_end:sample_every_nth]
+                        
+                        # Prepare SMPLX data in the same format as ARIA egoallo data
+                        smplx_clip_data = {}
+                        
+                        # Add all SMPLX parameters (following ARIA case pattern)
+                        for key, value in smplx_data.items():
+                            # Skip non-numerical data (NPZ can only store numpy arrays)
+                            if not isinstance(value, np.ndarray):
+                                print(f"⚠️  Skipping SMPLX key '{key}' - not a numpy array (type: {type(value)})")
+                                continue
+                                
+                            if value.shape[0] == body_pose.shape[0]:
+                                # Only include parameters that have the same number of frames
+                                smplx_clip_data[key] = value[clip_start:clip_end:sample_every_nth].astype(np.float32)
+                            elif len(value.shape) == 1:
+                                # Handle scalar parameters (like betas) that don't have frame dimension
+                                smplx_clip_data[key] = value.astype(np.float32)
+                            else:
+                                # Skip arrays with different frame count
+                                print(f"⚠️  Skipping SMPLX key '{key}' with different frame count: {value.shape[0]} vs {body_pose.shape[0]}")
+                        
+                        # Save as compressed NPZ (same format as ARIA)
+                        np.savez_compressed(out_path, **smplx_clip_data)
                 else:
                     print(f"Would create SMPLX pose file: {clip_idx:05}.npz")
             else:
