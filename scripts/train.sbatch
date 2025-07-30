@@ -7,9 +7,9 @@
 #SBATCH --error=out/world_model_lab_00_%j.err
 #SBATCH --comment="Training World Model on Lab 00 Dataset camera pose estimation"
 
-# source ~/.bashrc
-# source $(conda info --base)/etc/profile.d/conda.sh
-# conda activate tavid
+source ~/.bashrc
+source $(conda info --base)/etc/profile.d/conda.sh
+conda activate world_model
 
 export TORCH_LOGS="+dynamo,recompiles,graph_breaks"
 export TORCHDYNAMO_VERBOSE=1

@@ -215,7 +215,7 @@ def log_validation(
             filename = os.path.join(args.output_dir, f"step_{step}", f"{pipeline_args['task']}", f"{name}_disp.mp4")
             export_to_video(colorize_depth(disparity), filename, fps=8)
             filename = os.path.join(args.output_dir, f"step_{step}", f"{pipeline_args['task']}", f"{name}_disp.npz")
-            np.savez_compressed(filename, disparity=disparity.cpu().numpy())
+            np.savez_compressed(filename, disparity=disparity)
             video_filenames.append(filename)
 
         # tracker.log(
