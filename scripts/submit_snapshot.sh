@@ -2,7 +2,7 @@
 
 # ==== Config ====
 JOB_SCRIPT="scripts/train.sbatch"              # Your Slurm script
-SNAPSHOT_ROOT="/scratch/$USER/jobs"            # Where snapshots are stored
+SNAPSHOT_ROOT="/scratch/jobs"            # Where snapshots are stored
 JOB_NAME=$(basename "$JOB_SCRIPT" .sbatch)     # Default job name from script name
 
 # Optional: Take optional job label as first argument
