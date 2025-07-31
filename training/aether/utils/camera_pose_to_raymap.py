@@ -135,6 +135,12 @@ def main(args):
                     print(f"Warning: Disparity file {disparity_path} not found, skipping...")
                     continue
                 disparity = np.load(disparity_path)
+            
+            # Apply reverse sqrt operation for NPY/NPZ formats (same as MP4 videos)
+            if args.reverse_sqrt:
+                disparity = disparity ** 2
+                print(f"Applied reverse sqrt (squared) to {args.disparity_format} disparity data for {args.dataset_type} dataset")
+            
             dmax = disparity.max()
 
             # If disparity is 3D (T, H, W), extract frames
@@ -145,9 +151,9 @@ def main(args):
                 disparity_frames = [disparity]
 
         # Handle dmax value appropriately
-        # For all formats, we use the dmax value directly
-        # - For EXR-derived NPY: dmax represents pre-normalization maximum (data is normalized to [0,1])
-        # - For DepthAnyVideo NPY: dmax represents the actual maximum (typically ≤ 1.0)
+        # For Trumans datasets: reverse sqrt operation is applied (sqrt was applied in exr_to_disparity.py/make_sequences.py)
+        # For ARIA datasets: no reverse sqrt operation (DepthAnyVideo doesn't apply sqrt)
+        # - For EXR-derived NPY/NPZ: dmax represents pre-normalization maximum (data is normalized to [0,1])
         # - For MP4 videos: dmax represents the actual maximum (typically ≈ 1.0)
         
         print(f"Using dmax={dmax:.6f} for {args.disparity_format} format")
@@ -168,16 +174,30 @@ if __name__ == "__main__":
     parser.add_argument("--data_root", type=str, required=True, help="Data root dir.")
     parser.add_argument("--disparity_format", type=str, choices=["video", "npy", "npz", "auto"], 
                        default="auto", help="Format of disparity data: video (MP4), npy, or npz files")
-    parser.add_argument("--reverse_sqrt", action="store_true", default=True,
-                       help="Whether to square disparity values to reverse sqrt operation from exr_to_disparity.py")
+    parser.add_argument("--dataset_type", type=str, choices=["aria", "trumans"], 
+                       default="trumans", help="Dataset type: 'aria' for DepthAnyVideo results, 'trumans' for Blender rendering (default: trumans)")
+    parser.add_argument("--reverse_sqrt", type=bool, default=True,
+                       help="Whether to square disparity values to reverse sqrt operation from exr_to_disparity.py/make_sequences.py (default: True)")
     parser.add_argument("--no_reverse_sqrt", action="store_true", default=False,
                        help="Disable reverse sqrt operation (use with --no_sqrt_disparity in exr_to_disparity.py)")
     parser.add_argument("--debug", action="store_true", help="Process only one trajectory for debugging")
     args = parser.parse_args()
     
-    # Set reverse_sqrt based on arguments
-    if args.no_reverse_sqrt:
+    print(f"📊 Dataset type: {args.dataset_type.upper()}")
+    
+    # Set reverse_sqrt based on dataset type and arguments
+    # Trumans datasets need reverse sqrt (sqrt applied in exr_to_disparity.py/make_sequences.py)
+    # ARIA datasets don't need reverse sqrt (DepthAnyVideo doesn't apply sqrt)
+    if args.no_reverse_sqrt or args.dataset_type == "aria":
         args.reverse_sqrt = False
+        if args.dataset_type == "aria":
+            print(f"ℹ️  ARIA dataset - disabling reverse sqrt (DepthAnyVideo doesn't apply sqrt)")
+        else:
+            print(f"ℹ️  Manual override - disabling reverse sqrt")
+    else:
+        args.reverse_sqrt = True
+        print(f"ℹ️  Trumans dataset - enabling reverse sqrt (to reverse sqrt from exr_to_disparity.py/make_sequences.py)")
+    
     print(f"Using reverse_sqrt: {args.reverse_sqrt}")
 
     main(args)
