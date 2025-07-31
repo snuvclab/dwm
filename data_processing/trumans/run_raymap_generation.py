@@ -40,10 +40,10 @@ def check_action_requirements(action_path):
         os.path.join(action_path, "cam_params", "intrinsics.npy"),
     ]
     
-    # Check for either disparity or disparity_video
+    # Check for disparity formats: disparity (npy/npz), disparity_video (mp4)
     disp_paths = [
-        os.path.join(action_path, "sequences", "disparity"),
-        os.path.join(action_path, "sequences", "disparity_video"),
+        os.path.join(action_path, "sequences", "disparity"),  # npy/npz files
+        os.path.join(action_path, "sequences", "disparity_video"),  # mp4 files
     ]
     
     # Check if at least one disparity directory exists
@@ -72,8 +72,13 @@ def check_raymaps_exist(action_path, disparity_format="auto"):
     if not trajectory_files:
         return False
     
-    # Get all existing raymap files
-    raymap_files = list(Path(raymaps_path).glob("*.npy"))
+    # Get existing raymap files based on specified format
+    if disparity_format == "npy":
+        raymap_files = list(Path(raymaps_path).glob("*.npy"))
+    elif disparity_format == "npz":
+        raymap_files = list(Path(raymaps_path).glob("*.npz"))
+    else:  # auto or video - check both formats
+        raymap_files = list(Path(raymaps_path).glob("*.npy")) + list(Path(raymaps_path).glob("*.npz"))
     
     # Check if we have the same number of raymaps as trajectories
     if len(raymap_files) != len(trajectory_files):
@@ -128,8 +133,8 @@ def main():
     parser = argparse.ArgumentParser(description="Run raymap generation for all actions in all scenes")
     parser.add_argument("--data_root", type=str, default="data/trumans/250712_sample", 
                        help="Root directory containing scene data")
-    parser.add_argument("--disparity_format", type=str, choices=["video", "npy", "auto"], 
-                       default="auto", help="Format of disparity data")
+    parser.add_argument("--disparity_format", type=str, choices=["video", "npy", "npz", "auto"], 
+                       default="auto", help="Format of disparity data: 'video' for MP4, 'npy' for uncompressed, 'npz' for compressed, 'auto' to auto-detect")
     parser.add_argument("--debug", action="store_true", help="Process only one action for debugging")
     parser.add_argument("--dry_run", action="store_true", help="Show what would be processed without running")
     parser.add_argument("--skip_existing", action="store_true", help="Skip actions that already have raymaps")
@@ -166,7 +171,14 @@ def main():
                 if os.path.exists(trajectory_path):
                     trajectory_files = list(Path(trajectory_path).glob("*.npy"))
                     if os.path.exists(raymaps_path):
-                        raymap_files = list(Path(raymaps_path).glob("*.npy"))
+                        # Get raymap files based on specified format
+                        if args.disparity_format == "npy":
+                            raymap_files = list(Path(raymaps_path).glob("*.npy"))
+                        elif args.disparity_format == "npz":
+                            raymap_files = list(Path(raymaps_path).glob("*.npz"))
+                        else:  # auto or video - check both formats
+                            raymap_files = list(Path(raymaps_path).glob("*.npy")) + list(Path(raymaps_path).glob("*.npz"))
+                        
                         missing_count = len(trajectory_files) - len(raymap_files)
                         if missing_count > 0:
                             print(f"🔄 Processing {action['scene']}/{action['action']}: {missing_count} raymaps missing ({len(raymap_files)}/{len(trajectory_files)})")
@@ -199,7 +211,7 @@ def main():
                     print(f"   ❌ {path} (MISSING)")
             
             if not has_disparity:
-                print(f"   ❌ No disparity data found (need either 'disparity' or 'disparity_video' directory)")
+                print(f"   ❌ No disparity data found (need either 'disparity' directory with .npy/.npz files or 'disparity_video' directory with .mp4 files)")
             
             print()  # Empty line for readability
     
