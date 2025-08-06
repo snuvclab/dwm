@@ -1,3 +1,9 @@
+"""
+Visualize camera poses and SMPL/SMPLX human meshes in 3D space using viser.
+
+This script supports both ARIA (egoallo) and Trumans (SMPLX) datasets.
+For Trumans datasets, it applies coordinate transformation from Blender to viser coordinates.
+"""
 import random
 import time
 import numpy as np
@@ -9,22 +15,26 @@ import math
 import argparse
 from pathlib import Path
 import imageio.v3 as iio
-import numpy as np
-
 
 import viser
 import viser.transforms as tf
 
-import projectaria_tools.core.mps as mps
-from projectaria_tools.core.mps.utils import filter_points_from_confidence
-
 # Add the project root to sys.path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from training.aether.utils.postprocess_utils import postprocess_pointmap
+from training.aether.utils.postprocess_utils import camera_pose_to_raymap
 
-from egoallo import fncsmpl, fncsmpl_extensions
 import trimesh
 import torch
+
+# Coordinate transformation matrix for Blender to viser conversion
+# 90° rotation around X-axis: Y->Z, Z->-Y
+BLENDER_TO_VISER_TRANSFORM = np.array([
+    [1,  0,  0,  0],
+    [0,  0, -1,  0],
+    [0,  1,  0,  0],
+    [0,  0,  0,  1]
+])
 
 def quat_inv(q):
     q_inv = q.clone()
@@ -67,6 +77,92 @@ def compose_se3_qwxyz(pose1, pose2):
 
     return torch.cat([q_new, t_new], dim=-1)
 
+def create_zero_pose_smplx_mesh(smpl_model, device, dataset_type, server):
+    """
+    Create a zero pose SMPLX mesh for debugging purposes.
+    
+    Args:
+        smpl_model: SMPLX model instance
+        device: PyTorch device
+        dataset_type: Dataset type ("aria" or "trumans")
+        server: Viser server instance
+    
+    Returns:
+        None (adds mesh to server scene)
+    """
+    print("🔄 Creating zero pose SMPLX mesh for debugging...")
+    
+    # Create zero pose parameters
+    zero_betas = torch.zeros(1, 10, device=device, dtype=torch.float32)
+    zero_global_orient = torch.zeros(1, 3, device=device, dtype=torch.float32)
+    zero_body_pose = torch.zeros(1, 63, device=device, dtype=torch.float32)  # SMPLX: 21 joints * 3
+    zero_left_hand_pose = torch.zeros(1, 45, device=device, dtype=torch.float32)  # 15 joints * 3
+    zero_right_hand_pose = torch.zeros(1, 45, device=device, dtype=torch.float32)  # 15 joints * 3
+    zero_jaw_pose = torch.zeros(1, 3, device=device, dtype=torch.float32)
+    zero_leye_pose = torch.zeros(1, 3, device=device, dtype=torch.float32)
+    zero_reye_pose = torch.zeros(1, 3, device=device, dtype=torch.float32)
+    zero_transl = torch.zeros(1, 3, device=device, dtype=torch.float32)
+    
+    # Create SMPLX output with zero pose
+    zero_smplx_output = smpl_model(
+        betas=zero_betas,
+        global_orient=zero_global_orient,
+        body_pose=zero_body_pose,
+        left_hand_pose=zero_left_hand_pose,
+        right_hand_pose=zero_right_hand_pose,
+        jaw_pose=zero_jaw_pose,
+        leye_pose=zero_leye_pose,
+        reye_pose=zero_reye_pose,
+        transl=zero_transl,
+        return_verts=True,
+        return_full_pose=True,
+        use_pca=False
+    )
+    
+    # Get vertices and faces
+    zero_vertices = zero_smplx_output.vertices.detach().cpu().numpy().squeeze()
+    zero_vertex_colors = np.array([255, 0, 0])  # Red color for zero pose
+    
+    # Get faces from the model
+    if hasattr(smpl_model, 'faces'):
+        if hasattr(smpl_model.faces, 'cpu'):
+            zero_faces = smpl_model.faces.cpu().numpy()
+        else:
+            zero_faces = smpl_model.faces
+    else:
+        if hasattr(smpl_model.faces_tensor, 'cpu'):
+            zero_faces = smpl_model.faces_tensor.cpu().numpy()
+        else:
+            zero_faces = smpl_model.faces_tensor
+    
+    # Apply coordinate transformation for Trumans dataset
+    if dataset_type == "trumans":
+        print("🔄 Applying coordinate transformation to zero pose SMPLX mesh...")
+        
+        # Apply coordinate transformation directly to vertices (avoid global_orient translation issue)
+        vertices_homogeneous = np.concatenate([zero_vertices, np.ones((zero_vertices.shape[0], 1))], axis=1)
+        vertices_transformed_homogeneous = (BLENDER_TO_VISER_TRANSFORM @ vertices_homogeneous.T).T
+        zero_vertices_transformed = vertices_transformed_homogeneous[:, :3]
+        
+        zero_mesh_out = trimesh.Trimesh(
+            vertices=zero_vertices_transformed,
+            faces=zero_faces,
+            vertex_colors=np.repeat(zero_vertex_colors[None, :], zero_vertices_transformed.shape[0], axis=0)
+        )
+        print("✅ Applied coordinate transformation to zero pose mesh")
+    else:
+        # For ARIA: Use original zero pose
+        zero_mesh_out = trimesh.Trimesh(
+            vertices=zero_vertices,
+            faces=zero_faces,
+            vertex_colors=np.repeat(zero_vertex_colors[None, :], zero_vertices.shape[0], axis=0)
+        )
+    
+    server.scene.add_mesh_trimesh(
+        "/zero_pose_smplx",
+        mesh=zero_mesh_out,
+    )
+    print("✅ Added zero pose SMPLX mesh (red) for debugging")
 
 def diagonal_fov(fov_x_deg, fov_y_deg):
     fov_x_rad = math.radians(fov_x_deg)
@@ -78,15 +174,48 @@ def diagonal_fov(fov_x_deg, fov_y_deg):
     diag_fov_rad = 2 * math.atan(math.sqrt(tan_x**2 + tan_y**2))
     return math.degrees(diag_fov_rad)
 
+def load_trimesh_obj(path: str):
+    mesh = trimesh.load(path, force='mesh', process=False)
+    if isinstance(mesh, trimesh.Scene):
+        mesh = mesh.dump().sum()
+    return mesh
                         
 def main():
 
     parser = argparse.ArgumentParser(description="Visualize camera poses and point clouds.")
     parser.add_argument("--data_root", type=str, required=True, help="Root directory containing data.")
     parser.add_argument("--name", type=str, required=True, help="Name of the sequence.")
+    parser.add_argument("--dataset_type", type=str, choices=["aria", "trumans"], default=None,
+                       help="Dataset type: 'aria' for egoallo data, 'trumans' for SMPLX data. Auto-detected if not specified.")
+    parser.add_argument("--camera_type", type=str, choices=["relative", "absolute"], default="relative",
+                       help="Camera trajectory type: 'relative' for relative poses, 'absolute' for absolute poses")
     args = parser.parse_args()
 
     data_root = Path(args.data_root)
+
+    # Auto-detect dataset type if not specified
+    egoallo_human_pose_file = data_root / "egoallo.npz"
+    if args.dataset_type is None:
+        if egoallo_human_pose_file.exists():
+            args.dataset_type = "aria"
+            print(f"🔍 Auto-detected dataset type: ARIA (found egoallo.npz)")
+        else:
+            args.dataset_type = "trumans"
+            print(f"🔍 Auto-detected dataset type: Trumans (SMPLX processing enabled)")
+    
+    print(f"📊 Dataset type: {args.dataset_type.upper()}")
+
+    # Import egoallo only for ARIA datasets
+    if args.dataset_type == "aria":
+        try:
+            import projectaria_tools.core.mps as mps
+            from projectaria_tools.core.mps.utils import filter_points_from_confidence
+            print("📁 Imported projectaria_tools for ARIA dataset")
+            from egoallo import fncsmpl, fncsmpl_extensions
+            print("📁 Imported egoallo for ARIA dataset")
+        except ImportError:
+            print("❌ Error: egoallo library not found. Please install it for ARIA datasets.")
+            return
 
     server = viser.ViserServer()
     num_frames = 49
@@ -98,7 +227,18 @@ def main():
         position=(0, 0, 0),
     )
 
-
+    # # Add oven.obj mesh to the scene
+    # oven_mesh = load_trimesh_obj("./oven.obj")
+    # server.scene.add_mesh_trimesh(
+    #     "/oven",
+    #     mesh=oven_mesh,
+    # )
+    # smpl_mesh = load_trimesh_obj("./smplx.obj")
+    # server.scene.add_mesh_trimesh(
+    #     "/smpl",
+    #     mesh=smpl_mesh,
+    # )
+    
     # Initial camera pose.
     @server.on_client_connect
     def _(client: viser.ClientHandle) -> None:
@@ -174,26 +314,41 @@ def main():
     smpl_nodes: list[viser.FrameHandle] = []
     
     # GT camera poses
-    with open(data_root / "trajectory" / f"{args.name}.npy", "rb") as f:
+    trajectory_suffix = "_abs" if args.camera_type == "absolute" else ""
+    with open(data_root / "trajectory" / f"{args.name}{trajectory_suffix}.npy", "rb") as f:
         gt_trajectory = np.load(f)
     gt_intrinsics = np.load(data_root.parent / "cam_params" / "intrinsics.npy")
     gt_frames = iio.imread(data_root / "videos" / f"{args.name}.mp4")
 
     disparities = np.load(data_root / "disparity" / f"{args.name}.npz")["disparity"]
-    raymaps = np.load(data_root / "raymaps" / f"{args.name}.npz")["raymap"]
+
+    raymaps = np.load(data_root / "raymaps" / f"{args.name}{trajectory_suffix}.npz")["raymap"]
     human_motions = np.load(data_root / "human_motions" / f"{args.name}.npz")
 
     # Calculate point maps using disparities and raymaps
     point_maps = postprocess_pointmap(
         disparity= disparities,
-        raymap=raymaps,
+        raymap=raymaps.copy(),
         ray_o_scale_inv=0.1,
     )["pointmap"]
 
-    # Create the SMPLH model
-    model_path = '/media/taeksoo/SSD1/github1/egoallo/data/smplh/neutral/model.npz'
+    # Create the SMPL model based on dataset type
     device = "cuda"
-    smplh_model = fncsmpl.SmplhModel.load(model_path).to(device)
+    if args.dataset_type == "aria":
+        # Use SMPLH model for ARIA datasets (egoallo)
+        model_path = '/media/taeksoo/SSD1/github1/egoallo/data/smplh/neutral/model.npz'
+        smpl_model = fncsmpl.SmplhModel.load(model_path).to(device)
+        print(f"📁 Loaded SMPLH model for ARIA dataset")
+    elif args.dataset_type == "trumans":
+        # Use SMPLX model for Trumans datasets
+        try:
+            import smplx
+            smpl_model = smplx.create('smpl_models/smplx/SMPLX_MALE.npz', model_type='smplx', gender='male', use_pca=False).to(device)
+            print(f"📁 Loaded SMPLX model for Trumans dataset")
+        except ImportError:
+            raise ImportError("⚠️  Warning: smplx library not found. Please install it with: pip install smplx")
+    else:
+        raise ValueError(f"Unknown dataset type: {args.dataset_type}")
 
 
     # unify coordinates between camera and human motions
@@ -207,6 +362,8 @@ def main():
     #     global_orient_axis.append(T_world_root[:4])
     #     transl_axis.append(T_world_root[4:])
 
+    # # Create zero pose SMPLX mesh for debugging
+    # create_zero_pose_smplx_mesh(smpl_model, device, args.dataset_type, server)
 
 
     for i in tqdm(range(num_frames)):
@@ -246,57 +403,105 @@ def main():
             origin_color=(0, 0, 0),  # black for ground truth
         )
 
-        # Add SMPLH mesh
-        smplh_shape = smplh_model.with_shape(betas=torch.tensor(human_motions['betas'][i, :], device=device))
 
-        local_quats = torch.cat([
-            torch.tensor(human_motions['body_pose_quat'][i, :], device=device),
-            torch.tensor(human_motions['left_hand_pose_quat'][i, :], device=device),
-            torch.tensor(human_motions['right_hand_pose_quat'][i, :], device=device),
-        ], dim=0)
+        # Add SMPL mesh based on dataset type
+        if args.dataset_type == "aria":
+            # Process egoallo data for ARIA datasets
+            smpl_shape = smpl_model.with_shape(betas=torch.tensor(human_motions['betas'][i, :], device=device))
 
-        # first_frame_Ts_world_root = torch.cat([
-        #     torch.tensor(global_orient_axis[0], device=device),
-        #     torch.tensor(transl_axis[0], device=device),
-        # ])
-        # first_frame_inv = se3_inverse_qwxyz(first_frame_Ts_world_root)
+            local_quats = torch.cat([
+                torch.tensor(human_motions['body_pose_quat'][i, :], device=device),
+                torch.tensor(human_motions['left_hand_pose_quat'][i, :], device=device),
+                torch.tensor(human_motions['right_hand_pose_quat'][i, :], device=device),
+            ], dim=0)
 
-        # Ts_world_root = torch.cat([
-        #     torch.tensor(global_orient_axis[i], device=device),
-        #     torch.tensor(transl_axis[i], device=device),
-        # ])
-        # Ts_world_root = compose_se3_qwxyz(first_frame_inv, Ts_world_root)
-        # smplh_pose = smplh_shape.with_pose(T_world_root=Ts_world_root,
-        #                                 local_quats=local_quats)
+            # Local visualization for ARIA
+            smpl_pose = smpl_shape.with_pose(T_world_root=torch.tensor([1, 0, 0, 0, 0, 0, 0], device=device, dtype=torch.float32),
+                                            local_quats=local_quats)
+            cpf_pos = torch.tensor((tf.SE3.from_matrix((gt_trajectory[i]))).wxyz_xyz, dtype=torch.float32, device=device)
+            cpf_pos = compose_se3_qwxyz(cpf_pos, torch.tensor([0, 0, 0, 1, 0, 0, 0], device=device, dtype=torch.float32))
+            T_world_root = fncsmpl_extensions.get_T_world_root_from_cpf_pose(smpl_pose, cpf_pos)
+            smpl_pose = smpl_shape.with_pose(T_world_root=T_world_root,
+                                            local_quats=local_quats)
 
-
-        # # Global visualization
-        # Ts_world_root = torch.cat([
-        #     torch.tensor(human_motions['global_orient_quat'][i, :], device=device),
-        #     torch.tensor(human_motions['transl'][i, :], device=device),
-        # ])
-        # smplh_pose = smplh_shape.with_pose(T_world_root=Ts_world_root,
-        #                                 local_quats=local_quats)
+            mesh = smpl_pose.lbs()
+            
+        elif args.dataset_type == "trumans":
+            # Process SMPLX data for Trumans datasets
+            import smplx
+            
+            # Extract SMPLX parameters
+            if 'betas' in human_motions and human_motions['betas'].size > 0:
+                betas = torch.tensor(human_motions['betas'][i:i+1, :], device=device, dtype=torch.float32)
+            else:
+                # Initialize betas as zeros if empty or missing
+                betas = torch.zeros(1, 10, device=device, dtype=torch.float32)  # SMPLX typically has 10 beta parameters
+            
+            global_orient = torch.tensor(human_motions['global_orient'][i:i+1, :], device=device, dtype=torch.float32) if 'global_orient' in human_motions else None
+            body_pose = torch.tensor(human_motions['body_pose'][i:i+1, :], device=device, dtype=torch.float32) if 'body_pose' in human_motions else None
+            left_hand_pose = torch.tensor(human_motions['left_hand_pose'][i:i+1, :], device=device, dtype=torch.float32) if 'left_hand_pose' in human_motions else None
+            right_hand_pose = torch.tensor(human_motions['right_hand_pose'][i:i+1, :], device=device, dtype=torch.float32) if 'right_hand_pose' in human_motions else None
+            jaw_pose = torch.tensor(human_motions['jaw_pose'][i:i+1, :], device=device, dtype=torch.float32) if 'jaw_pose' in human_motions else None
+            leye_pose = torch.tensor(human_motions['leye_pose'][i:i+1, :], device=device, dtype=torch.float32) if 'leye_pose' in human_motions else None
+            reye_pose = torch.tensor(human_motions['reye_pose'][i:i+1, :], device=device, dtype=torch.float32) if 'reye_pose' in human_motions else None
+            transl = torch.tensor(human_motions['transl'][i:i+1, :], device=device, dtype=torch.float32) if 'transl' in human_motions else None
+            # Create SMPLX output with original pose (no global_orient transformation to avoid translation issue)
+            smplx_output = smpl_model(
+                betas=betas,
+                global_orient=global_orient,
+                body_pose=body_pose,
+                left_hand_pose=left_hand_pose,
+                right_hand_pose=right_hand_pose,
+                jaw_pose=jaw_pose,
+                leye_pose=leye_pose,
+                reye_pose=reye_pose,
+                transl=transl,
+                return_verts=True,
+                return_full_pose=True,
+                use_pca=False
+            )
+            
+            # Apply coordinate transformation for Trumans dataset
+            if args.dataset_type == "trumans":
+                vertices = smplx_output.vertices.detach().cpu().numpy().squeeze()
+                
+                # Apply transformation directly to vertices (avoid global_orient translation issue)
+                vertices_homogeneous = np.concatenate([vertices, np.ones((vertices.shape[0], 1))], axis=1)
+                vertices_transformed_homogeneous = (BLENDER_TO_VISER_TRANSFORM @ vertices_homogeneous.T).T
+                vertices_transformed = vertices_transformed_homogeneous[:, :3]
+                
+                mesh = torch.tensor(vertices_transformed, device=device, dtype=torch.float32).unsqueeze(0)
+            else:
+                mesh = smplx_output.vertices
         
-
-        # Local visualization
-        smplh_pose = smplh_shape.with_pose(T_world_root=torch.tensor([1, 0, 0, 0, 0, 0, 0], device=device, dtype=torch.float32),
-                                        local_quats=local_quats)
-        cpf_pos = torch.tensor((tf.SE3.from_matrix((gt_trajectory[i]))).wxyz_xyz, dtype=torch.float32, device=device)
-        cpf_pos = compose_se3_qwxyz(cpf_pos, torch.tensor([0, 0, 0, 1, 0, 0, 0], device=device, dtype=torch.float32))
-        T_world_root = fncsmpl_extensions.get_T_world_root_from_cpf_pose(smplh_pose, cpf_pos)
-        smplh_pose = smplh_shape.with_pose(T_world_root=T_world_root,
-                                        local_quats=local_quats)
-        
-
-        mesh = smplh_pose.lbs()
+        # Create mesh visualization
         vertex_colors = np.array([180, 248, 200])
-        mesh_out = trimesh.Trimesh(vertices=mesh.verts.cpu().numpy() * 1,
-                                faces=mesh.faces.cpu().numpy(),
-                                vertex_colors=np.repeat(vertex_colors[None, :], mesh.verts.shape[0], axis=0))
+        if hasattr(mesh, 'cpu'):
+            vertices = mesh.detach().cpu().numpy()
+        else:
+            vertices = mesh.detach().cpu().numpy()
+            
+        # Get faces from the model
+        if hasattr(smpl_model, 'faces'):
+            if hasattr(smpl_model.faces, 'cpu'):
+                # If it's a tensor, convert to numpy
+                faces = smpl_model.faces.cpu().numpy()
+            else:
+                # If it's already a numpy array
+                faces = smpl_model.faces
+        else:
+            # Fallback for SMPLX
+            if hasattr(smpl_model.faces_tensor, 'cpu'):
+                faces = smpl_model.faces_tensor.cpu().numpy()
+            else:
+                faces = smpl_model.faces_tensor
+            
+        mesh_out = trimesh.Trimesh(vertices=vertices.squeeze() * 1,
+                                faces=faces,
+                                vertex_colors=np.repeat(vertex_colors[None, :], vertices.shape[0], axis=0))
         smpl_nodes.append(
             server.scene.add_mesh_trimesh(
-                f"/frames/t{i}/smplh",
+                f"/frames/t{i}/smpl",
                 mesh=mesh_out,
             )
         )
