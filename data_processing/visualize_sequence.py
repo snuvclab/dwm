@@ -27,13 +27,24 @@ from training.aether.utils.postprocess_utils import camera_pose_to_raymap
 import trimesh
 import torch
 
-# Coordinate transformation matrix for Blender to viser conversion
+# Coordinate transformation matrix for Blender to viser conversion (absolute case)
 # 90° rotation around X-axis: Y->Z, Z->-Y
 BLENDER_TO_VISER_TRANSFORM = np.array([
     [1,  0,  0,  0],
     [0,  0, -1,  0],
     [0,  1,  0,  0],
     [0,  0,  0,  1]
+])
+
+# Coordinate transformation matrix for SMPL to camera coordinate system (relative case)
+# SMPL: +Y up, +Z front
+# Camera: -Y up, +X right, +Z front
+# Transform: Rotate 180° around Z-axis to flip Y direction
+SMPL_TO_CAMERA_TRANSFORM = np.array([
+    [-1,  0,  0,  0],
+    [ 0, -1,  0,  0],
+    [ 0,  0,  1,  0],
+    [ 0,  0,  0,  1]
 ])
 
 def quat_inv(q):
@@ -76,6 +87,34 @@ def compose_se3_qwxyz(pose1, pose2):
     t_new = t1 + t2_rot
 
     return torch.cat([q_new, t_new], dim=-1)
+
+def axis_angle_to_matrix(axis_angle: torch.Tensor) -> torch.Tensor:
+    """
+    Converts axis-angle vectors to rotation matrices using Rodrigues' rotation formula.
+    
+    Args:
+        axis_angle: Tensor of shape (..., 3), where the last dimension is the axis-angle.
+
+    Returns:
+        Rotation matrices of shape (..., 3, 3)
+    """
+    angle = torch.norm(axis_angle, dim=-1, keepdim=True) + 1e-8
+    axis = axis_angle / angle
+
+    x, y, z = axis.unbind(-1)
+    zeros = torch.zeros_like(x)
+    K = torch.stack([
+        zeros, -z, y,
+        z, zeros, -x,
+        -y, x, zeros
+    ], dim=-1).reshape(*axis.shape[:-1], 3, 3)
+
+    I = torch.eye(3, device=axis.device, dtype=axis.dtype).expand(*axis.shape[:-1], 3, 3)
+    sin = torch.sin(angle)[..., None]
+    cos = torch.cos(angle)[..., None]
+
+    R = I + sin * K + (1 - cos) * K @ K
+    return R
 
 def create_zero_pose_smplx_mesh(smpl_model, device, dataset_type, server):
     """
@@ -445,24 +484,92 @@ def main():
             leye_pose = torch.tensor(human_motions['leye_pose'][i:i+1, :], device=device, dtype=torch.float32) if 'leye_pose' in human_motions else None
             reye_pose = torch.tensor(human_motions['reye_pose'][i:i+1, :], device=device, dtype=torch.float32) if 'reye_pose' in human_motions else None
             transl = torch.tensor(human_motions['transl'][i:i+1, :], device=device, dtype=torch.float32) if 'transl' in human_motions else None
-            # Create SMPLX output with original pose (no global_orient transformation to avoid translation issue)
-            smplx_output = smpl_model(
-                betas=betas,
-                global_orient=global_orient,
-                body_pose=body_pose,
-                left_hand_pose=left_hand_pose,
-                right_hand_pose=right_hand_pose,
-                jaw_pose=jaw_pose,
-                leye_pose=leye_pose,
-                reye_pose=reye_pose,
-                transl=transl,
-                return_verts=True,
-                return_full_pose=True,
-                use_pca=False
-            )
             
-            # Apply coordinate transformation for Trumans dataset
-            if args.dataset_type == "trumans":
+            # Handle different camera types for Trumans
+            if args.camera_type == "relative":
+                # For relative camera poses, use fncsmpl_extensions approach like ARIA
+                # Create SMPLX output with local pose (no global transformation)
+                smplx_output = smpl_model(
+                    betas=betas,
+                    global_orient=torch.zeros_like(global_orient) if global_orient is not None else None,  # Zero global orientation for local pose
+                    body_pose=body_pose,
+                    left_hand_pose=left_hand_pose,
+                    right_hand_pose=right_hand_pose,
+                    jaw_pose=jaw_pose,
+                    leye_pose=leye_pose,
+                    reye_pose=reye_pose,
+                    transl=torch.zeros_like(transl) if transl is not None else None,  # Zero translation for local pose
+                    return_verts=True,
+                    return_full_pose=True,
+                    use_pca=False
+                )
+                
+                # Get local vertices and apply coordinate transformation
+                vertices = smplx_output.vertices.detach().cpu().numpy().squeeze()
+                
+                # Apply coordinate transformation to match camera coordinate system
+                vertices_homogeneous = np.concatenate([vertices, np.ones((vertices.shape[0], 1))], axis=1)
+                vertices_transformed_homogeneous = (SMPL_TO_CAMERA_TRANSFORM @ vertices_homogeneous.T).T
+                vertices_transformed = vertices_transformed_homogeneous[:, :3]
+                
+                # Align SMPLX mesh with camera pose using eye center and head orientation
+                camera_pose = gt_trajectory[i]
+                
+                # Load vertex segmentation for eye indices
+                import json
+                with open("smplx_vert_segmentation.json") as f:
+                    vert_seg = json.load(f)
+                eye_indices = vert_seg["leftEye"] + vert_seg["rightEye"]
+                head_joint_index = 15
+
+                # Compute eye center and head orientation
+                eye_center = vertices_transformed[eye_indices].mean(axis=0)
+                head_rotmat = axis_angle_to_matrix(smplx_output.full_pose[0].view(-1, 3)[head_joint_index]).detach().cpu().numpy()
+                
+                # Align head forward direction with camera forward direction
+                head_forward = head_rotmat @ np.array([0, 0, 1])
+                camera_forward = camera_pose[:3, 2]
+                head_forward /= np.linalg.norm(head_forward)
+                camera_forward /= np.linalg.norm(camera_forward)
+
+                # Compute rotation to align head with camera
+                v = np.cross(head_forward, camera_forward)
+                c = np.dot(head_forward, camera_forward)
+                s = np.linalg.norm(v)
+
+                if s < 1e-8:
+                    R_align = np.eye(3) if c > 0 else -np.eye(3)
+                else:
+                    vx = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+                    R_align = np.eye(3) + vx + vx @ vx * ((1 - c) / (s ** 2))
+
+                # Build transformation from SMPLX to camera frame
+                T_smplx_to_camera = np.eye(4)
+                T_smplx_to_camera[:3, :3] = R_align.T
+                T_smplx_to_camera[:3, 3] = -R_align.T @ eye_center
+
+                # Apply transformations
+                vertices_homogeneous = np.concatenate([vertices_transformed, np.ones((vertices_transformed.shape[0], 1))], axis=1)
+                vertices_world = (camera_pose @ T_smplx_to_camera @ vertices_homogeneous.T).T[:, :3]
+                mesh = torch.tensor(vertices_world, device=device, dtype=torch.float32).unsqueeze(0)
+            else:  # absolute camera poses
+                # For absolute camera poses, use the given global pose (original logic)
+                smplx_output = smpl_model(
+                    betas=betas,
+                    global_orient=global_orient,
+                    body_pose=body_pose,
+                    left_hand_pose=left_hand_pose,
+                    right_hand_pose=right_hand_pose,
+                    jaw_pose=jaw_pose,
+                    leye_pose=leye_pose,
+                    reye_pose=reye_pose,
+                    transl=transl,
+                    return_verts=True,
+                    return_full_pose=True,
+                    use_pca=False
+                )
+                
+                # Apply coordinate transformation for Trumans dataset
                 vertices = smplx_output.vertices.detach().cpu().numpy().squeeze()
                 
                 # Apply transformation directly to vertices (avoid global_orient translation issue)
@@ -471,8 +578,6 @@ def main():
                 vertices_transformed = vertices_transformed_homogeneous[:, :3]
                 
                 mesh = torch.tensor(vertices_transformed, device=device, dtype=torch.float32).unsqueeze(0)
-            else:
-                mesh = smplx_output.vertices
         
         # Create mesh visualization
         vertex_colors = np.array([180, 248, 200])
