@@ -163,6 +163,13 @@ render = scene.render
 render.engine = 'CYCLES'
 optimize_scene_for_rendering()
 
+# Show AugmentAreaCollection if it exists
+if "AugmentAreaCollection" in bpy.data.collections:
+    bpy.data.collections["AugmentAreaCollection"].hide_render = True
+    print("✓ Hide AugmentAreaCollection for rendering")
+else:
+    print("ℹ️  AugmentAreaCollection not found - skipping")
+
 # Try GPU
 try:
     prefs_cycles = bpy.context.preferences.addons['cycles'].preferences
