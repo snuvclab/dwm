@@ -114,7 +114,31 @@ def _get_dataset_args(parser: argparse.ArgumentParser) -> None:
         default="npy",
         help="Format for disparity data: 'npy' for NPY files, 'video' for MP4 video files.",
     )
-
+    parser.add_argument(
+        "--enable_pose_conditioning",
+        action="store_true",
+        default=False,
+        help="Whether to enable SMPL-X conditioned AetherV1 pipeline. If enabled, will load SMPL-X pose parameters from sequences/human_motions/ directory.",
+    )
+    parser.add_argument(
+        "--smpl_conditioning_type",
+        type=str,
+        choices=["global", "per_frame"],
+        default="global",
+        help="Type of SMPL conditioning: 'global' processes all frames together, 'per_frame' processes each frame individually.",
+    )
+    parser.add_argument(
+        "--strict_pose_params",
+        action="store_true",
+        default=False,
+        help="If True, raise an error when SMPL pose parameters are missing or None. If False, handle missing pose parameters gracefully.",
+    )
+    parser.add_argument(
+        "--smpl_learning_rate",
+        type=float,
+        default=None,
+        help="Learning rate for SMPL pose parameters. If None, uses the same learning rate as LoRA parameters.",
+    )
 
 
 def _get_validation_args(parser: argparse.ArgumentParser) -> None:
@@ -159,6 +183,18 @@ def _get_validation_args(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=None,
         help="Run validation every X training steps. Validation consists of running the validation prompt `args.num_validation_videos` times.",
+    )
+    parser.add_argument(
+        "--max_validation_videos",
+        type=int,
+        default=1,
+        help="Maximum number of validation videos to process. Use -1 to process all videos in validation set.",
+    )
+    parser.add_argument(
+        "--validation_stride",
+        type=int,
+        default=1,
+        help="Stride for sampling validation videos from validation set (default: 1, processes every video). This controls how many validation samples to process, while num_validation_videos controls how many videos to generate per sample.",
     )
     parser.add_argument(
         "--guidance_scale",
