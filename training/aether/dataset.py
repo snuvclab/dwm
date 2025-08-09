@@ -42,7 +42,7 @@ class VideoDataset(Dataset):
         random_flip: Optional[float] = None,
         image_to_video: bool = False,
         disparity_format: str = "npy",  # "npy", "npz", or "video"
-        enable_pose_conditioning: bool = False,  # Whether to enable SMPL-X pose conditioning
+        enable_pose_conditioning: bool = True,  # Whether to enable SMPL-X pose conditioning (default: True)
     ) -> None:
         super().__init__()
 
@@ -356,24 +356,43 @@ class VideoDataset(Dataset):
             name: Video name (e.g., "0a761819_2023-01-14@22-06-10_00000")
             
         Returns:
-            SMPL pose parameters as torch.Tensor with shape (1, num_frames, 63) or None if not found
+            SMPL pose parameters as torch.Tensor with shape (num_frames, 63) or None if not found
         """
         if not self.enable_pose_conditioning:
             return None
 
-        try:
-            # Try to load from smplx_poses directory
-            pose_file = self.data_root / "smplx_poses" / f"{name}_smplx_body.npy"
+        if self.load_tensors:
+            # For load_tensors=True, pose data is saved as .pt files (as in prepare_dataset_trumans.py)
+            pose_file = self.data_root / "human_motions" / f"{name}.pt"
             if pose_file.exists():
-                pose_params = np.load(pose_file)
-                # Ensure shape is (1, num_frames, 63) for SMPLX body pose
-                if pose_params.ndim == 2:
-                    pose_params = pose_params.reshape(-1, 63)
-                return torch.tensor(pose_params, dtype=torch.float32)
+                try:
+                    pose_params = torch.load(pose_file, map_location="cpu", weights_only=True)
+                    return pose_params
+                except Exception as e:
+                    print(f"Warning: Could not load SMPL pose from {pose_file}: {e}")
+                    return None
             else:
-                raise FileNotFoundError(f"SMPL-X pose parameters not found for {name}")
-        except Exception as e:
-            print(f"Warning: Could not load SMPL-X pose parameters for {name}: {e}")
+                print(f"Warning: SMPL pose parameters not found for {name} in human_motions directory")
+                return None
+        else:
+            # For load_tensors=False, pose data is saved as .npz files (as in make_sequences.py)
+            pose_file = self.data_root / "human_motions" / f"{name}.npz"
+            if pose_file.exists():
+                try:
+                    pose_data = np.load(pose_file)
+                    # Use body_pose key directly (as saved by make_sequences.py)
+                    if 'body_pose' in pose_data:
+                        pose_params = pose_data['body_pose']
+                        return torch.tensor(pose_params, dtype=torch.float32)
+                    else:
+                        print(f"Warning: No 'body_pose' key found in {pose_file}")
+                        return None
+                except Exception as e:
+                    print(f"Warning: Could not load SMPL pose from {pose_file}: {e}")
+                    return None
+            
+            # If human_motions file doesn't exist, return None (don't raise error)
+            print(f"Warning: SMPL pose parameters not found for {name} in human_motions directory")
             return None
 
 
