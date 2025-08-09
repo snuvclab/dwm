@@ -7,12 +7,13 @@ import sys
 from collections import deque
 from pathlib import Path
 import argparse
+from check_rendering_status import get_animation_frame_count
 
 # === User Configuration ===
 DEFAULT_RECORDINGS_PATH = "../../nas1/public_dataset/trumans/Recordings_blend"
 # DEFAULT_RECORDINGS_PATH = "./Recordings_blend"
-DEFAULT_SAVE_PATH = "/home/byungjun/workspace/trumans_ego/ego_render_new"
-SCRIPT_PATH = "blender_ego_rgb_depth_optimized.py"
+DEFAULT_SAVE_PATH = "../../nas1/public_dataset/trumans/ego_render_fov90"
+SCRIPT_PATH = "data_processing/trumans/blender_ego_rgb_depth_optimized.py"
 NUM_GPUS = 8
 # ===========================
 
@@ -51,6 +52,43 @@ def signal_handler(signum, frame):
     sys.exit(1)
 
 
+
+def filter_scenes(blend_jobs, scene_names=None, scene_pattern=None):
+    """Filter blend jobs based on scene names or pattern."""
+    if not scene_names and not scene_pattern:
+        return blend_jobs
+    
+    # Get all available scene names for validation
+    all_scene_names = set(os.path.basename(os.path.dirname(blend_file)) for blend_file in blend_jobs)
+    
+    filtered_jobs = []
+    matched_scenes = set()
+    
+    for blend_file in blend_jobs:
+        directory_name = os.path.basename(os.path.dirname(blend_file))
+        
+        # Check if scene name matches any specified names
+        if scene_names and directory_name in scene_names:
+            filtered_jobs.append(blend_file)
+            matched_scenes.add(directory_name)
+            continue
+        
+        # Check if scene name matches pattern
+        if scene_pattern:
+            import fnmatch
+            if fnmatch.fnmatch(directory_name, scene_pattern):
+                filtered_jobs.append(blend_file)
+                matched_scenes.add(directory_name)
+                continue
+    
+    # Validate specified scene names
+    if scene_names:
+        missing_scenes = set(scene_names) - matched_scenes
+        if missing_scenes:
+            print(f"⚠️  Warning: The following specified scenes were not found: {', '.join(missing_scenes)}")
+            print(f"Available scenes: {', '.join(sorted(all_scene_names))}")
+    
+    return filtered_jobs
 
 def load_rendering_status_report(report_path=None):
     """Load the rendering status report from check_rendering_status.py."""
@@ -211,6 +249,7 @@ def check_already_rendered(blend_file, save_path, status_report=None):
     if not status_report:
         print(f"Querying Blender for animation data: {os.path.basename(blend_file)}")
         all_animations = get_animation_names(blend_file)
+        print(all_animations)
         if not all_animations:
             print(f"Warning: No animations found in {os.path.basename(blend_file)}")
             return False, [], [], []
@@ -286,6 +325,7 @@ def main():
     parser.add_argument("--check-only", action="store_true", help="Only check what's already rendered")
     parser.add_argument("--force", action="store_true", help="Force re-render even if already done")
     parser.add_argument("--max-gpus", type=int, default=NUM_GPUS, help="Maximum number of GPUs to use")
+    parser.add_argument("--gpu-indices", type=str, help="Comma-separated list of GPU indices to use (e.g., '0,2,4,6'). Overrides --max-gpus")
     parser.add_argument("--use-status-report", action="store_true", help="Use rendering status report from check_rendering_status.py")
     parser.add_argument("--status-report-path", type=str, help="Custom path to rendering status report JSON file")
     parser.add_argument("--partial-render", action="store_true", default=True, help="Enable partial re-rendering of failed animations (default: True)")
@@ -293,6 +333,11 @@ def main():
     parser.add_argument("--status-only", action="store_true", help="Only show current rendering status and exit")
     parser.add_argument("--show-incomplete", action="store_true", help="Show detailed information about incomplete animations")
     parser.add_argument("--show-rendered", action="store_true", help="Show detailed information about already rendered scenes")
+    parser.add_argument("--frame-skip", type=int, default=3, help="Render every Nth frame (default: 1, i.e., all frames)")
+    parser.add_argument("--fov", type=float, default=90.0, help="Camera field of view in degrees (default: 90)")
+    parser.add_argument("--parallel-animations", action="store_true", help="Launch separate jobs for each animation (faster for single scenes, more blend file overhead)")
+    parser.add_argument("--scenes", type=str, nargs='+', help="Specific scene names (directory names) to render. If not specified, renders all scenes.")
+    parser.add_argument("--scene-pattern", type=str, help="Pattern to match scene names (e.g., 'scene_*' or '*_walk')")
 
     args = parser.parse_args()
     
@@ -337,7 +382,22 @@ def main():
     print(f"Data path: {args.data_path}")
     print(f"Save path: {args.save_path}")
     print(f"Script path: {args.script_path}")
+    print(f"Frame skip: {args.frame_skip} (rendering every {args.frame_skip}th frame)")
+    print(f"Camera FOV: {args.fov} degrees")
     print(f"Found {len(blend_jobs)} .blend files.")
+    
+    # Apply scene filtering if specified
+    original_count = len(blend_jobs)
+    blend_jobs = filter_scenes(blend_jobs, args.scenes, args.scene_pattern)
+    
+    if args.scenes:
+        print(f"Filtered to {len(blend_jobs)} scenes matching specified names: {', '.join(args.scenes)}")
+    elif args.scene_pattern:
+        print(f"Filtered to {len(blend_jobs)} scenes matching pattern: {args.scene_pattern}")
+    
+    if len(blend_jobs) == 0:
+        print("No scenes match the specified criteria!")
+        return
     
     # Load status report if requested
     status_report = None
@@ -440,21 +500,33 @@ def main():
             else:
                 print(f"⏳ {display_name} ({scene_name}): Rendering all {len(all_anims)} animations")
         
-        # Create jobs for individual animations
-        for anim_name in animations_to_render:
-            # Find animation index
-            try:
-                anim_index = all_anims.index(anim_name)
-            except ValueError:
-                print(f"⚠️  Warning: Animation '{anim_name}' not found in blend file, skipping")
-                continue
-            
+        if args.parallel_animations:
+            # Create jobs for individual animations (parallel processing)
+            for anim_name in animations_to_render:
+                # Find animation index
+                try:
+                    anim_index = all_anims.index(anim_name)
+                except ValueError:
+                    print(f"⚠️  Warning: Animation '{anim_name}' not found in blend file, skipping")
+                    continue
+                
+                pending_jobs.append({
+                    'file': blend_file,
+                    'name': scene_name,
+                    'display_name': display_name,
+                    'animation_name': anim_name,
+                    'animation_index': anim_index,
+                    'job_type': 'animation'
+                })
+        else:
+            # Create job for the entire scene (all animations)
             pending_jobs.append({
                 'file': blend_file,
                 'name': scene_name,
                 'display_name': display_name,
-                'animation_name': anim_name,
-                'animation_index': anim_index
+                'animations_to_render': animations_to_render,
+                'all_animations': all_anims,
+                'job_type': 'scene'
             })
     
     if args.check_only:
@@ -751,18 +823,57 @@ def main():
         print("\n🎉 All scenes are already rendered!")
         return
     
-    print(f"\n🚀 Starting rendering for {len(pending_jobs)} animation jobs...")
+    # Count total animations for summary
+    total_animations = 0
+    scene_jobs = 0
+    animation_jobs = 0
+    
+    for job in pending_jobs:
+        job_type = job.get('job_type', 'scene')
+        if job_type == 'animation':
+            animation_jobs += 1
+            total_animations += 1
+        else:
+            scene_jobs += 1
+            total_animations += len(job.get('animations_to_render', []))
+    
+    if args.parallel_animations:
+        print(f"\n🚀 Starting rendering for {len(pending_jobs)} animation jobs ({total_animations} total animations)...")
+        print(f"📊 Job breakdown: {animation_jobs} animation jobs, {scene_jobs} scene jobs")
+    else:
+        print(f"\n🚀 Starting rendering for {len(pending_jobs)} scene jobs ({total_animations} total animations)...")
+        print(f"📊 Job breakdown: {scene_jobs} scene jobs, {animation_jobs} animation jobs")
     
     # Sort jobs by scene name for consistent ordering
     pending_jobs.sort(key=lambda x: x['name'])
     
+    # Determine which GPUs to use
+    if args.gpu_indices:
+        # Parse comma-separated GPU indices
+        try:
+            gpu_indices = [int(idx.strip()) for idx in args.gpu_indices.split(',')]
+            print(f"🎯 Using specified GPU indices: {gpu_indices}")
+        except ValueError as e:
+            print(f"❌ Error parsing GPU indices '{args.gpu_indices}': {e}")
+            print("Please use comma-separated integers (e.g., '0,2,4,6')")
+            return
+        available_gpus = deque(gpu_indices)
+        max_gpus = len(gpu_indices)
+    else:
+        # Use sequential GPUs from 0 to max_gpus-1
+        available_gpus = deque(range(args.max_gpus))
+        max_gpus = args.max_gpus
+    
     # Track running processes with GPU assignment (using global variable)
     global running_processes
-    running_processes = {}  # GPU_ID -> list of processes
-    available_gpus = deque(range(args.max_gpus))
+    running_processes = {}  # GPU_ID -> list of (process, job_info) tuples
     
-    print(f"🚀 GPU Configuration: {args.max_gpus} GPUs, 1 job per GPU (optimal for Blender)")
-    print(f"📊 Total concurrent jobs: {args.max_gpus}")
+    if args.parallel_animations:
+        print(f"🚀 GPU Configuration: {max_gpus} GPUs, 1 animation per GPU (max parallelization)")
+        print(f"📊 Total concurrent animations: {max_gpus}")
+    else:
+        print(f"🚀 GPU Configuration: {max_gpus} GPUs, 1 scene per GPU (optimal for Blender)")
+        print(f"📊 Total concurrent scenes: {max_gpus}")
     
     # Dispatch jobs with proper GPU distribution
     for job in pending_jobs:
@@ -770,11 +881,11 @@ def main():
         while len(available_gpus) == 0:
             # Check if any processes have finished
             finished_gpus = []
-            for gpu_id, processes in running_processes.items():
+            for gpu_id, process_jobs in running_processes.items():
                 # Remove finished processes
-                processes[:] = [p for p in processes if p.poll() is None]
+                process_jobs[:] = [(p, job_info) for p, job_info in process_jobs if p.poll() is None]
                 # If no processes left on this GPU, mark it as available
-                if len(processes) == 0:
+                if len(process_jobs) == 0:
                     finished_gpus.append(gpu_id)
             
             # Add finished GPUs back to available queue
@@ -796,17 +907,33 @@ def main():
             "--python",
             args.script_path,
             "--",
-            "--animation_index", str(job['animation_index']),
-            "--save-path", args.save_path
+            "--save-path", args.save_path,
+            "--frame-skip", str(args.frame_skip),
+            "--fov", str(args.fov)
         ]
+        
+        # Add animation index for animation-based jobs
+        if job.get('job_type') == 'animation':
+            cmd.extend(["--animation_index", str(job['animation_index'])])
         
         # Assign environment variable to restrict GPU usage
         env = os.environ.copy()
         env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
         
         display_name = job.get('display_name', job['name'])
-        anim_info = f" - Animation: {job['animation_name']}" if 'animation_name' in job else ""
-        print(f"[GPU {gpu_id}] Launching Blender for: {display_name} ({job['name']}){anim_info}")
+        job_type = job.get('job_type', 'scene')
+        
+        if job_type == 'animation':
+            anim_info = f" - Animation: {job['animation_name']}"
+        else:
+            animations_count = len(job.get('animations_to_render', []))
+            anim_info = f" - {animations_count} animations" if animations_count > 0 else ""
+        
+        frame_info = f" (frame skip: {args.frame_skip}, FOV: {args.fov}°)" if args.frame_skip > 1 or args.fov != 90.0 else ""
+        print(f"[GPU {gpu_id}] Launching Blender for: {display_name} ({job['name']}){anim_info}{frame_info}")
+        
+        # Print the command being executed
+        print(f"[GPU {gpu_id}] Command: {' '.join(cmd)}")
         
         # proc = subprocess.Popen(cmd, env=env)
         proc = subprocess.Popen(cmd, env=env, stdout=devnull, stderr=devnull)
@@ -829,7 +956,14 @@ def main():
         # Track this process on the assigned GPU
         if gpu_id not in running_processes:
             running_processes[gpu_id] = []
-        running_processes[gpu_id].append(proc)
+        # Store process and job info together
+        job_info = {
+            'name': display_name,
+            'file': job['file'],
+            'animation_name': job.get('animation_name', 'N/A'),
+            'job_type': job.get('job_type', 'scene')
+        }
+        running_processes[gpu_id].append((proc, job_info))
     
     # Wait for all remaining processes to finish
     print("Waiting for all processes to complete...")
@@ -838,22 +972,41 @@ def main():
     try:
         while running_processes:
             finished_gpus = []
-            for gpu_id, processes in running_processes.items():
+            for gpu_id, process_jobs in running_processes.items():
                 # Check for failed processes and add them to failed_jobs
-                for proc in processes[:]:  # Copy list to avoid modification during iteration
+                for proc, job_info in process_jobs[:]:  # Copy list to avoid modification during iteration
                     if proc.poll() is not None:  # Process has finished
                         if proc.returncode != 0:  # Process failed
-                            # Find the job name for this process (we'll need to track this better)
+                            # Capture output from failed process
+                            try:
+                                stdout, stderr = proc.communicate(timeout=5)  # Get output with timeout
+                                error_output = stderr.strip() if stderr else stdout.strip()
+                                if not error_output:
+                                    error_output = f"Process failed with return code: {proc.returncode} (no output captured)"
+                            except subprocess.TimeoutExpired:
+                                proc.kill()  # Force kill if it hangs
+                                error_output = f"Process failed with return code: {proc.returncode} (timeout getting output)"
+                            
+                            # Add to failed jobs with proper job info
                             failed_jobs.append({
-                                'name': f"Unknown (GPU {gpu_id})",
-                                'file': f"Unknown (PID: {proc.pid})",
+                                'name': f"{job_info['name']} ({job_info['animation_name']})" if job_info['job_type'] == 'animation' else job_info['name'],
+                                'file': job_info['file'],
                                 'gpu': gpu_id,
-                                'error': f"Process failed with return code: {proc.returncode}"
+                                'error': error_output
                             })
-                        processes.remove(proc)
+                            
+                            # Print immediate error for debugging
+                            job_display = f"{job_info['name']} - {job_info['animation_name']}" if job_info['job_type'] == 'animation' else job_info['name']
+                            print(f"\n❌ GPU {gpu_id}: Job failed - {job_display}")
+                            print(f"Return code: {proc.returncode}")
+                            print(f"Error output:")
+                            print(f"{'='*60}")
+                            print(error_output)
+                            print(f"{'='*60}")
+                        process_jobs.remove((proc, job_info))
                 
                 # If no processes left on this GPU, mark it as finished
-                if len(processes) == 0:
+                if len(process_jobs) == 0:
                     finished_gpus.append(gpu_id)
                     print(f"GPU {gpu_id} completed all jobs")
             
@@ -862,11 +1015,14 @@ def main():
                 del running_processes[gpu_id]
             
             if running_processes:
-                active_count = sum(len(procs) for procs in running_processes.values())
+                active_count = sum(len(process_jobs) for process_jobs in running_processes.values())
                 print(f"Still waiting for {active_count} processes on {len(running_processes)} GPUs...")
                 time.sleep(30)
         
-        print("All Blender render jobs completed.")
+        if args.parallel_animations:
+            print("All Blender animation render jobs completed.")
+        else:
+            print("All Blender scene render jobs completed.")
         
         # Report failed jobs
         if failed_jobs:
