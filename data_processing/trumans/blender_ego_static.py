@@ -22,11 +22,13 @@ parser.add_argument("--start_frame", type=int, default=None)
 parser.add_argument("--end_frame", type=int, default=None)
 parser.add_argument("--animation_index", type=int, default=None, help="Specific animation index (else: all)")
 parser.add_argument("--samples", type=int, default=64, help="Cycles samples")
+parser.add_argument("--resolution", type=int, default=720, help="(unused; final is fixed 720x480)")
 parser.add_argument("--save-path", type=str, default="/home/byungjun/workspace/trumans_ego/ego_render_new",
                     help="Root output dir")
 parser.add_argument("--skip-existing", action="store_true", default=True, help="Skip frames that already exist")
 parser.add_argument("--no-skip-existing", action="store_true", help="Disable skipping existing frames")
 parser.add_argument("--frame-skip", type=int, default=3, help="Render every Nth frame")
+parser.add_argument("--stride", type=int, default=25, help="Stride for video sequences (default: 25)")
 parser.add_argument("--fov", type=float, default=90.0, help="Camera FOV in degrees (perspective)")
 args = parser.parse_args(argv)
 if args.no_skip_existing:
@@ -88,6 +90,7 @@ cycles_samples = args.samples
 # ---------------------------
 # Helpers
 # ---------------------------
+
 def get_animation_sets():
     try:
         animation_sets_json = bpy.context.scene.hsi_properties.animation_sets
@@ -127,17 +130,7 @@ def get_camera_intrinsics(camera_obj):
 def get_camera_to_world_matrix(camera_obj):
     return np.array(camera_obj.matrix_world, dtype=np.float32)
 
-def check_frame_exists(frame_num, images_output_path, depth_output_path, cam_params_path):
-    def file_ok(path): return os.path.isfile(path) and os.path.getsize(path) > 0
-    image_path = os.path.join(images_output_path, f"{frame_num:04d}.png")
-    depth_path = os.path.join(depth_output_path,  f"{frame_num:04d}.exr")
-    cam_param_path = os.path.join(cam_params_path, f"cam_{frame_num:04d}.npy")
-    rgb_exists = file_ok(image_path)
-    depth_exists = file_ok(depth_path)
-    cam_param_exists = file_ok(cam_param_path)
-    needs_rendering = not rgb_exists or not depth_exists
-    needs_cam_param = not cam_param_exists
-    return rgb_exists, depth_exists, cam_param_exists, needs_rendering, needs_cam_param
+# Removed check_frame_exists function - no longer needed for video-based rendering
 
 def optimize_scene_for_rendering():
     scene = bpy.context.scene
@@ -153,6 +146,141 @@ def optimize_scene_for_rendering():
     if hasattr(scene.render, 'use_free_unused_nodes'): scene.render.use_free_unused_nodes = True
     if hasattr(scene.render, 'use_free_image_textures'): scene.render.use_free_image_textures = True
     print(f"Optimized scene: {scene.render.resolution_x}x{scene.render.resolution_y}, {cycles_samples} samples")
+
+def hide_actor_from_rendering():
+    """Hide the actor (armature and its children) from rendering for static scenes."""
+    if armature_obj:
+        # Hide the armature itself
+        armature_obj.hide_render = True
+        print(f"Hidden armature '{armature_name}' from rendering")
+        
+        # Hide all children of the armature
+        for child in armature_obj.children:
+            child.hide_render = True
+            print(f"Hidden child '{child.name}' from rendering")
+        
+        # Also hide any objects that are parented to bones
+        for obj in bpy.data.objects:
+            if obj.parent_bone and obj.parent == armature_obj:
+                obj.hide_render = True
+                print(f"Hidden bone-child '{obj.name}' from rendering")
+
+def show_actor_in_rendering():
+    """Show the actor in rendering."""
+    if armature_obj:
+        # Show the armature itself
+        armature_obj.hide_render = False
+        print(f"Shown armature '{armature_name}' in rendering")
+        
+        # Show all children of the armature
+        for child in armature_obj.children:
+            child.hide_render = False
+            print(f"Shown child '{child.name}' in rendering")
+        
+        # Also show any objects that are parented to bones
+        for obj in bpy.data.objects:
+            if obj.parent_bone and obj.parent == armature_obj:
+                obj.hide_render = False
+                print(f"Shown bone-child '{obj.name}' in rendering")
+
+def sample_camera_world_transforms(camera_obj, frames):
+    """
+    Return lists of (location, rotation_quaternion) for the camera's world transform,
+    sampled by setting scene.frame_set(f) for each frame in `frames`.
+    """
+    scene = bpy.context.scene
+    locs, rots = [], []
+    prev = scene.frame_current
+    try:
+        for f in frames:
+            scene.frame_set(f)
+            mw = camera_obj.matrix_world.copy()
+            locs.append(mw.to_translation())
+            rots.append(mw.to_quaternion())
+    finally:
+        scene.frame_set(prev)
+    return locs, rots
+
+# ---------------------------
+# Helpers (stateful freeze/restore)
+# ---------------------------
+
+# Save original animation state & camera parenting
+_original_animation_state = {
+    "camera_parent": None,   # (parent, parent_type, parent_bone, matrix_world_before)
+    "actions": {},           # obj_name -> action (or None)
+}
+
+def disable_animations_except_camera(camera_obj):
+    """
+    1) Save camera parenting and clear it (KEEP transform).
+    2) Save each object's current action, then detach (freeze) for all objects except the camera.
+    """
+    global _original_animation_state
+    _original_animation_state = {"camera_parent": None, "actions": {}}
+
+    # --- 1) Camera parenting ---
+    if camera_obj.parent is not None:
+        _original_animation_state["camera_parent"] = (
+            camera_obj.parent,
+            camera_obj.parent_type,
+            camera_obj.parent_bone,
+            camera_obj.matrix_world.copy(),
+        )
+        bpy.context.view_layer.objects.active = camera_obj
+        bpy.ops.object.parent_clear(type='CLEAR_KEEP_TRANSFORM')
+
+    # --- 2) Detach actions of all non-camera objects ---
+    for obj in bpy.data.objects:
+        if obj == camera_obj:
+            continue
+        if obj.animation_data:
+            # record current action (could be None)
+            _original_animation_state["actions"][obj.name] = obj.animation_data.action
+            # keep the action from being purged
+            if obj.animation_data.action:
+                obj.animation_data.action.use_fake_user = True
+            # detach to freeze at current pose
+            obj.animation_data.action = None
+
+    # Depsgraph refresh helps ensure “frozen” state is used during rendering
+    bpy.context.view_layer.update()
+
+
+def restore_animations(camera_obj):
+    """
+    Restore every object's action and camera parenting that we saved in disable_animations_except_camera().
+    This is idempotent-safe and can be called at the end of each video iteration.
+    """
+    global _original_animation_state
+    if not _original_animation_state:
+        return
+
+    # --- 1) Restore actions ---
+    for obj_name, action in _original_animation_state.get("actions", {}).items():
+        obj = bpy.data.objects.get(obj_name)
+        if not obj:
+            continue
+        if not obj.animation_data:
+            obj.animation_data_create()
+        obj.animation_data.action = action
+
+    # --- 2) Restore camera parenting ---
+    cam_parent = _original_animation_state.get("camera_parent")
+    if cam_parent is not None:
+        parent, parent_type, parent_bone, mw_before = cam_parent
+        camera_obj.parent = parent
+        camera_obj.parent_type = parent_type
+        if parent_type == 'BONE':
+            camera_obj.parent_bone = parent_bone
+        # keep the same world transform
+        camera_obj.matrix_world = mw_before
+
+    # clear for next use
+    _original_animation_state = {"camera_parent": None, "actions": {}}
+    bpy.context.view_layer.update()
+
+
 
 # ---------------------------
 # Scene setup
@@ -199,25 +327,7 @@ render.resolution_percentage = 100
 render.image_settings.file_format = 'PNG'
 render.image_settings.color_mode = 'RGBA'
 
-# ---------------------------
-# Make Clean-Depth View Layer (opaque override) BEFORE building nodes
-# ---------------------------
-# Create solid diffuse material
-mat_depth = bpy.data.materials.get("DepthOverride")
-if mat_depth is None:
-    mat_depth = bpy.data.materials.new("DepthOverride")
-mat_depth.use_nodes = True
-nodes = mat_depth.node_tree.nodes
-links = mat_depth.node_tree.links
-for n in list(nodes): nodes.remove(n)
-bsdf = nodes.new("ShaderNodeBsdfDiffuse")
-out  = nodes.new("ShaderNodeOutputMaterial")
-links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
-
-# Create / configure depth view layer
-depth_layer = scene.view_layers.get("DepthSolid") or scene.view_layers.new("DepthSolid")
-depth_layer.material_override = mat_depth
-depth_layer.use_pass_z = True
+# Removed depth view layer setup - no longer needed for static video rendering
 
 # ---------------------------
 # Compositor nodes
@@ -232,32 +342,13 @@ rl_rgb = tree.nodes.new(type='CompositorNodeRLayers')
 rl_rgb.location = 0, 0
 rl_rgb.layer = bpy.context.view_layer.name  # usually "ViewLayer"
 
+# RGB output node (will be configured per video sequence)
 rgb_output_node = tree.nodes.new(type='CompositorNodeOutputFile')
 rgb_output_node.label = "RGB Output"
-rgb_output_node.base_path = output_folder
-rgb_output_node.file_slots[0].path = "####"
 rgb_output_node.format.file_format = 'PNG'
 rgb_output_node.format.color_mode = 'RGBA'
 rgb_output_node.location = 400, 200
 tree.links.new(rl_rgb.outputs['Image'], rgb_output_node.inputs[0])
-
-# DepthSolid layer for clean Z (meters)
-rl_depth = tree.nodes.new(type='CompositorNodeRLayers')
-rl_depth.location = 0, -200
-rl_depth.layer = depth_layer.name
-
-depth_output_node = tree.nodes.new(type='CompositorNodeOutputFile')
-depth_output_node.label = "Depth Clean (EXR)"
-depth_output_node.base_path = output_folder
-depth_output_node.file_slots[0].path = "####"
-depth_output_node.format.file_format = 'OPEN_EXR'
-depth_output_node.format.color_depth = '32'
-depth_output_node.format.exr_codec = 'ZIP'
-depth_output_node.location = 400, -200
-if 'Depth' in rl_depth.outputs:
-    tree.links.new(rl_depth.outputs['Depth'], depth_output_node.inputs[0])
-else:
-    print("Warning: Depth output not found in DepthSolid layer.")
 
 # ---------------------------
 # Locate objects & camera setup
@@ -341,109 +432,159 @@ bpy.ops.object.mode_set(mode='OBJECT')
 # ---------------------------
 def render_animation_sequence(animation_index, animation_name):
     anim_output_folder = os.path.join(output_folder, f"{animation_name}")
-    images_output_path = os.path.join(anim_output_folder, "images")
-    depth_output_path  = os.path.join(anim_output_folder, "depth")
-    cam_params_path    = os.path.join(anim_output_folder, "cam_params")
-    for p in [images_output_path, depth_output_path, cam_params_path]:
-        os.makedirs(p, exist_ok=True)
+    sequences_folder = os.path.join(anim_output_folder, "sequences")
+    videos_output_path = os.path.join(sequences_folder, "videos_static")
+    os.makedirs(videos_output_path, exist_ok=True)
 
     print(f"Rendering animation {animation_index}: {animation_name}")
-    print(f"  Images: {images_output_path}")
-    print(f"  Depth : {depth_output_path}")
-    print(f"  Cam   : {cam_params_path}")
+    print(f"  Videos: {videos_output_path}")
 
-    # Set base paths per animation
-    rgb_output_node.base_path   = images_output_path
-    depth_output_node.base_path = depth_output_path
-    rgb_output_node.file_slots[0].path   = "####"
-    depth_output_node.file_slots[0].path = "####"
-
-    # Save intrinsics (same for all frames in render res)
-    intrinsics = get_camera_intrinsics(camera_obj)
-    np.save(os.path.join(cam_params_path, "intrinsics.npy"), intrinsics)
-
-    # Frame range
+    # Frame range and video sequence parameters
     scene = bpy.context.scene
     render_start_frame = scene.frame_start if start_frame is None else start_frame
     render_end_frame   = scene.frame_end   if end_frame   is None else end_frame
-    frames_to_render = list(range(render_start_frame, render_end_frame + 1, max(1, args.frame_skip)))
-    total_frames = len(frames_to_render)
-    print(f"Render frames: {render_start_frame}..{render_end_frame} (step {args.frame_skip}) -> {total_frames} frames")
+    
+    # Video sequence parameters
+    clip_length = 49  # 49 frames per video
+    stride = args.stride
+    frame_skip = args.frame_skip
+    fps = 8
+    
+    # Calculate video start frames
+    effective_stride = stride * frame_skip  # Actual frame stride
+    video_start_frames = []
+    current_frame = render_start_frame
+    while current_frame + (clip_length - 1) * frame_skip <= render_end_frame:
+        video_start_frames.append(current_frame)
+        current_frame += effective_stride
+    
+    print(f"Animation frames: {render_start_frame}..{render_end_frame}")
+    print(f"Video parameters: {clip_length} frames, stride {stride}, frame_skip {frame_skip}")
+    print(f"Effective stride: {effective_stride} frames (50% overlap)")
+    print(f"Creating {len(video_start_frames)} video sequences")
 
     start_time = time.time()
-    frames_completed = 0
-    frames_skipped   = 0
-    cam_params_saved_count = 0
+    videos_completed = 0
     total_render_time = 0.0
 
-    for frame_num in frames_to_render:
-        rgb_exists, depth_exists, cam_param_exists, needs_rendering, needs_cam_param = \
-            check_frame_exists(frame_num, images_output_path, depth_output_path, cam_params_path)
+    for video_idx, start_frame_num in enumerate(video_start_frames):
+        video_end_frame = start_frame_num + (clip_length - 1) * frame_skip
+        frames_to_render = list(range(start_frame_num, video_end_frame + 1, frame_skip))
 
-        scene.frame_set(frame_num)
+        # === (A) 루프 시작: 깨끗한 상태로 되돌리기 ===
+        restore_animations(camera_obj)    # 이전 클립에서 분리했던 것 되돌림
+        show_actor_in_rendering()         # 배우(암) 다시 보이게
 
-        # Save cam2world per frame if missing
-        if needs_cam_param:
-            c2w = get_camera_to_world_matrix(camera_obj)
-            np.save(os.path.join(cam_params_path, f"cam_{frame_num:04d}.npy"), c2w)
-            cam_params_saved_count += 1
-            cam_param_exists = True
-
-        if args.skip_existing and not needs_rendering:
-            frames_skipped += 1
-            status = []
-            if rgb_exists: status.append("RGB")
-            if depth_exists: status.append("Depth")
-            if cam_param_exists: status.append("Cam")
-            print(f"[ANIM {animation_index}] Frame {frame_num}: SKIPPED ({', '.join(status)})")
+        # 현재 클립용 애니메이션 적용 (동적인 상태에서)
+        if not apply_animation_set(animation_index):
+            print(f"Failed to apply animation set for video {video_idx}")
             continue
 
-        # Render (compositor writes RGB+clean depth directly to anim folders)
-        frame_start_time = time.time()
-        bpy.ops.render.render(write_still=True)
+        # === (B) 이 클립의 카메라 포즈 샘플 ===
+        cam_locs, cam_rots = sample_camera_world_transforms(camera_obj, frames_to_render)
 
-        frame_time = time.time() - frame_start_time
-        total_render_time += frame_time
-        frames_completed += 1
+        # 씬을 클립의 시작 프레임으로 맞춘 뒤,
+        scene.frame_set(start_frame_num)
 
-        # Progress
-        total_processed = frames_completed + frames_skipped
-        progress = total_processed / total_frames * 100.0
-        elapsed = time.time() - start_time
+        # === (C) 이제 씬 고정: 카메라 제외 모든 애니메이션 분리 & 카메라 부모 해제 ===
+        disable_animations_except_camera(camera_obj)
 
-        if frames_completed > 1:
-            avg = total_render_time / frames_completed
-            remaining = total_frames - total_processed
-            eta = remaining * avg
-            fps = 1.0 / avg if avg > 0 else 0
-            if (frame_num % 5 == 0) or (frame_num == frames_to_render[0] + 1):
-                print(f"\n========== PROGRESS ==========")
-                print(f"[ANIM {animation_index}] Frame {frame_num}/{frames_to_render[-1]} ({progress:.1f}%)")
-                print(f"  Rendered: {frames_completed} | Skipped: {frames_skipped} | Remaining: {remaining}")
-                print(f"  Frame time: {frame_time:.1f}s | Avg: {avg:.1f}s | Throughput: {fps:.2f} fps")
-                print(f"  ETA: {eta/60:.1f} min | Elapsed: {elapsed/60:.1f} min")
-                print(f"==============================")
-        else:
-            print(f"\n========== PROGRESS ==========")
-            print(f"[ANIM {animation_index}] Frame {frame_num}/{frames_to_render[-1]} ({progress:.1f}%)")
-            print(f"  Rendered: {frames_completed} | Skipped: {frames_skipped}")
-            print(f"  Frame time: {frame_time:.1f}s")
-            print(f"==============================")
+        # (권장) 모션블러 끄기
+        if hasattr(scene.render, "use_motion_blur"):
+            scene.render.use_motion_blur = False
+
+        print(f"\n========== VIDEO {video_idx + 1}/{len(video_start_frames)} ==========")
+        print(f"Frames: {start_frame_num}..{video_end_frame} (step {frame_skip}) -> {len(frames_to_render)} frames")
+
+        # 출력 경로/노드 설정
+        video_temp_dir = os.path.join(videos_output_path, f"temp_{video_idx:05d}")
+        os.makedirs(video_temp_dir, exist_ok=True)
+        rgb_output_node.base_path = video_temp_dir
+        rgb_output_node.file_slots[0].path = "####"
+
+        # 정지 씬 렌더링이니 배우 숨김
+        hide_actor_from_rendering()
+        
+        # Render all frames for this video
+        video_start_time = time.time()
+        frames_rendered = 0
+        
+        for frame_idx, frame_num in enumerate(frames_to_render):
+            scene.frame_set(frame_num)
+
+            # Drive only the camera from the cached poses
+            camera_obj.location = cam_locs[frame_idx]
+            camera_obj.rotation_mode = 'QUATERNION'
+            camera_obj.rotation_quaternion = cam_rots[frame_idx]
+
+            # Render
+            frame_render_start = time.time()
+            bpy.ops.render.render(write_still=True)
+            frame_time = time.time() - frame_render_start
+
+            frames_rendered += 1
+            total_render_time += frame_time
+
+            if frame_idx % 10 == 0 or frame_idx == len(frames_to_render) - 1:
+                progress = (frame_idx + 1) / len(frames_to_render) * 100.0
+                avg_frame_time = total_render_time / (videos_completed * clip_length + frames_rendered)
+                print(f"  Frame {frame_idx + 1}/{len(frames_to_render)} ({progress:.1f}%) - {frame_time:.1f}s")
+        
+        # Convert frames to video using ffmpeg
+        video_output_path = os.path.join(videos_output_path, f"{video_idx:05d}.mp4")
+        
+        try:
+            import subprocess
+            
+            # Create RGB video
+            rgb_cmd = [
+                'ffmpeg', '-y', '-framerate', str(fps),
+                '-pattern_type', 'glob', '-i', os.path.join(video_temp_dir, '*.png'),
+                '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+                '-crf', '18', video_output_path
+            ]
+            subprocess.run(rgb_cmd, check=True, capture_output=True)
+            
+            print(f"  ✅ Created video: {os.path.basename(video_output_path)}")
+            
+        except subprocess.CalledProcessError as e:
+            print(f"  ❌ Failed to create video: {e}")
+            print(f"  Command output: {e.stderr.decode()}")
+        except FileNotFoundError:
+            print(f"  ❌ ffmpeg not found. Please install ffmpeg to create videos.")
+            print(f"  Rendered frames saved in: {video_temp_dir}")
+        
+        # # Clean up temporary files
+        # try:
+        #     import shutil
+        #     shutil.rmtree(video_temp_dir)
+        # except Exception as e:
+        #     print(f"  Warning: Could not clean up temp files: {e}")
+        
+        videos_completed += 1
+        
+        # Restore animations for the next video sequence
+        restore_animations(camera_obj)
+        show_actor_in_rendering()
+        
+        # Overall progress
+        total_elapsed = time.time() - start_time
+        if videos_completed > 1:
+            avg_video_time = total_elapsed / videos_completed
+            remaining_videos = len(video_start_frames) - videos_completed
+            eta = remaining_videos * avg_video_time
+            print(f"  📊 Progress: {videos_completed}/{len(video_start_frames)} videos")
+            print(f"  ⏱️  Video time: {time.time() - video_start_time:.1f}s | Avg: {avg_video_time:.1f}s")
+            print(f"  🎯 ETA: {eta/60:.1f} min | Elapsed: {total_elapsed/60:.1f} min")
 
     total_time = time.time() - start_time
-    avg_fps = frames_completed / total_time if total_time > 0 and frames_completed > 0 else 0
-
-    # Count saved cam params
-    cam_params_saved = 0
-    for frame_num in frames_to_render:
-        if os.path.exists(os.path.join(cam_params_path, f"cam_{frame_num:04d}.npy")):
-            cam_params_saved += 1
+    avg_fps = (videos_completed * clip_length) / total_time if total_time > 0 else 0
 
     print("\n" + "="*50)
     print(f"COMPLETED: Animation {animation_index} ({animation_name})")
     print(f"Total time: {total_time/60:.1f} minutes")
-    print(f"Frame step: {args.frame_skip} | Rendered: {frames_completed} | Skipped: {frames_skipped}")
-    print(f"Camera parameters saved: {cam_params_saved_count} this run | Total present: {cam_params_saved}/{total_frames}")
+    print(f"Videos created: {videos_completed}/{len(video_start_frames)}")
+    print(f"Frame step: {frame_skip} | Stride: {stride} | Effective stride: {effective_stride}")
     print(f"Average throughput: {avg_fps:.2f} fps")
     print("="*50)
 
@@ -506,6 +647,10 @@ print(f"Total frames rendered (stepped): {total_frames_rendered}")
 print(f"Overall throughput: {overall_fps:.2f} fps")
 print(f"Results saved in: '{output_folder}'")
 print("Each animation has its own subfolder: {animation_name}/")
+print("Output structure:")
+print("  {animation_name}/")
+print("    └── sequences/")
+print("        └── videos_static/         # Static scene video sequences (MP4)")
 if failed_animations:
     print(f"\nFAILED ANIMATIONS ({len(failed_animations)}):")
     for anim_idx, anim_name, error_type in failed_animations:
