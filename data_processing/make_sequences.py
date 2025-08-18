@@ -12,112 +12,81 @@ import json
 # Add the training/aether/utils directory to the path to import postprocess_utils
 import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'training', 'aether', 'utils'))
-
-try:
-    from postprocess_utils import depth_to_disparity, colorize_depth
-except ImportError:
-    print("Warning: Could not import postprocess_utils. Using local implementation.")
     
-    def depth_to_disparity(depth, sqrt_disparity=True):
-        """Convert depth to disparity.
-        
-        Args:
-            depth: (N, H, W) depth map
-            sqrt_disparity (bool, optional): Whether to take the square root of the disparity.
-                Defaults to True.
-        Returns:
-            (N, H, W) disparity map, dmax
-        """
-        import torch
-        
-        is_numpy = isinstance(depth, np.ndarray)
-        if is_numpy:
-            # Ensure the array is writable before converting to tensor
-            depth = np.array(depth, copy=True)
-            depth = torch.from_numpy(depth).float()
-        
-        disparity = 1.0 / depth
-        valid_disparity = disparity[depth > 1e-6]
-        dmax = valid_disparity.max()
-        disparity = torch.clamp(disparity / dmax, min=0.0, max=1.0)
-
-        if sqrt_disparity:
-            disparity = torch.sqrt(disparity)
-
-        if is_numpy:
-            disparity = disparity.cpu().numpy()
-        return disparity, dmax
+def depth_to_disparity(depth, sqrt_disparity=True):
+    """Convert depth to disparity.
     
-    def colorize_depth(depth, cmap="Spectral"):
-        """Colorize depth map for visualization."""
-        import matplotlib.cm as cmaps
-        
-        min_d, max_d = (depth[depth > 0]).min(), (depth[depth > 0]).max()
-        depth = (max_d - depth) / (max_d - min_d)
+    Args:
+        depth: (N, H, W) depth map
+        sqrt_disparity (bool, optional): Whether to take the square root of the disparity.
+            Defaults to True.
+    Returns:
+        (N, H, W) disparity map, dmax
+    """
+    import torch
+    
+    is_numpy = isinstance(depth, np.ndarray)
+    if is_numpy:
+        # Ensure the array is writable before converting to tensor
+        depth = np.array(depth, copy=True)
+        depth = torch.from_numpy(depth).float()
+    
+    disparity = 1.0 / depth
+    valid_disparity = disparity[depth > 1e-6]
+    dmax = valid_disparity.max()
+    disparity = torch.clamp(disparity / dmax, min=0.0, max=1.0)
 
-        cm = cmaps.get_cmap(cmap)
-        depth = depth.clip(0, 1)
-        depth = cm(depth, bytes=False)[..., 0:3]
-        return depth
+    if sqrt_disparity:
+        disparity = torch.sqrt(disparity)
+
+    if is_numpy:
+        disparity = disparity.cpu().numpy()
+    return disparity, dmax
+
+def colorize_depth(depth, cmap="Spectral"):
+    """Colorize depth map for visualization."""
+    import matplotlib.cm as cmaps
+    
+    # min_d, max_d = (depth[depth > 0]).min(), (depth[depth > 0]).max()
+    # depth = (max_d - depth) / (max_d - min_d)
+    depth = 1 - depth  # assume depth is in range [0, 1]
+
+    cm = cmaps.get_cmap(cmap)
+    depth = depth.clip(0, 1)
+    depth = cm(depth, bytes=False)[..., 0:3]
+    return depth
 
 def load_exr_depth(file_path):
     """Load depth data from .exr file."""
     try:
-        # Try using OpenEXR library first (more reliable for EXR files)
-        try:
-            import OpenEXR
-            import Imath
-            import array
-            
-            # Open the EXR file
-            exr_file = OpenEXR.InputFile(str(file_path))
-            
-            # Get the data window
-            dw = exr_file.header()['dataWindow']
-            width = dw.max.x - dw.min.x + 1
-            height = dw.max.y - dw.min.y + 1
-            
-            # Read the first channel (usually 'R' for depth)
-            channels = exr_file.header()['channels'].keys()
-            first_channel = list(channels)[0]
-            
-            # Read the channel data
-            channel_data = exr_file.channel(first_channel, Imath.PixelType(Imath.PixelType.FLOAT))
-            depth = np.frombuffer(channel_data, dtype=np.float32)
-            depth = depth.reshape(height, width)
-            # Make the array writable to avoid PyTorch warnings
-            depth = np.array(depth, copy=True)
-            
-            exr_file.close()
-            return depth
-            
-        except ImportError:
-            # Fallback to imageio with OpenEXR support
-            try:
-                depth_data = iio.imread(file_path)
-                
-                # EXR files can have multiple channels, we want the first one for depth
-                if depth_data.ndim == 3 and depth_data.shape[2] > 1:
-                    # If it's a multi-channel EXR, take the first channel
-                    depth = depth_data[:, :, 0]
-                else:
-                    depth = depth_data
-                
-                # Make the array writable to avoid PyTorch warnings
-                depth = np.array(depth.astype(np.float32), copy=True)
-                return depth
-                
-            except Exception as e2:
-                print(f"imageio failed: {e2}")
-                raise e2
-    
+        import OpenEXR
+        import Imath
+        import array
+        
+        # Open the EXR file
+        exr_file = OpenEXR.InputFile(str(file_path))
+        
+        # Get the data window
+        dw = exr_file.header()['dataWindow']
+        width = dw.max.x - dw.min.x + 1
+        height = dw.max.y - dw.min.y + 1
+        
+        # Read the first channel (usually 'R' for depth)
+        channels = exr_file.header()['channels'].keys()
+        first_channel = list(channels)[0]
+        
+        # Read the channel data
+        channel_data = exr_file.channel(first_channel, Imath.PixelType(Imath.PixelType.FLOAT))
+        depth = np.frombuffer(channel_data, dtype=np.float32)
+        depth = depth.reshape(height, width)
+        # Make the array writable to avoid PyTorch warnings
+        depth = np.array(depth, copy=True)
+        
+        exr_file.close()
+        return depth
+        
     except Exception as e:
-        print(f"Error loading {file_path}: {e}")
-        print("Try installing OpenEXR support:")
-        print("  pip install OpenEXR")
-        print("  or")
-        print("  conda install -c conda-forge openexr-python")
-        return None
+        raise ImportError("OpenEXR library required for depth processing but not available")
 
 def load_smplx_data(file_path):
     """Load SMPLX data from pickle file."""
@@ -142,16 +111,64 @@ def extract_smplx_body_pose(smplx_data):
     
     return body_pose
 
+def blender_to_opencv_transform():
+    """
+    Create transformation matrix to convert from Blender to OpenCV coordinates.
+    
+    According to OpenCV/COLMAP convention:
+    - OpenCV uses: Forward: +Z, Up: -Y, Right: +X
+    - Blender uses: Forward: -Z, Up: +Y, Right: +X
+    
+    The conversion is a 180° rotation around the local X-axis.
+    
+    Returns:
+        np.ndarray: 4x4 transformation matrix
+    """
+    # 180° rotation around X-axis to convert from Blender to OpenCV
+    # This flips Y and Z axes
+    rotation = np.array([
+        [1,  0,  0],  # X stays the same
+        [0,  -1, 0],  # Y becomes -Y
+        [0,  0, -1]   # Z becomes -Z
+    ])
+    
+    # Create 4x4 transformation matrix
+    transform = np.eye(4)
+    transform[:3, :3] = rotation
+    
+    return transform
+
+def convert_blender_to_opencv_poses(poses):
+    """
+    Convert camera poses from Blender coordinate system to OpenCV coordinate system.
+    
+    Args:
+        poses: (N, 4, 4) camera poses in Blender coordinates (Y-up)
+        
+    Returns:
+        poses_converted: (N, 4, 4) camera poses in OpenCV coordinates (Z-up)
+    """
+    transform = blender_to_opencv_transform()
+    poses_converted = np.zeros_like(poses)
+    
+    for i in range(poses.shape[0]):
+        # Apply the coordinate transformation
+        poses_converted[i] = poses[i] @ transform.T
+    
+    return poses_converted
+
 parser = argparse.ArgumentParser(description="Generate video and trajectory sequences from images and camera parameters.")
 parser.add_argument("--data_root", type=str, required=True, help="Root directory containing folders of image and camera parameter data.")
 parser.add_argument("--start_idx", type=int, default=0, help="Starting index for image sequence.")
 parser.add_argument("--end_idx", type=int, default=-1, help="Ending index for image sequence.")
 parser.add_argument("--stride", type=int, default=25, help="Stride for selecting frames in the sequence.")
 parser.add_argument("--sample_every_nth", type=int, default=3, help="Sample every nth frame for the sequence.")
-parser.add_argument("--disparity_format", type=str, choices=["image", "npy", "npz"], default="npz", 
-                   help="Format for disparity output: 'image' for MP4 video, 'npy' for concatenated frames, 'npz' for compressed frames")
+parser.add_argument("--disparity_format", type=str, choices=["npy", "npz"], default="npz", 
+                   help="Format for disparity output: 'npy' for concatenated frames, 'npz' for compressed frames")
+parser.add_argument("--save_colorized_disparity", action="store_true", 
+                   help="Additionally save colorized disparity videos (MP4 format)")
 
-parser.add_argument("--no_sqrt_disparity", action="store_true", help="Disable square root of disparity (default: enabled)")
+parser.add_argument("--sqrt_disparity", action="store_true", help="Enable square root of disparity (default: disabled)")
 parser.add_argument("--skip_existing_clips", action="store_true", help="Skip clips that already exist")
 parser.add_argument("--smplx_base_path", type=str, default=None, 
                    help="Base path for SMPLX result files (default: {data_root}/../smplx_result)")
@@ -160,6 +177,10 @@ parser.add_argument("--dataset_type", type=str, choices=["aria", "trumans"], def
                    help="Dataset type: 'aria' for egoallo data, 'trumans' for SMPLX data. Auto-detected if not specified.")
 parser.add_argument("--dry_run", action="store_true", help="Show what would be processed without actually processing")
 parser.add_argument("--save_root", type=str, default=None, help="Root directory for saving sequences. If None, uses data_root.")
+parser.add_argument("--force_depth_reprocessing", action="store_true", 
+                   help="Force reprocessing of depth files even if disparity files already exist")
+parser.add_argument("--force_cam_pose_reprocessing", action="store_true", 
+                   help="Force reprocessing of camera poses even if trajectory files already exist")
 args = parser.parse_args()
 
 
@@ -177,11 +198,9 @@ else:
     output_folder = Path(args.data_root) / "sequences"
 video_output_folder = Path(output_folder) / "videos"
 
-# Set disparity output folder based on format
-if args.disparity_format == "image":
-    disparity_output_folder = Path(output_folder) / "disparity_video"  # Compatible with camera_pose_to_raymap.py
-else:  # npy or npz format
-    disparity_output_folder = Path(output_folder) / "disparity"
+# Set disparity output folder
+disparity_output_folder = Path(output_folder) / "disparity"
+colorized_disparity_output_folder = Path(output_folder) / "disparity_colorized" if args.save_colorized_disparity else None
 
 trajectory_output_folder = Path(output_folder) / "trajectory"
 human_pose_output_folder = Path(output_folder) / "human_motions"
@@ -194,7 +213,7 @@ fps = 8
 start_image_idx = args.start_idx  # Start from
 end_image_idx = args.end_idx  # End at
 output_size = None  # Set this if you want to resize (e.g., (720, 480))
-sqrt_disparity = not args.no_sqrt_disparity
+sqrt_disparity = args.sqrt_disparity
 
 # Create output directory
 if not image_folder.exists():
@@ -205,6 +224,29 @@ if image_folder.exists(): os.makedirs(video_output_folder, exist_ok=True)
 if disparity_folder.exists(): os.makedirs(disparity_output_folder, exist_ok=True)
 if depth_folder.exists(): os.makedirs(disparity_output_folder, exist_ok=True)
 if cam_param_folder.exists(): os.makedirs(trajectory_output_folder, exist_ok=True)
+if args.save_colorized_disparity: os.makedirs(colorized_disparity_output_folder, exist_ok=True)
+
+# Copy cam_params/intrinsics.npy to save_root if using save_root
+if args.save_root:
+    source_intrinsics_path = cam_param_folder / "intrinsics.npy"
+    dest_cam_params_path = Path(args.save_root) / "cam_params"
+    dest_intrinsics_path = dest_cam_params_path / "intrinsics.npy"
+    
+    if source_intrinsics_path.exists():
+        if not dest_intrinsics_path.exists():
+            try:
+                # Create cam_params directory in destination
+                os.makedirs(dest_cam_params_path, exist_ok=True)
+                # Copy intrinsics.npy
+                import shutil
+                shutil.copy2(source_intrinsics_path, dest_intrinsics_path)
+                print(f"📋 Copied cam_params/intrinsics.npy to save location: {dest_intrinsics_path}")
+            except Exception as e:
+                print(f"Warning: Could not copy intrinsics.npy: {e}")
+        else:
+            print(f"📋 cam_params/intrinsics.npy already exists in save location: {dest_intrinsics_path}")
+    else:
+        print(f"📋 No cam_params/intrinsics.npy found in source: {source_intrinsics_path}")
 
 
 # save arguments to a JSON file
@@ -303,6 +345,16 @@ if args.dataset_type == "trumans":
 if args.dataset_type == "trumans" and depth_folder.exists():
     print(f"📁 Found depth folder: {depth_folder}")
     print(f"ℹ️  Trumans dataset - will convert .exr depth to disparity")
+    
+    # Check OpenEXR availability - MANDATORY for depth processing
+    try:
+        import OpenEXR
+        print(f"✅ OpenEXR library available for depth processing")
+    except ImportError:
+        print(f"❌ ERROR: OpenEXR library is required for depth processing but not available")
+        print(f"💡 Install OpenEXR with: pip install OpenEXR")
+        print(f"💡 Or: conda install -c conda-forge openexr-python")
+        raise ImportError("OpenEXR library required for depth processing but not available")
 elif args.dataset_type == "aria" and depth_folder.exists():
     print(f"⚠️  Warning: ARIA dataset but depth folder found at {depth_folder}")
     print(f"ℹ️  ARIA datasets typically don't have depth files")
@@ -360,8 +412,13 @@ for start_idx in tqdm(range(0, num_images - clip_length * sample_every_nth + 1, 
         if smplx_data is not None:
             smplx_exists = os.path.exists(os.path.join(human_pose_output_folder, f"{clip_idx:05}.npz"))
         
-        # Skip if all required files exist
-        if video_exists and trajectory_exists and disparity_exists and smplx_exists:
+        # Skip if all required files exist (respect force reprocessing flags)
+        skip_video = video_exists
+        skip_trajectory = trajectory_exists and not args.force_cam_pose_reprocessing
+        skip_disparity = disparity_exists and not args.force_depth_reprocessing
+        skip_smplx = smplx_exists
+        
+        if skip_video and skip_trajectory and skip_disparity and skip_smplx:
             print(f"Skipping clip {clip_idx}: all files already exist")
             clip_idx += 1
             continue
@@ -418,28 +475,7 @@ for start_idx in tqdm(range(0, num_images - clip_length * sample_every_nth + 1, 
 
     # Disparity output - handle existing disparity files (if any)
     if disparity_folder.exists():
-        if args.disparity_format == "image":
-            # Save as MP4 video
-            out_path = os.path.join(disparity_output_folder, f"{clip_idx:05}.mp4")
-            if not args.dry_run:
-                if os.path.exists(out_path) and args.skip_existing_clips:
-                    print(f"Skipping existing disparity video: {out_path}")
-                else:
-                    disparity_frames = []
-                    for disparity_path in clip_disparity:
-                        disparity_frame = iio.imread(disparity_path)
-                        if output_size:
-                            disparity_frame = cv2.resize(disparity_frame, output_size)
-                        disparity_frames.append(disparity_frame)
-                    iio.imwrite(
-                        out_path,
-                        np.stack(disparity_frames),
-                        fps=fps,
-                        codec='libx264'
-                    )
-            else:
-                print(f"Would create disparity video: {out_path}")
-        elif args.disparity_format == "npy":
+        if args.disparity_format == "npy":
             # Save as concatenated NPY file
             out_path = os.path.join(disparity_output_folder, f"{clip_idx:05}.npy")
             if not args.dry_run:
@@ -481,6 +517,40 @@ for start_idx in tqdm(range(0, num_images - clip_length * sample_every_nth + 1, 
                     np.savez_compressed(out_path, disparity=disparity_sequence)
             else:
                 print(f"Would create disparity npz: {out_path}")
+        
+        # Save colorized disparity video if requested
+        if args.save_colorized_disparity:
+            out_path = os.path.join(colorized_disparity_output_folder, f"{clip_idx:05}.mp4")
+            if not args.dry_run:
+                if os.path.exists(out_path) and args.skip_existing_clips:
+                    print(f"Skipping existing colorized disparity video: {out_path}")
+                else:
+                    disparity_frames = []
+                    for disparity_path in clip_disparity:
+                        disparity_frame = iio.imread(disparity_path)
+                        if output_size:
+                            disparity_frame = cv2.resize(disparity_frame, output_size)
+                        
+                        # Convert to grayscale if RGB
+                        if disparity_frame.ndim == 3 and disparity_frame.shape[-1] == 3:
+                            disparity_frame = np.mean(disparity_frame, axis=-1)
+                        
+                        # Normalize to 0-1 range for colorize_depth function
+                        disparity_frame = disparity_frame.astype(np.float32) / 255.0
+                        # Apply colorization
+                        disparity_frame = colorize_depth(disparity_frame)
+                        # Convert back to 0-255 range for video
+                        disparity_frame = (disparity_frame * 255).astype(np.uint8)
+                        
+                        disparity_frames.append(disparity_frame)
+                    iio.imwrite(
+                        out_path,
+                        np.stack(disparity_frames),
+                        fps=fps,
+                        codec='libx264'
+                    )
+            else:
+                print(f"Would create colorized disparity video: {out_path}")
     
     # Depth to disparity conversion (Trumans datasets)
     elif depth_folder.exists():
@@ -508,33 +578,11 @@ for start_idx in tqdm(range(0, num_images - clip_length * sample_every_nth + 1, 
         
         print(f"Clip {clip_idx} dmax: {clip_dmax:.6f}")
         
-        if args.disparity_format == "image":
-            # Save as MP4 video
-            out_path = os.path.join(disparity_output_folder, f"{clip_idx:05}.mp4")
-            if not args.dry_run:
-                if os.path.exists(out_path) and args.skip_existing_clips:
-                    print(f"Skipping existing disparity video: {out_path}")
-                else:
-                    disparity_frames = []
-                    for i, disparity in enumerate(disparity_stack):
-                        # Convert to 8-bit grayscale (0-255)
-                        disparity_8bit = (disparity * 255).astype(np.uint8)
-                        if output_size:
-                            disparity_8bit = cv2.resize(disparity_8bit, output_size)
-                        disparity_frames.append(disparity_8bit)
-                    iio.imwrite(
-                        out_path,
-                        np.stack(disparity_frames),
-                        fps=fps,
-                        codec='libx264'
-                    )
-            else:
-                print(f"Would create disparity video: {out_path}")
-        elif args.disparity_format == "npy":
+        if args.disparity_format == "npy":
             # Save as concatenated NPY file
             out_path = os.path.join(disparity_output_folder, f"{clip_idx:05}.npy")
             if not args.dry_run:
-                if os.path.exists(out_path) and args.skip_existing_clips:
+                if os.path.exists(out_path) and args.skip_existing_clips and not args.force_depth_reprocessing:
                     print(f"Skipping existing disparity npy: {out_path}")
                 else:
                     # Stack frames and save as NPY
@@ -545,13 +593,39 @@ for start_idx in tqdm(range(0, num_images - clip_length * sample_every_nth + 1, 
             # Save as compressed NPZ file
             out_path = os.path.join(disparity_output_folder, f"{clip_idx:05}.npz")
             if not args.dry_run:
-                if os.path.exists(out_path) and args.skip_existing_clips:
+                if os.path.exists(out_path) and args.skip_existing_clips and not args.force_depth_reprocessing:
                     print(f"Skipping existing disparity npz: {out_path}")
                 else:
                     # Stack frames and save as compressed NPZ
                     np.savez_compressed(out_path, disparity=disparity_stack.astype(np.float16))
             else:
                 print(f"Would create disparity npz: {out_path}")
+        
+        # Save colorized disparity video if requested
+        if args.save_colorized_disparity:
+            out_path = os.path.join(colorized_disparity_output_folder, f"{clip_idx:05}.mp4")
+            if not args.dry_run:
+                if os.path.exists(out_path) and args.skip_existing_clips and not args.force_depth_reprocessing:
+                    print(f"Skipping existing colorized disparity video: {out_path}")
+                else:
+                    disparity_frames = []
+                    for i, disparity in enumerate(disparity_stack):
+                        # Apply colorization
+                        disparity_colorized = colorize_depth(disparity)
+                        # Convert to 8-bit RGB (0-255)
+                        disparity_8bit = (disparity_colorized * 255).astype(np.uint8)
+                        
+                        if output_size:
+                            disparity_8bit = cv2.resize(disparity_8bit, output_size)
+                        disparity_frames.append(disparity_8bit)
+                    iio.imwrite(
+                        out_path,
+                        np.stack(disparity_frames),
+                        fps=fps,
+                        codec='libx264'
+                    )
+            else:
+                print(f"Would create colorized disparity video: {out_path}")
 
     # Camera trajectory output
     if cam_param_folder.exists():
@@ -560,10 +634,18 @@ for start_idx in tqdm(range(0, num_images - clip_length * sample_every_nth + 1, 
             absolute_path = os.path.join(trajectory_output_folder, f"{clip_idx:05}_abs.npy")
             
             # Check if both trajectory files exist
-            if os.path.exists(relative_path) and os.path.exists(absolute_path) and args.skip_existing_clips:
+            if os.path.exists(relative_path) and os.path.exists(absolute_path) and args.skip_existing_clips and not args.force_cam_pose_reprocessing:
                 print(f"Skipping existing trajectory files: {relative_path}, {absolute_path}")
             else:
                 cam_params = [np.load(cam_param_path) for cam_param_path in clip_cam_params]
+                
+                # Apply Blender-to-OpenCV coordinate transformation for Trumans datasets
+                if args.dataset_type == "trumans":
+                    print(f"🔄 Applying Blender-to-OpenCV coordinate transformation for clip {clip_idx}")
+                    # Transform the original camera parameters first
+                    cam_params = [convert_blender_to_opencv_poses(cam_param.reshape(1, 4, 4)).squeeze(0) for cam_param in cam_params]
+                
+                # Compute relative and absolute trajectories from transformed camera parameters
                 T0_inv = np.linalg.inv(cam_params[0])
                 relative_trajectory = np.array([T0_inv @ T for T in cam_params]) # relative to the first frame
                 absolute_trajectory = np.array(cam_params) # absolute trajectory in world coordinates

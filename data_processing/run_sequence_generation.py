@@ -12,6 +12,7 @@ from pathlib import Path
 from tqdm import tqdm
 import imageio.v3 as iio
 import json
+import re
 
 # Add the training/aether/utils directory to the path to import postprocess_utils
 import sys
@@ -62,18 +63,26 @@ except ImportError:
         depth = cm(depth, bytes=False)[..., 0:3]
         return depth
 
-def find_all_actions(data_root):
-    """Find all action directories in all scenes."""
+def find_all_actions(data_root, scene_start=0, scene_end=-1):
+    """Find all action directories in all scenes, optionally filtered by scene index range."""
     actions = []
     
-    # Find all scene directories
+    # Find all scene directories and sort them naturally
     scene_dirs = [d for d in os.listdir(data_root) if os.path.isdir(os.path.join(data_root, d))]
+    scene_dirs = sorted(scene_dirs, key=lambda x: [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', x)])
     
-    for scene in scene_dirs:
+    # Apply scene index filtering
+    if scene_end == -1:
+        scene_end = len(scene_dirs)
+    
+    filtered_scene_dirs = scene_dirs[scene_start:scene_end]
+    
+    for scene in filtered_scene_dirs:
         scene_path = os.path.join(data_root, scene)
-        # Find all action directories (timestamp-like names)
+        # Find all action directories (timestamp-like names) and sort them naturally
         action_dirs = [d for d in os.listdir(scene_path) 
                       if os.path.isdir(os.path.join(scene_path, d)) and '@' in d]
+        action_dirs = sorted(action_dirs, key=lambda x: [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', x)])
         
         for action in action_dirs:
             action_path = os.path.join(scene_path, action)
@@ -107,10 +116,10 @@ def check_action_requirements(action_path):
 
 
 def get_sequence_parameters():
-    """Get sequence generation parameters from make_sequences.py to avoid hard-coding."""
-    # Default values (fallback)
+    # Default values (fallback) - MUST match make_sequences.py defaults
     clip_length = 49
-    stride = 10
+    stride = 25
+    sample_every_nth = 3
     
     try:
         # Read parameters from make_sequences.py without executing argument parsing
@@ -119,7 +128,7 @@ def get_sequence_parameters():
             with open(make_sequences_path, 'r') as f:
                 content = f.read()
                 
-            # Extract clip_length and stride using regex (before args.parse_args())
+            # Extract parameters using regex (before args.parse_args())
             import re
             
             # Find clip_length = 49
@@ -127,21 +136,40 @@ def get_sequence_parameters():
             if clip_match:
                 clip_length = int(clip_match.group(1))
                 
-            # Find stride = 10
+            # Find stride = 25 (updated to match make_sequences.py default)
             stride_match = re.search(r'stride\s*=\s*(\d+)', content)
             if stride_match:
                 stride = int(stride_match.group(1))
                 
+            # Find sample_every_nth = 3
+            sample_match = re.search(r'sample_every_nth\s*=\s*(\d+)', content)
+            if sample_match:
+                sample_every_nth = int(sample_match.group(1))
+                
     except Exception as e:
         print(f"Warning: Could not read parameters from make_sequences.py: {e}")
-        print(f"Using default values: clip_length={clip_length}, stride={stride}")
+        print(f"Using default values: clip_length={clip_length}, stride={stride}, sample_every_nth={sample_every_nth}")
     
-    return clip_length, stride
+    return clip_length, stride, sample_every_nth
 
 
-def check_sequences_exist(action_path, disparity_format="image"):
+def check_sequences_exist(action_path, disparity_format="image", save_root=None, scene_name=None, action_name=None, save_colorized_disparity=False):
     """Check if all expected sequences already exist for this action."""
-    sequences_path = os.path.join(action_path, "sequences")
+    if save_root:
+        # Use provided scene_name and action_name if available, otherwise extract from path
+        if scene_name and action_name:
+            sequences_path = os.path.join(save_root, scene_name, action_name, "sequences")
+        else:
+            # Extract scene and action from action_path to construct save path
+            action_path_parts = Path(action_path).parts
+            if len(action_path_parts) >= 2:
+                scene_name = action_path_parts[-2]
+                action_name = action_path_parts[-1]
+                sequences_path = os.path.join(save_root, scene_name, action_name, "sequences")
+            else:
+                sequences_path = os.path.join(action_path, "sequences")
+    else:
+        sequences_path = os.path.join(action_path, "sequences")
     images_path = os.path.join(action_path, "images")
     
     # Check if sequences directory exists
@@ -158,11 +186,11 @@ def check_sequences_exist(action_path, disparity_format="image"):
         return False
     
     # Get parameters from make_sequences.py
-    clip_length, stride = get_sequence_parameters()
+    clip_length, stride, sample_every_nth = get_sequence_parameters()
     
     # Calculate expected number of clips
     total_frames = len(image_files)
-    expected_clips = max(1, (total_frames - clip_length) // stride + 1)
+    expected_clips = max(1, (total_frames - clip_length * sample_every_nth) // (stride * sample_every_nth) + 1)
     
     # Check required sequence directories
     required_dirs = ["videos", "trajectory"]
@@ -170,6 +198,10 @@ def check_sequences_exist(action_path, disparity_format="image"):
         required_dirs.append("disparity_video")
     else:
         required_dirs.append("disparity")
+    
+    # Add colorized disparity directory if requested
+    if save_colorized_disparity:
+        required_dirs.append("disparity_colorized")
     
     # Check if all required directories exist
     for dir_name in required_dirs:
@@ -194,6 +226,9 @@ def check_sequences_exist(action_path, disparity_format="image"):
                 files = list(Path(dir_path).glob("*.npz"))
             else:
                 files = []
+        elif dir_name == "disparity_colorized":
+            # Check for MP4 files (colorized disparity videos)
+            files = list(Path(dir_path).glob("*.mp4"))
         elif dir_name == "trajectory":
             # Check for NPY files (both relative and absolute trajectories)
             files = list(Path(dir_path).glob("*.npy"))
@@ -206,6 +241,25 @@ def check_sequences_exist(action_path, disparity_format="image"):
             continue
         
         if len(files) != expected_clips:
+            return False
+    
+    # Check for cam_params/intrinsics.npy if using save_root
+    if save_root:
+        # Determine the path for intrinsics.npy in the save location
+        if scene_name and action_name:
+            save_action_path = os.path.join(save_root, scene_name, action_name)
+        else:
+            # Extract scene and action from action_path to construct save path
+            action_path_parts = Path(action_path).parts
+            if len(action_path_parts) >= 2:
+                scene_name = action_path_parts[-2]
+                action_name = action_path_parts[-1]
+                save_action_path = os.path.join(save_root, scene_name, action_name)
+            else:
+                save_action_path = action_path
+        
+        intrinsics_path = os.path.join(save_action_path, "cam_params", "intrinsics.npy")
+        if not os.path.exists(intrinsics_path):
             return False
     
     return True
@@ -250,7 +304,7 @@ def check_optional_data(action_path):
     return optional_data
 
 
-def run_sequence_generation(action_path, disparity_format="image", start_idx=0, end_idx=-1, debug=False, sqrt_disparity=True, skip_existing_clips=False, dataset_type=None, smplx_base_path=None):
+def run_sequence_generation(action_path, disparity_format="image", start_idx=0, end_idx=-1, debug=False, sqrt_disparity=True, skip_existing_clips=False, dataset_type=None, smplx_base_path=None, save_root=None, scene_name=None, action_name=None, verbose=False, force_depth_reprocessing=False, force_cam_pose_reprocessing=False, save_colorized_disparity=False):
     """Run make_sequences.py for a single action with optional depth-to-disparity conversion."""
     
     # Check if we should use existing disparity or convert from depth
@@ -266,6 +320,36 @@ def run_sequence_generation(action_path, disparity_format="image", start_idx=0, 
         "--end_idx", str(end_idx)
     ]
     
+    # Add save_root if provided
+    if save_root:
+        # Use provided scene_name and action_name if available, otherwise extract from path
+        if scene_name and action_name:
+            save_path = os.path.join(save_root, scene_name, action_name)
+        else:
+            # Extract scene and action from action_path to construct save path
+            action_path_parts = Path(action_path).parts
+            # Find the scene and action parts (they should be the last two parts)
+            if len(action_path_parts) >= 2:
+                scene_name = action_path_parts[-2]
+                action_name = action_path_parts[-1]
+                save_path = os.path.join(save_root, scene_name, action_name)
+            else:
+                print(f"Warning: Could not extract scene/action from path: {action_path}")
+                print(f"Using default save location: {action_path}")
+                save_path = action_path
+        
+        # Create the save directory structure
+        try:
+            os.makedirs(save_path, exist_ok=True)
+            print(f"Created save directory: {save_path}")
+        except Exception as e:
+            print(f"Warning: Could not create directory {save_path}: {e}")
+        
+
+        
+        cmd.extend(["--save_root", save_path])
+        print(f"Saving sequences to: {save_path}")
+    
     if skip_existing_clips:
         cmd.append("--skip_existing_clips")
     
@@ -278,11 +362,23 @@ def run_sequence_generation(action_path, disparity_format="image", start_idx=0, 
     if smplx_base_path:
         cmd.extend(["--smplx_base_path", smplx_base_path])
     
+    # Add force reprocessing flags if specified
+    if force_depth_reprocessing:
+        cmd.append("--force_depth_reprocessing")
+    if force_cam_pose_reprocessing:
+        cmd.append("--force_cam_pose_reprocessing")
+    
+    # Add colorized disparity flag if specified
+    if save_colorized_disparity:
+        cmd.append("--save_colorized_disparity")
+    
     # Check if depth files exist (for Trumans datasets)
     if os.path.exists(depth_path):
         exr_files = list(Path(depth_path).glob("*.exr"))
         if exr_files:
             print(f"Converting depth to disparity from: {depth_path}")
+            if force_depth_reprocessing:
+                print(f"🔄 Force reprocessing depth files (OpenEXR required)")
         else:
             print(f"Depth folder exists but no .exr files found in: {depth_path}")
     elif os.path.exists(disparity_path):
@@ -306,13 +402,22 @@ def run_sequence_generation(action_path, disparity_format="image", start_idx=0, 
             if output:
                 output_lines.append(output.strip())
                 # Print progress lines that contain frame/clip information
-                if any(keyword in output for keyword in ["Processing frame", "Generated clip", "Converting depth", "Saved", "frames processed"]):
+                if verbose or any(keyword in output for keyword in ["Processing frame", "Generated clip", "Converting depth", "Saved", "frames processed", "Error", "Exception", "Failed"]):
                     print(f"    {output.strip()}")
         
         # Wait for process to complete
         return_code = process.wait()
+        
+        # If the process failed, print the full output for debugging
+        if return_code != 0:
+            print(f"    ❌ Process failed with return code: {return_code}")
+            print(f"    📋 Full output:")
+            for line in output_lines[-20:]:  # Show last 20 lines
+                print(f"        {line}")
+        
         return return_code == 0, "\n".join(output_lines), ""
     except Exception as e:
+        print(f"    ❌ Exception occurred: {e}")
         return False, "", str(e)
 
 
@@ -393,6 +498,21 @@ def main():
                        help="Process only actions from fully rendered scenes (requires rendering_status_report.json)")
     parser.add_argument("--status_report_path", type=str, default="rendering_status_report.json",
                        help="Path to the rendering status report JSON file")
+    parser.add_argument("--save_root", type=str, default=None,
+                       help="Root directory for saving sequences. If None, uses data_root. Preserves scene/action structure.")
+    parser.add_argument("--scene_start", type=int, default=0,
+                       help="Starting scene index (0-based, for manual parallel processing)")
+    parser.add_argument("--scene_end", type=int, default=-1,
+                       help="Ending scene index (exclusive, -1 for all scenes)")
+    parser.add_argument("--verbose", action="store_true",
+                       help="Show verbose output including all subprocess output")
+    parser.add_argument("--force_depth_reprocessing", action="store_true",
+                       help="Force reprocessing of depth files even if disparity files already exist")
+    parser.add_argument("--force_cam_pose_reprocessing", action="store_true",
+                       help="Force reprocessing of camera poses even if trajectory files already exist")
+    parser.add_argument("--save_colorized_disparity", action="store_true",
+                       help="Additionally save colorized disparity videos (MP4 format)")
+
     
     args = parser.parse_args()
     
@@ -402,8 +522,14 @@ def main():
     
     print(f"Scanning for actions in: {args.data_root}")
     
-    # Find all actions
-    actions = find_all_actions(args.data_root)
+    # Find all actions with scene filtering
+    actions = find_all_actions(args.data_root, args.scene_start, args.scene_end)
+    
+    # Show scene range being processed
+    if args.scene_end == -1:
+        print(f"Processing scenes {args.scene_start} to end")
+    else:
+        print(f"Processing scenes {args.scene_start} to {args.scene_end-1} (exclusive)")
     
     if not actions:
         print("No actions found!")
@@ -427,7 +553,8 @@ def main():
             return
         
         # Show which scenes are being processed
-        scenes_to_process = sorted(set(a['scene'] for a in actions))
+        scenes_to_process = sorted(set(a['scene'] for a in actions), 
+                                 key=lambda x: [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', x)])
         print(f"\n🎯 Processing actions from {len(scenes_to_process)} fully rendered scenes:")
         for scene in scenes_to_process[:10]:  # Show first 10
             print(f"  ✓ {scene}")
@@ -441,7 +568,7 @@ def main():
     for action in actions:
         if check_action_requirements(action['path']):
             # Check if sequences already exist
-            if args.skip_existing and check_sequences_exist(action['path'], args.disparity_format):
+            if args.skip_existing and check_sequences_exist(action['path'], args.disparity_format, args.save_root, action['scene'], action['action'], args.save_colorized_disparity):
                 skipped_actions.append(action)
                 print(f"⏭️  Skipping {action['scene']}/{action['action']}: All sequences already exist")
             else:
@@ -454,8 +581,15 @@ def main():
                     total_frames = len(image_files)
                     
                     # Get parameters from make_sequences.py
-                    clip_length, stride = get_sequence_parameters()
-                    expected_clips = max(1, (total_frames - clip_length) // stride + 1)
+                    clip_length, stride, sample_every_nth = get_sequence_parameters()
+                    expected_clips = max(1, (total_frames - clip_length * sample_every_nth) // (stride * sample_every_nth) + 1)
+                    
+                    # Determine the correct sequences path
+                    if args.save_root:
+                        # Use scene and action names directly
+                        sequences_path = os.path.join(args.save_root, action['scene'], action['action'], "sequences")
+                    else:
+                        sequences_path = os.path.join(action['path'], "sequences")
                     
                     if os.path.exists(sequences_path):
                         # Check existing files
@@ -475,14 +609,22 @@ def main():
                             disparity_path = os.path.join(sequences_path, "disparity")
                             existing_disparities = len(list(Path(disparity_path).glob("*.npz"))) if os.path.exists(disparity_path) else 0
                         
+                        # Check colorized disparity files if requested
+                        existing_colorized_disparities = 0
+                        if args.save_colorized_disparity:
+                            colorized_disparity_path = os.path.join(sequences_path, "disparity_colorized")
+                            existing_colorized_disparities = len(list(Path(colorized_disparity_path).glob("*.mp4"))) if os.path.exists(colorized_disparity_path) else 0
+                        
                         missing_videos = expected_clips - existing_videos
                         missing_trajectories = expected_clips - existing_trajectories
                         missing_disparities = expected_clips - existing_disparities
+                        missing_colorized_disparities = expected_clips - existing_colorized_disparities if args.save_colorized_disparity else 0
                         print(f"existing_videos: {existing_videos}, expected_clips: {expected_clips}")
                         print(f"existing_trajectories: {existing_trajectories}, expected_clips: {expected_clips}")
                         print(f"existing_disparities: {existing_disparities}, expected_clips: {expected_clips}")
-                        if missing_videos > 0 or missing_trajectories > 0 or missing_disparities > 0:
-                            print(f"🔄 Processing {action['scene']}/{action['action']}: {missing_videos} videos, {missing_trajectories} trajectories, {missing_disparities} disparities missing ({existing_videos}/{expected_clips} videos)")
+                        if missing_videos > 0 or missing_trajectories > 0 or missing_disparities > 0 or missing_colorized_disparities > 0:
+                            colorized_info = f", {missing_colorized_disparities} colorized disparities" if args.save_colorized_disparity else ""
+                            print(f"🔄 Processing {action['scene']}/{action['action']}: {missing_videos} videos, {missing_trajectories} trajectories, {missing_disparities} disparities{colorized_info} missing ({existing_videos}/{expected_clips} videos)")
                         else:
                             # All sequences are complete, skip this action
                             if args.skip_existing:
@@ -565,7 +707,14 @@ def main():
             sqrt_disparity,
             args.skip_existing_clips,
             args.dataset_type,
-            args.smplx_base_path
+            args.smplx_base_path,
+            args.save_root,
+            action['scene'],
+            action['action'],
+            args.verbose,
+            args.force_depth_reprocessing,
+            args.force_cam_pose_reprocessing,
+            args.save_colorized_disparity
         )
         
         if success:
@@ -576,6 +725,11 @@ def main():
             if stderr:
                 print(f"   Error: {stderr}")
             failed += 1
+            
+            # Suggest debugging if this is the first failure
+            if failed == 1:
+                print(f"   💡 To debug this issue, run with --debug --verbose flags:")
+                print(f"      python data_processing/run_sequence_generation.py --debug --verbose --data_root {args.data_root} --save_root {args.save_root}")
         
         # Show progress summary
         print(f"   📊 Progress: {successful} successful, {failed} failed ({i}/{len(valid_actions)} completed)")
@@ -603,6 +757,8 @@ def main():
             print(f"    ├── disparity/                 # Disparity sequences (NPY)")
         else:  # npz format
             print(f"    ├── disparity/                 # Disparity sequences (compressed NPZ)")
+        if args.save_colorized_disparity:
+            print(f"    ├── disparity_colorized/       # Colorized disparity videos (MP4)")
         print(f"    ├── trajectory/                  # Camera trajectory sequences")
         print(f"    └── human_motions/               # Human pose sequences (if available)")
 
