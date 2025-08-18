@@ -9,13 +9,26 @@ import argparse
 from pathlib import Path
 from tqdm import tqdm
 
-def find_all_actions(data_root):
-    """Find all action directories in all scenes."""
+def find_all_actions(data_root, scene_start=None, scene_end=None):
+    """Find all action directories in all scenes, optionally filtered by scene range."""
     actions = []
     
     # Find all scene directories, excluding "processed"
     scene_dirs = [d for d in os.listdir(data_root) 
                   if os.path.isdir(os.path.join(data_root, d)) and d != "processed"]
+    
+    # Sort scenes naturally for consistent ordering
+    from natsort import natsorted
+    scene_dirs = natsorted(scene_dirs)
+    
+    # Apply scene range filtering if specified
+    if scene_start is not None or scene_end is not None:
+        if scene_start is None:
+            scene_start = 0
+        if scene_end is None:
+            scene_end = len(scene_dirs)
+        scene_dirs = scene_dirs[scene_start:scene_end]
+        print(f"🔍 Processing scenes {scene_start}-{scene_end-1} ({len(scene_dirs)} scenes)")
     
     for scene in scene_dirs:
         scene_path = os.path.join(data_root, scene)
@@ -95,16 +108,17 @@ def check_raymaps_exist(action_path, disparity_format="auto"):
     
     return True
 
-def run_raymap_generation(action_path, disparity_format="auto", debug=False):
+def run_raymap_generation(action_path, disparity_format="auto", dataset_type="trumans", skip_existing=False, debug=False):
     """Run camera_pose_to_raymap.py for a single action."""
     cmd = [
         "python", "training/aether/utils/camera_pose_to_raymap.py",
         "--data_root", action_path,
-        "--disparity_format", disparity_format
+        "--disparity_format", disparity_format,
+        "--dataset_type", dataset_type
     ]
     
-    if debug:
-        cmd.append("--debug")
+    if skip_existing:
+        cmd.append("--skip_existing")
     
     try:
         # Run with real-time output to show progress
@@ -135,6 +149,10 @@ def main():
                        help="Root directory containing scene data")
     parser.add_argument("--disparity_format", type=str, choices=["video", "npy", "npz", "auto"], 
                        default="auto", help="Format of disparity data: 'video' for MP4, 'npy' for uncompressed, 'npz' for compressed, 'auto' to auto-detect")
+    parser.add_argument("--dataset_type", type=str, choices=["aria", "trumans"], 
+                       default="trumans", help="Dataset type: 'aria' for DepthAnyVideo results, 'trumans' for Blender rendering (default: trumans)")
+    parser.add_argument("--scene_start", type=int, default=None, help="Start scene index (0-based) for processing a subset of scenes")
+    parser.add_argument("--scene_end", type=int, default=None, help="End scene index (exclusive) for processing a subset of scenes")
     parser.add_argument("--debug", action="store_true", help="Process only one action for debugging")
     parser.add_argument("--dry_run", action="store_true", help="Show what would be processed without running")
     parser.add_argument("--skip_existing", action="store_true", help="Skip actions that already have raymaps")
@@ -143,7 +161,7 @@ def main():
     print(f"Scanning for actions in: {args.data_root}")
     
     # Find all actions
-    actions = find_all_actions(args.data_root)
+    actions = find_all_actions(args.data_root, args.scene_start, args.scene_end)
     
     if not actions:
         print("No actions found!")
@@ -243,6 +261,8 @@ def main():
         success, stdout, stderr = run_raymap_generation(
             action['path'], 
             args.disparity_format, 
+            args.dataset_type,
+            args.skip_existing,
             args.debug
         )
         
@@ -257,7 +277,10 @@ def main():
         
         # Show progress summary
         print(f"   📊 Progress: {successful} successful, {failed} failed ({i}/{len(valid_actions)} completed)")
-    
+        
+        if args.debug:
+            break
+        
     # Summary
     print(f"\n{'='*60}")
     print(f"SUMMARY")
