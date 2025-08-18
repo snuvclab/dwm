@@ -3,13 +3,46 @@
 # Parallel sequence generation for 58 scenes split into 6 groups
 # Each group processes ~10 scenes (9-10 scenes per group)
 
+# Function to kill all background processes
+cleanup() {
+    echo ""
+    echo "🛑 Received interrupt signal. Killing all background processes..."
+    
+    # Kill all background processes
+    if [ ! -z "$PID1" ]; then kill $PID1 2>/dev/null; fi
+    if [ ! -z "$PID2" ]; then kill $PID2 2>/dev/null; fi
+    if [ ! -z "$PID3" ]; then kill $PID3 2>/dev/null; fi
+    if [ ! -z "$PID4" ]; then kill $PID4 2>/dev/null; fi
+    if [ ! -z "$PID5" ]; then kill $PID5 2>/dev/null; fi
+    if [ ! -z "$PID6" ]; then kill $PID6 2>/dev/null; fi
+    
+    # Wait a moment for processes to terminate
+    sleep 2
+    
+    # Force kill if still running
+    if [ ! -z "$PID1" ]; then kill -9 $PID1 2>/dev/null; fi
+    if [ ! -z "$PID2" ]; then kill -9 $PID2 2>/dev/null; fi
+    if [ ! -z "$PID3" ]; then kill -9 $PID3 2>/dev/null; fi
+    if [ ! -z "$PID4" ]; then kill -9 $PID4 2>/dev/null; fi
+    if [ ! -z "$PID5" ]; then kill -9 $PID5 2>/dev/null; fi
+    if [ ! -z "$PID6" ]; then kill -9 $PID6 2>/dev/null; fi
+    
+    echo "✅ All processes terminated."
+    echo "⏰ Interrupted at: $(date)"
+    exit 1
+}
+
+# Set up signal handlers for graceful shutdown
+trap cleanup SIGINT SIGTERM
+
 # Define shared command parts
 BASE_CMD="python data_processing/run_sequence_generation.py"
-SHARED_ARGS="--force_depth_reprocessing --data_root ../ego_render_new/ --save_root ../../nas1/public_dataset/trumans/ego_render_new/ --smplx_base_path ../../nas1/public_dataset/trumans/smplx_result/ --skip_existing_clips"
+SHARED_ARGS="--data_root ./data/trumans/ego_render_fov90/ --save_root ./data/trumans/ego_render_fov90/ --smplx_base_path ./data/trumans/smplx_result/ --skip_existing_clips"
 
 echo "🚀 Starting parallel sequence generation with 6 processes..."
 echo "📊 Total scenes: 58, Scenes per process: ~10"
 echo "⏰ Started at: $(date)"
+echo "💡 Press Ctrl+C to stop all processes gracefully"
 echo ""
 
 # Create logs directory if it doesn't exist

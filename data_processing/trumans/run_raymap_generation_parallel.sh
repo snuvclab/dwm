@@ -3,6 +3,38 @@
 # Parallel raymap generation for multiple scenes split into groups
 # Each group processes a subset of scenes in parallel
 
+# Function to kill all background processes
+cleanup() {
+    echo ""
+    echo "🛑 Received interrupt signal. Killing all background processes..."
+    
+    # Kill all background processes
+    if [ ! -z "$PID1" ]; then kill $PID1 2>/dev/null; fi
+    if [ ! -z "$PID2" ]; then kill $PID2 2>/dev/null; fi
+    if [ ! -z "$PID3" ]; then kill $PID3 2>/dev/null; fi
+    if [ ! -z "$PID4" ]; then kill $PID4 2>/dev/null; fi
+    if [ ! -z "$PID5" ]; then kill $PID5 2>/dev/null; fi
+    if [ ! -z "$PID6" ]; then kill $PID6 2>/dev/null; fi
+    
+    # Wait a moment for processes to terminate
+    sleep 2
+    
+    # Force kill if still running
+    if [ ! -z "$PID1" ]; then kill -9 $PID1 2>/dev/null; fi
+    if [ ! -z "$PID2" ]; then kill -9 $PID2 2>/dev/null; fi
+    if [ ! -z "$PID3" ]; then kill -9 $PID3 2>/dev/null; fi
+    if [ ! -z "$PID4" ]; then kill -9 $PID4 2>/dev/null; fi
+    if [ ! -z "$PID5" ]; then kill -9 $PID5 2>/dev/null; fi
+    if [ ! -z "$PID6" ]; then kill -9 $PID6 2>/dev/null; fi
+    
+    echo "✅ All processes terminated."
+    echo "⏰ Interrupted at: $(date)"
+    exit 1
+}
+
+# Set up signal handlers for graceful shutdown
+trap cleanup SIGINT SIGTERM
+
 # Define shared command parts
 BASE_CMD="python data_processing/trumans/run_raymap_generation.py"
 SHARED_ARGS="--data_root ./data/trumans/ego_render_fov90/ --disparity_format npz --dataset_type trumans --skip_existing"
@@ -15,6 +47,7 @@ NUM_GROUPS=6
 echo "🚀 Starting parallel raymap generation with $NUM_GROUPS processes..."
 echo "📊 Total scenes: $TOTAL_SCENES, Scenes per process: ~$SCENES_PER_GROUP"
 echo "⏰ Started at: $(date)"
+echo "💡 Press Ctrl+C to stop all processes gracefully"
 echo ""
 
 # Create logs directory if it doesn't exist
