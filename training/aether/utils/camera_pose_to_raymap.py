@@ -158,9 +158,15 @@ def main(args):
         
         print(f"Using dmax={dmax:.6f} for {args.disparity_format} format")
 
+        # Check if output file already exists
+        output_path = out_dir / f"{traj.stem}.npz"
+        if args.skip_existing and output_path.exists():
+            print(f"Skipping {name} - output file already exists: {output_path}")
+            continue
+
         # Generate raymap using the maximum disparity value
         raymap = camera_pose_to_raymap(Rt, np.tile(K, (len(Rt), 1, 1)), ray_o_scale_factor=10.0, dmax=dmax)
-        np.savez_compressed(out_dir / f"{traj.stem}.npz", raymap=raymap)
+        np.savez_compressed(output_path, raymap=raymap)
 
         print(f"Generated raymap for {name} with dmax={dmax:.6f}")
 
@@ -181,6 +187,7 @@ if __name__ == "__main__":
     parser.add_argument("--no_reverse_sqrt", action="store_true", default=False,
                        help="Disable reverse sqrt operation (use with --no_sqrt_disparity in exr_to_disparity.py)")
     parser.add_argument("--debug", action="store_true", help="Process only one trajectory for debugging")
+    parser.add_argument("--skip_existing", action="store_true", help="Skip processing if output file already exists")
     args = parser.parse_args()
     
     print(f"📊 Dataset type: {args.dataset_type.upper()}")
