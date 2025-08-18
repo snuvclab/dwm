@@ -10,10 +10,12 @@ import argparse
 from check_rendering_status import get_animation_frame_count
 
 # === User Configuration ===
-DEFAULT_RECORDINGS_PATH = "../../nas1/public_dataset/trumans/Recordings_blend"
+DEFAULT_RECORDINGS_PATH = "../nas1/public_dataset/trumans/Recordings_blend"
 # DEFAULT_RECORDINGS_PATH = "./Recordings_blend"
-DEFAULT_SAVE_PATH = "../../nas1/public_dataset/trumans/ego_render_fov90"
+DEFAULT_SAVE_PATH = "../nas1/public_dataset/trumans/ego_render_fov90"
 SCRIPT_PATH = "data_processing/trumans/blender_ego_rgb_depth_optimized.py"
+# SCRIPT_PATH = "data_processing/trumans/blender_ego_static.py"
+# SCRIPT_PATH = "data_processing/trumans/blender_ego_hand.py"
 NUM_GPUS = 8
 # ===========================
 
@@ -189,11 +191,18 @@ except Exception as e:
         print(f"Exception getting animation names for {os.path.basename(blend_file)}: {e}")
         return []
 
-def check_already_rendered(blend_file, save_path, status_report=None):
+def check_already_rendered(blend_file, save_path, status_report=None, script_path=None):
     """Check if a scene has already been rendered using status report if available.
     Returns: (is_complete, rendered_animations, missing_animations, all_animations)"""
     directory_name = os.path.basename(os.path.dirname(blend_file))
     blend_name = Path(blend_file).stem
+    
+    # Determine output format based on script path
+    is_video_output = False
+    if script_path:
+        script_name = os.path.basename(script_path)
+        if script_name in ['blender_ego_static.py', 'blender_ego_hand.py']:
+            is_video_output = True
     
     # Use status report if available (preferred method - no Blender overhead)
     if status_report and "rendered_scenes_details" in status_report:
@@ -266,30 +275,54 @@ def check_already_rendered(blend_file, save_path, status_report=None):
         for item in os.listdir(output_base):
             item_path = os.path.join(output_base, item)
             if os.path.isdir(item_path):
-                # Check if this animation folder has complete output
-                rgb_path = os.path.join(item_path, "images")  # Updated to match Blender script
-                depth_path = os.path.join(item_path, "depth")
-                cam_params_path = os.path.join(item_path, "cam_params")
-                
-                # Check if all required folders exist
-                if not all(os.path.exists(p) for p in [rgb_path, depth_path, cam_params_path]):
-                    continue
-                
-                # Count files in each folder
-                rgb_files = len([f for f in os.listdir(rgb_path) if f.endswith('.png')])
-                depth_files = len([f for f in os.listdir(depth_path) if f.endswith('.exr')])
-                cam_files = len([f for f in os.listdir(cam_params_path) if f.startswith('cam')])
-                
-                # Get expected frame count for this animation
-                expected_frames = get_animation_frame_count(blend_file, item)
-                if expected_frames is None:
-                    expected_frames = 0
-                
-                # Consider complete only if all file counts match expected frames
-                if (rgb_files == expected_frames and 
-                    depth_files == expected_frames and 
-                    cam_files == expected_frames):
-                    rendered_animations.append(item)
+                if is_video_output:
+                    # For video output scripts, check for video sequences
+                    sequences_path = os.path.join(item_path, "sequences")
+                    if not os.path.exists(sequences_path):
+                        continue
+                    
+                    # Check for video files based on script type
+                    if script_path and 'blender_ego_static.py' in script_path:
+                        videos_path = os.path.join(sequences_path, "videos_static")
+                    elif script_path and 'blender_ego_hand.py' in script_path:
+                        videos_path = os.path.join(sequences_path, "videos_hands")
+                    else:
+                        videos_path = sequences_path
+                    
+                    if os.path.exists(videos_path):
+                        # Count video files
+                        video_files = len([f for f in os.listdir(videos_path) if f.endswith('.mp4')])
+                        
+                        # For video output, we consider it complete if there are any video files
+                        # (since we don't know the exact expected count without complex calculation)
+                        if video_files > 0:
+                            rendered_animations.append(item)
+                else:
+                    # For frame-based output (blender_ego_rgb_depth_optimized.py)
+                    # Check if this animation folder has complete output
+                    rgb_path = os.path.join(item_path, "images")  # Updated to match Blender script
+                    depth_path = os.path.join(item_path, "depth")
+                    cam_params_path = os.path.join(item_path, "cam_params")
+                    
+                    # Check if all required folders exist
+                    if not all(os.path.exists(p) for p in [rgb_path, depth_path, cam_params_path]):
+                        continue
+                    
+                    # Count files in each folder
+                    rgb_files = len([f for f in os.listdir(rgb_path) if f.endswith('.png')])
+                    depth_files = len([f for f in os.listdir(depth_path) if f.endswith('.exr')])
+                    cam_files = len([f for f in os.listdir(cam_params_path) if f.startswith('cam')])
+                    
+                    # Get expected frame count for this animation
+                    expected_frames = get_animation_frame_count(blend_file, item)
+                    if expected_frames is None:
+                        expected_frames = 0
+                    
+                    # Consider complete only if all file counts match expected frames
+                    if (rgb_files == expected_frames and 
+                        depth_files == expected_frames and 
+                        cam_files == expected_frames):
+                        rendered_animations.append(item)
         
         # Calculate missing animations
         missing_animations = [anim for anim in all_animations if anim not in rendered_animations]
@@ -460,7 +493,7 @@ def main():
         # Use directory_name as scene key for consistency with status report and actual output folders
         scene_name = directory_name
         display_name = directory_name  # For user-friendly display (same as scene_name in this case)
-        is_rendered, rendered_anims, missing_anims, all_anims = check_already_rendered(blend_file, args.save_path, status_report)
+        is_rendered, rendered_anims, missing_anims, all_anims = check_already_rendered(blend_file, args.save_path, status_report, args.script_path)
         
         if is_rendered:
             rendered_scenes[scene_name] = rendered_anims
