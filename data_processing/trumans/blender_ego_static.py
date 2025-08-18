@@ -22,7 +22,6 @@ parser.add_argument("--start_frame", type=int, default=None)
 parser.add_argument("--end_frame", type=int, default=None)
 parser.add_argument("--animation_index", type=int, default=None, help="Specific animation index (else: all)")
 parser.add_argument("--samples", type=int, default=64, help="Cycles samples")
-parser.add_argument("--resolution", type=int, default=720, help="(unused; final is fixed 720x480)")
 parser.add_argument("--save-path", type=str, default="/home/byungjun/workspace/trumans_ego/ego_render_new",
                     help="Root output dir")
 parser.add_argument("--skip-existing", action="store_true", default=True, help="Skip frames that already exist")
@@ -130,7 +129,20 @@ def get_camera_intrinsics(camera_obj):
 def get_camera_to_world_matrix(camera_obj):
     return np.array(camera_obj.matrix_world, dtype=np.float32)
 
-# Removed check_frame_exists function - no longer needed for video-based rendering
+def check_video_exists(video_idx, videos_output_path):
+    """Check if video already exists and has non-zero size."""
+    def file_ok(path): return os.path.isfile(path) and os.path.getsize(path) > 0
+    video_path = os.path.join(videos_output_path, f"{video_idx:05d}.mp4")
+    video_exists = file_ok(video_path)
+    needs_rendering = not video_exists
+    return video_exists, needs_rendering
+
+def check_frame_exists(frame_num, images_output_path):
+    def file_ok(path): return os.path.isfile(path) and os.path.getsize(path) > 0
+    image_path = os.path.join(images_output_path, f"{frame_num:04d}.png")
+    image_exists = file_ok(image_path)
+    needs_rendering = not image_exists
+    return image_exists, needs_rendering
 
 def optimize_scene_for_rendering():
     scene = bpy.context.scene
@@ -471,6 +483,15 @@ def render_animation_sequence(animation_index, animation_name):
         video_end_frame = start_frame_num + (clip_length - 1) * frame_skip
         frames_to_render = list(range(start_frame_num, video_end_frame + 1, frame_skip))
 
+        # Check if video already exists
+        video_exists, needs_video_rendering = check_video_exists(video_idx, videos_output_path)
+        
+        if args.skip_existing and not needs_video_rendering:
+            print(f"\n========== VIDEO {video_idx + 1}/{len(video_start_frames)} ==========")
+            print(f"SKIPPED: Video {video_idx:05d}.mp4 already exists")
+            videos_completed += 1
+            continue
+
         # === (A) 루프 시작: 깨끗한 상태로 되돌리기 ===
         restore_animations(camera_obj)    # 이전 클립에서 분리했던 것 되돌림
         show_actor_in_rendering()         # 배우(암) 다시 보이게
@@ -527,7 +548,7 @@ def render_animation_sequence(animation_index, animation_name):
 
             if frame_idx % 10 == 0 or frame_idx == len(frames_to_render) - 1:
                 progress = (frame_idx + 1) / len(frames_to_render) * 100.0
-                avg_frame_time = total_render_time / (videos_completed * clip_length + frames_rendered)
+                avg_frame_time = total_render_time / frames_rendered if frames_rendered > 0 else 0
                 print(f"  Frame {frame_idx + 1}/{len(frames_to_render)} ({progress:.1f}%) - {frame_time:.1f}s")
         
         # Convert frames to video using ffmpeg
@@ -586,6 +607,7 @@ def render_animation_sequence(animation_index, animation_name):
     print(f"Videos created: {videos_completed}/{len(video_start_frames)}")
     print(f"Frame step: {frame_skip} | Stride: {stride} | Effective stride: {effective_stride}")
     print(f"Average throughput: {avg_fps:.2f} fps")
+    print(f"Skip existing: {args.skip_existing}")
     print("="*50)
 
 # ---------------------------

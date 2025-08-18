@@ -145,6 +145,14 @@ def get_camera_intrinsics(camera_obj):
 def get_camera_to_world_matrix(camera_obj):
     return np.array(camera_obj.matrix_world, dtype=np.float32)
 
+def check_video_exists(video_idx, videos_output_path):
+    """Check if video already exists and has non-zero size."""
+    def file_ok(path): return os.path.isfile(path) and os.path.getsize(path) > 0
+    video_path = os.path.join(videos_output_path, f"{video_idx:05d}.mp4")
+    video_exists = file_ok(video_path)
+    needs_rendering = not video_exists
+    return video_exists, needs_rendering
+
 def check_frame_exists(frame_num, images_output_path):
     def file_ok(path): return os.path.isfile(path) and os.path.getsize(path) > 0
     image_path = os.path.join(images_output_path, f"{frame_num:04d}.png")
@@ -710,6 +718,15 @@ def render_animation_sequence(animation_index, animation_name):
         video_end_frame = start_frame_num + (clip_length - 1) * frame_skip
         frames_to_render = list(range(start_frame_num, video_end_frame + 1, frame_skip))
 
+        # Check if video already exists
+        video_exists, needs_video_rendering = check_video_exists(video_idx, videos_output_path)
+        
+        if args.skip_existing and not needs_video_rendering:
+            print(f"\n========== VIDEO {video_idx + 1}/{len(video_start_frames)} ==========")
+            print(f"SKIPPED: Video {video_idx:05d}.mp4 already exists")
+            videos_completed += 1
+            continue
+
         print(f"\n========== VIDEO {video_idx + 1}/{len(video_start_frames)} ==========")
         print(f"Frames: {start_frame_num}..{video_end_frame} (step {frame_skip}) -> {len(frames_to_render)} frames")
 
@@ -742,7 +759,7 @@ def render_animation_sequence(animation_index, animation_name):
 
             if frame_idx % 10 == 0 or frame_idx == len(frames_to_render) - 1:
                 progress = (frame_idx + 1) / len(frames_to_render) * 100.0
-                avg_frame_time = total_render_time / (videos_completed * clip_length + frames_rendered)
+                avg_frame_time = total_render_time / frames_rendered if frames_rendered > 0 else 0
                 print(f"  Frame {frame_idx + 1}/{len(frames_to_render)} ({progress:.1f}%) - {frame_time:.1f}s")
         
         # Convert frames to video using ffmpeg
@@ -797,6 +814,7 @@ def render_animation_sequence(animation_index, animation_name):
     print(f"Videos created: {videos_completed}/{len(video_start_frames)}")
     print(f"Frame step: {frame_skip} | Stride: {stride} | Effective stride: {effective_stride}")
     print(f"Average throughput: {avg_fps:.2f} fps")
+    print(f"Skip existing: {args.skip_existing}")
     print("="*50)
 
 # ---------------------------
