@@ -158,7 +158,7 @@ def main(args):
         
         print(f"Using dmax={dmax:.6f} for {args.disparity_format} format")
 
-        # Check if output file already exists
+        # ZzCheck if output file already exists
         output_path = out_dir / f"{traj.stem}.npz"
         if args.skip_existing and output_path.exists():
             print(f"Skipping {name} - output file already exists: {output_path}")
@@ -182,8 +182,8 @@ if __name__ == "__main__":
                        default="auto", help="Format of disparity data: video (MP4), npy, or npz files")
     parser.add_argument("--dataset_type", type=str, choices=["aria", "trumans"], 
                        default="trumans", help="Dataset type: 'aria' for DepthAnyVideo results, 'trumans' for Blender rendering (default: trumans)")
-    parser.add_argument("--reverse_sqrt", type=bool, default=True,
-                       help="Whether to square disparity values to reverse sqrt operation from exr_to_disparity.py/make_sequences.py (default: True)")
+    parser.add_argument("--reverse_sqrt", type=bool, default=False,
+                       help="Whether to square disparity values to reverse sqrt operation from exr_to_disparity.py/make_sequences.py (default: False)")
     parser.add_argument("--no_reverse_sqrt", action="store_true", default=False,
                        help="Disable reverse sqrt operation (use with --no_sqrt_disparity in exr_to_disparity.py)")
     parser.add_argument("--debug", action="store_true", help="Process only one trajectory for debugging")
@@ -192,18 +192,17 @@ if __name__ == "__main__":
     
     print(f"📊 Dataset type: {args.dataset_type.upper()}")
     
-    # Set reverse_sqrt based on dataset type and arguments
-    # Trumans datasets need reverse sqrt (sqrt applied in exr_to_disparity.py/make_sequences.py)
-    # ARIA datasets don't need reverse sqrt (DepthAnyVideo doesn't apply sqrt)
-    if args.no_reverse_sqrt or args.dataset_type == "aria":
+    # Set reverse_sqrt based on arguments (default is False regardless of dataset type)
+    if args.no_reverse_sqrt:
         args.reverse_sqrt = False
-        if args.dataset_type == "aria":
-            print(f"ℹ️  ARIA dataset - disabling reverse sqrt (DepthAnyVideo doesn't apply sqrt)")
-        else:
-            print(f"ℹ️  Manual override - disabling reverse sqrt")
+        print(f"ℹ️  Manual override - disabling reverse sqrt")
+    elif args.dataset_type == "aria":
+        args.reverse_sqrt = False
+        print(f"ℹ️  ARIA dataset - disabling reverse sqrt (DepthAnyVideo doesn't apply sqrt)")
     else:
-        args.reverse_sqrt = True
-        print(f"ℹ️  Trumans dataset - enabling reverse sqrt (to reverse sqrt from exr_to_disparity.py/make_sequences.py)")
+        # For Trumans datasets, reverse_sqrt defaults to False now
+        args.reverse_sqrt = False
+        print(f"ℹ️  Trumans dataset - reverse sqrt disabled by default")
     
     print(f"Using reverse_sqrt: {args.reverse_sqrt}")
 
