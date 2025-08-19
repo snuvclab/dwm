@@ -6,13 +6,12 @@ from postprocess_utils import camera_pose_to_raymap
 from pathlib import Path
 import imageio.v3 as iio
 
-def load_disparity_video(video_path, reverse_sqrt=True):
+def load_disparity_video(video_path):
     """
     Load disparity video and extract frames.
     
     Args:
         video_path: Path to MP4 disparity video
-        reverse_sqrt: Whether to square the values to reverse sqrt operation from exr_to_disparity.py
         
     Returns:
         frames: List of disparity frames as numpy arrays
@@ -36,10 +35,6 @@ def load_disparity_video(video_path, reverse_sqrt=True):
         if video.max() > 1.0:
             video = video / 255.0
         
-        # Square the values to reverse the sqrt operation applied in exr_to_disparity.py
-        if reverse_sqrt:
-            video = video ** 2
-        
         # Extract frames
         frames = [video[i] for i in range(video.shape[0])]
         
@@ -48,10 +43,7 @@ def load_disparity_video(video_path, reverse_sqrt=True):
         
         print(f"Loaded {len(frames)} frames from {video_path}")
         print(f"Frame shape: {frames[0].shape}")
-        if reverse_sqrt:
-            print(f"Max disparity value (after squaring): {dmax:.6f}")
-        else:
-            print(f"Max disparity value: {dmax:.6f}")
+        print(f"Max disparity value: {dmax:.6f}")
         
         return frames, dmax
         
@@ -116,7 +108,7 @@ def main(args):
                 continue
                 
             # Load disparity video and extract frames
-            disparity_frames, dmax = load_disparity_video(video_path, reverse_sqrt=args.reverse_sqrt)
+            disparity_frames, dmax = load_disparity_video(video_path)
             if disparity_frames is None:
                 print(f"Failed to load disparity video {video_path}, skipping...")
                 continue
@@ -136,10 +128,7 @@ def main(args):
                     continue
                 disparity = np.load(disparity_path)
             
-            # Apply reverse sqrt operation for NPY/NPZ formats (same as MP4 videos)
-            if args.reverse_sqrt:
-                disparity = disparity ** 2
-                print(f"Applied reverse sqrt (squared) to {args.disparity_format} disparity data for {args.dataset_type} dataset")
+            # No reverse sqrt operation needed (sqrt disabled by default in make_sequences.py)
             
             dmax = disparity.max()
 
@@ -151,10 +140,8 @@ def main(args):
                 disparity_frames = [disparity]
 
         # Handle dmax value appropriately
-        # For Trumans datasets: reverse sqrt operation is applied (sqrt was applied in exr_to_disparity.py/make_sequences.py)
-        # For ARIA datasets: no reverse sqrt operation (DepthAnyVideo doesn't apply sqrt)
-        # - For EXR-derived NPY/NPZ: dmax represents pre-normalization maximum (data is normalized to [0,1])
-        # - For MP4 videos: dmax represents the actual maximum (typically ≈ 1.0)
+        # No reverse sqrt operation needed (sqrt disabled by default in make_sequences.py)
+        # dmax represents the actual maximum disparity value
         
         print(f"Using dmax={dmax:.6f} for {args.disparity_format} format")
 
