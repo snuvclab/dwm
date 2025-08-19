@@ -12,6 +12,8 @@ from tqdm import tqdm
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 import pickle
+import argparse
+from pathlib import Path
 
 @dataclass
 class AriaCameraCalibration:
@@ -89,20 +91,24 @@ def read_trajectory_csv_to_dict(file_iterable_csv: str) -> TimedPoses:
     )
 
 
+parser = argparse.ArgumentParser(description="Process VRS files to extract images and camera parameters.")
+parser.add_argument("--data_root", type=str, required=True, help="Path to the data root.")
+args = parser.parse_args()
 
-vrsfile = "/media/taeksoo/HDD3/aria/lab_01/lab_01.vrs"
-provider = data_provider.create_vrs_data_provider(vrsfile)
+data_root = Path(args.data_root)
+vrsfile = list(data_root.rglob("*.vrs"))[0]
+
+provider = data_provider.create_vrs_data_provider(str(vrsfile))
 stream_id = provider.get_stream_id_from_label("camera-rgb")
 
-name = vrsfile.split("/")[-1].split(".")[0]
-image_output_dir = f"/media/taeksoo/HDD3/aria/lab_01/{name}_data/images"
-camera_output_dir = f"/media/taeksoo/HDD3/aria/lab_01/{name}_data/cam_params"
-os.makedirs(image_output_dir, exist_ok=True)
-os.makedirs(camera_output_dir, exist_ok=True)
+image_output_dir = data_root / "data" / "images"
+camera_output_dir = data_root / "data" / "cam_params"
+image_output_dir.mkdir(parents=True, exist_ok=True)
+camera_output_dir.mkdir(parents=True, exist_ok=True)
 
 num_frames = provider.get_num_data(stream_id)
-closed_loop_traj_path = f"/media/taeksoo/HDD3/aria/lab_01/mps_{name}_vrs/slam/closed_loop_trajectory.csv"
-t_world_devices = read_trajectory_csv_to_dict(closed_loop_traj_path)
+closed_loop_traj_path = data_root / "mps" / "slam" / f"closed_loop_trajectory.csv"
+t_world_devices = read_trajectory_csv_to_dict(str(closed_loop_traj_path))
 name_to_camera = get_camera_calibs(provider)
 
 # https://facebookresearch.github.io/projectaria_tools/docs/data_utilities/advanced_code_snippets/image_utilities
@@ -128,8 +134,8 @@ for i in tqdm(range(num_frames)):
 
 
     # Save the processed image
-    output_path = os.path.join(image_output_dir, f"{i:05d}.png")
-    cv2.imwrite(output_path, cv2.cvtColor(cropped, cv2.COLOR_RGB2BGR))
+    output_path = image_output_dir / f"{i:05d}.png"
+    cv2.imwrite(str(output_path), cv2.cvtColor(cropped, cv2.COLOR_RGB2BGR))
 
     # Pose information
     capture_time_ns = image_data[1].capture_timestamp_ns
@@ -143,7 +149,7 @@ for i in tqdm(range(num_frames)):
     t_world_camera = t_world_device @ pinhole_cw90.get_transform_device_camera() # world to rgb camera pose
 
     extrinsics = t_world_camera.to_matrix()
-    np.save(os.path.join(camera_output_dir, f"{i:05d}.npy"), extrinsics)
+    np.save(camera_output_dir / f"{i:05d}.npy", extrinsics)
 
 fx, fy, cx, cy = pinhole_cw90.get_projection_params()
 intrinsics = np.array([
@@ -151,5 +157,4 @@ intrinsics = np.array([
     [0, fy, cy - start_y],
     [0, 0, 1]
 ])
-np.save(os.path.join(camera_output_dir, f"intrinsics.npy"), intrinsics)
-    
+np.save(camera_output_dir / f"intrinsics.npy", intrinsics)
