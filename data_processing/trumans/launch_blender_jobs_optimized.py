@@ -8,11 +8,12 @@ from collections import deque
 from pathlib import Path
 import argparse
 from check_rendering_status import get_animation_frame_count
+from check_video_rendering_status import get_expected_video_count, check_video_sequence_completeness
 
 # === User Configuration ===
-DEFAULT_RECORDINGS_PATH = "../nas1/public_dataset/trumans/Recordings_blend"
+DEFAULT_RECORDINGS_PATH = "./data/trumans/Recordings_blend"
 # DEFAULT_RECORDINGS_PATH = "./Recordings_blend"
-DEFAULT_SAVE_PATH = "../nas1/public_dataset/trumans/ego_render_fov90"
+DEFAULT_SAVE_PATH = "./data/trumans/ego_render_fov90"
 SCRIPT_PATH = "data_processing/trumans/blender_ego_rgb_depth_optimized.py"
 # SCRIPT_PATH = "data_processing/trumans/blender_ego_static.py"
 # SCRIPT_PATH = "data_processing/trumans/blender_ego_hand.py"
@@ -92,10 +93,17 @@ def filter_scenes(blend_jobs, scene_names=None, scene_pattern=None):
     
     return filtered_jobs
 
-def load_rendering_status_report(report_path=None):
+def load_rendering_status_report(report_path=None, script_path=None):
     """Load the rendering status report from check_rendering_status.py."""
     if report_path is None:
-        report_file = "rendering_status_report.json"
+        # Determine report file based on script type
+        script_name = os.path.basename(script_path) if script_path else ""
+        if script_name in ['blender_ego_static.py']:
+            report_file = "rendering_status_report_static.json"
+        elif script_name in ['blender_ego_hand.py']:
+            report_file = "rendering_status_report_hands.json"
+        else:
+            report_file = "rendering_status_report.json"  # Default for frame-based rendering
     else:
         report_file = report_path
     
@@ -108,6 +116,10 @@ def load_rendering_status_report(report_path=None):
     else:
         if report_path is not None:
             print(f"Warning: Rendering status report not found at {report_file}")
+        else:
+            print(f"Warning: Rendering status report not found at {report_file}")
+            print(f"  Expected report for script: {script_name}")
+            print(f"  You can generate it using: python check_rendering_status.py --video-type {'static' if 'static' in script_name else 'hands' if 'hand' in script_name else 'frames'}")
     return None
 
 def get_animation_names(blend_file):
@@ -199,10 +211,15 @@ def check_already_rendered(blend_file, save_path, status_report=None, script_pat
     
     # Determine output format based on script path
     is_video_output = False
+    video_type = None
     if script_path:
         script_name = os.path.basename(script_path)
-        if script_name in ['blender_ego_static.py', 'blender_ego_hand.py']:
+        if script_name in ['blender_ego_static.py']:
             is_video_output = True
+            video_type = "static"
+        elif script_name in ['blender_ego_hand.py']:
+            is_video_output = True
+            video_type = "hands"
     
     # Use status report if available (preferred method - no Blender overhead)
     if status_report and "rendered_scenes_details" in status_report:
@@ -217,11 +234,21 @@ def check_already_rendered(blend_file, save_path, status_report=None, script_pat
             not_started_anims = scene_details.get("not_started_animations", [])
             expected_animations = scene_details["expected_animations"]
             
+            # Handle both frame-based and video-based formats
+            if incomplete_anims and isinstance(incomplete_anims[0], dict):
+                # Video-based format: incomplete_anims contains dicts with "name" key
+                incomplete_anim_names = [anim["name"] for anim in incomplete_anims]
+                not_started_anim_names = not_started_anims if (not_started_anims and isinstance(not_started_anims[0], str)) else [anim["name"] for anim in not_started_anims]
+            else:
+                # Frame-based format: incomplete_anims contains strings
+                incomplete_anim_names = incomplete_anims
+                not_started_anim_names = not_started_anims
+            
             # Get all animation names from the status report
-            all_animations = complete_anims + [anim["name"] for anim in incomplete_anims] + not_started_anims
+            all_animations = complete_anims + incomplete_anim_names + not_started_anim_names
             
             # Calculate missing animations (incomplete + not started)
-            missing_anims = [anim["name"] for anim in incomplete_anims] + not_started_anims
+            missing_anims = incomplete_anim_names + not_started_anim_names
             
             # Check if scene is fully complete
             is_fully_complete = len(incomplete_anims) == 0 and len(not_started_anims) == 0
@@ -234,12 +261,23 @@ def check_already_rendered(blend_file, save_path, status_report=None, script_pat
             # Scene not found in rendered_scenes_details, check if it's in incomplete_animations_by_scene
             if "incomplete_animations_by_scene" in status_report and scene_key in status_report["incomplete_animations_by_scene"]:
                 incomplete_anims = status_report["incomplete_animations_by_scene"][scene_key]
-                incomplete_anim_names = [anim["name"] for anim in incomplete_anims]
+                if incomplete_anims and isinstance(incomplete_anims[0], dict):
+                    # Video-based format
+                    incomplete_anim_names = [anim["name"] for anim in incomplete_anims]
+                else:
+                    # Frame-based format
+                    incomplete_anim_names = incomplete_anims
                 return False, [], incomplete_anim_names, incomplete_anim_names
             # Check if it's in not_started_animations_by_scene
             elif "not_started_animations_by_scene" in status_report and scene_key in status_report["not_started_animations_by_scene"]:
                 not_started_anims = status_report["not_started_animations_by_scene"][scene_key]
-                return False, [], not_started_anims, not_started_anims
+                if not_started_anims and isinstance(not_started_anims[0], dict):
+                    # Video-based format
+                    not_started_anim_names = [anim["name"] for anim in not_started_anims]
+                else:
+                    # Frame-based format
+                    not_started_anim_names = not_started_anims
+                return False, [], not_started_anim_names, not_started_anim_names
             # Check if it's in scenes with no animations
             elif "scenes_with_no_animations_list" in status_report and scene_key in status_report["scenes_with_no_animations_list"]:
                 return False, [], [], []  # No animations
@@ -293,9 +331,20 @@ def check_already_rendered(blend_file, save_path, status_report=None, script_pat
                         # Count video files
                         video_files = len([f for f in os.listdir(videos_path) if f.endswith('.mp4')])
                         
-                        # For video output, we consider it complete if there are any video files
-                        # (since we don't know the exact expected count without complex calculation)
-                        if video_files > 0:
+                        # Get expected video count for this specific animation
+                        if script_path and 'blender_ego_static.py' in script_path:
+                            video_type = "static"
+                        elif script_path and 'blender_ego_hand.py' in script_path:
+                            video_type = "hands"
+                        else:
+                            video_type = "static"  # Default
+                        
+                        expected_videos = get_expected_video_count(blend_file, item, frame_skip=3, stride=25, clip_length=49)
+                        if expected_videos is None:
+                            expected_videos = 0
+                        
+                        # Consider complete if we have the expected number of videos
+                        if video_files >= expected_videos:
                             rendered_animations.append(item)
                 else:
                     # For frame-based output (blender_ego_rgb_depth_optimized.py)
@@ -435,13 +484,18 @@ def main():
     # Load status report if requested
     status_report = None
     if args.use_status_report or args.status_report_path:
-        status_report = load_rendering_status_report(args.status_report_path)
+        status_report = load_rendering_status_report(args.status_report_path, args.script_path)
         if status_report:
-            report_source = args.status_report_path if args.status_report_path else "check_rendering_status.py"
+            script_name = os.path.basename(args.script_path)
+            if script_name in ['blender_ego_static.py', 'blender_ego_hand.py']:
+                report_source = args.status_report_path if args.status_report_path else "check_video_rendering_status.py"
+            else:
+                report_source = args.status_report_path if args.status_report_path else "check_rendering_status.py"
+            
             print(f"✓ Using rendering status report from {report_source}")
             print(f"  Status report contains data for {len(status_report.get('rendered_scenes_details', {}))} scenes")
             
-            # Show summary from status report
+            # Show summary from status report (handle both frame-based and video-based formats)
             if "incomplete_animations_by_scene" in status_report:
                 incomplete_by_scene = status_report["incomplete_animations_by_scene"]
                 total_incomplete = sum(len(anims) for anims in incomplete_by_scene.values())
@@ -449,8 +503,13 @@ def main():
                     print(f"  Found {total_incomplete} incomplete animations across {len(incomplete_by_scene)} scenes")
                     print("  Incomplete animations by scene:")
                     for scene, anims in incomplete_by_scene.items():
-                        anim_names = [anim["name"] for anim in anims]
-                        print(f"    {scene}: {', '.join(anim_names)}")
+                        if anims and isinstance(anims[0], dict) and "name" in anims[0]:
+                            # Video-based format
+                            anim_names = [anim["name"] for anim in anims]
+                        else:
+                            # Frame-based format
+                            anim_names = anims
+                        print(f"    {scene}: {', '.join(anim_names[:5])}{'...' if len(anim_names) > 5 else ''}")
                     
                     # Show detailed information if requested
                     if args.show_incomplete:
@@ -458,8 +517,13 @@ def main():
                         for scene, anims in incomplete_by_scene.items():
                             print(f"    {scene}:")
                             for anim in anims:
-                                print(f"      {anim['name']}: RGB {anim['rgb']}/{anim['expected']}, "
-                                      f"Depth {anim['depth']}/{anim['expected']}, Cam {anim['cam']}/{anim['expected']}")
+                                if isinstance(anim, dict) and "videos" in anim:
+                                    # Video-based format
+                                    print(f"      {anim['name']}: Videos {anim['videos']}/{anim['expected']}")
+                                elif isinstance(anim, dict) and "rgb" in anim:
+                                    # Frame-based format
+                                    print(f"      {anim['name']}: RGB {anim['rgb']}/{anim['expected']}, "
+                                          f"Depth {anim['depth']}/{anim['expected']}, Cam {anim['cam']}/{anim['expected']}")
             
             # Show not started animations summary
             if "not_started_animations_by_scene" in status_report:
@@ -480,8 +544,31 @@ def main():
                 print(f"⚠️  Status report not found at {args.status_report_path}, falling back to basic file system check")
             else:
                 print("⚠️  Status report not found, falling back to basic file system check")
+                # Provide helpful guidance based on script type
+                script_name = os.path.basename(args.script_path)
+                if script_name in ['blender_ego_static.py']:
+                    print(f"💡 To generate a status report for {script_name}, run:")
+                    print(f"   python check_video_rendering_status.py --video-type static --stride 25 --clip-length 49")
+                elif script_name in ['blender_ego_hand.py']:
+                    print(f"💡 To generate a status report for {script_name}, run:")
+                    print(f"   python check_video_rendering_status.py --video-type hands --stride 25 --clip-length 49")
+                else:
+                    print(f"💡 To generate a status report for {script_name}, run:")
+                    print(f"   python check_rendering_status.py")
     else:
         print("ℹ️  No status report specified. Use --use-status-report or --status-report-path for faster checking.")
+        
+        # Provide helpful guidance based on script type
+        script_name = os.path.basename(args.script_path)
+        if script_name in ['blender_ego_static.py']:
+            print(f"💡 To generate a status report for {script_name}, run:")
+            print(f"   python check_video_rendering_status.py --video-type static --stride 25 --clip-length 49")
+        elif script_name in ['blender_ego_hand.py']:
+            print(f"💡 To generate a status report for {script_name}, run:")
+            print(f"   python check_video_rendering_status.py --video-type hands --stride 25 --clip-length 49")
+        else:
+            print(f"💡 To generate a status report for {script_name}, run:")
+            print(f"   python check_rendering_status.py")
     
     # Check what's already rendered
     rendered_scenes = {}
@@ -788,7 +875,15 @@ def main():
                 print(f"  {scene}: {len(anims)} incomplete animations")
                 if len(anims) <= 3:  # Show animation names if not too many
                     for anim in anims:
-                        print(f"    ⚠️  {anim['name']}: RGB {anim['rgb']}/{anim['expected']}, Depth {anim['depth']}/{anim['expected']}, Cam {anim['cam']}/{anim['expected']}")
+                        if isinstance(anim, dict) and "videos" in anim:
+                            # Video-based format
+                            print(f"    ⚠️  {anim['name']}: Videos {anim['videos']}/{anim['expected']}")
+                        elif isinstance(anim, dict) and "rgb" in anim:
+                            # Frame-based format
+                            print(f"    ⚠️  {anim['name']}: RGB {anim['rgb']}/{anim['expected']}, Depth {anim['depth']}/{anim['expected']}, Cam {anim['cam']}/{anim['expected']}")
+                        else:
+                            # String format
+                            print(f"    ⚠️  {anim}")
             
             # Show not started animations
             for scene, anims in not_started_by_scene.items():
@@ -1013,7 +1108,10 @@ def main():
                             # Capture output from failed process
                             try:
                                 stdout, stderr = proc.communicate(timeout=5)  # Get output with timeout
-                                error_output = stderr.strip() if stderr else stdout.strip()
+                                # Handle None values safely
+                                stderr_str = stderr.strip() if stderr else ""
+                                stdout_str = stdout.strip() if stdout else ""
+                                error_output = stderr_str if stderr_str else stdout_str
                                 if not error_output:
                                     error_output = f"Process failed with return code: {proc.returncode} (no output captured)"
                             except subprocess.TimeoutExpired:
