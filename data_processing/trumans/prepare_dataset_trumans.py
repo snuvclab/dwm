@@ -18,7 +18,7 @@ from diffusers.utils import export_to_video, get_logger
 from torch.utils.data import DataLoader
 from torchvision import transforms
 from tqdm import tqdm
-from transformers import T5EncoderModel, T5Tokenizer
+
 
 import decord  # isort:skip
 from dataset import BucketSampler, VideoDatasetWithResizing, VideoDatasetWithResizeAndRectangleCrop  # isort:skip
@@ -94,18 +94,14 @@ def get_args() -> Dict[str, Any]:
     parser.add_argument(
         "--dataset_file", type=str, default=None, help="Path to CSV file containing metadata about training data."
     )
-    parser.add_argument(
-        "--caption_column",
-        type=str,
-        default="caption",
-        help="If using a CSV file via the `--dataset_file` argument, this should be the name of the column containing the captions. If using the folder structure format for data loading, this should be the name of the file containing line-separated captions (the file should be located in `--data_root`).",
-    )
+
     parser.add_argument(
         "--video_column",
         type=str,
         default="video",
         help="If using a CSV file via the `--dataset_file` argument, this should be the name of the column containing the video paths. If using the folder structure format for data loading, this should be the name of the file containing line-separated video paths (the file should be located in `--data_root`).",
     )
+
     parser.add_argument(
         "--id_token",
         type=str,
@@ -201,9 +197,9 @@ def get_args() -> Dict[str, Any]:
     parser.add_argument(
         "--disparity_format",
         type=str,
-        choices=["npy", "video"],
-        default="npy",
-        help="Format for disparity data: 'npy' for NPY files, 'video' for MP4 video files.",
+        choices=["npy", "npz", "video"],
+        default="npz",
+        help="Format for disparity data: 'npy' for NPY files, 'npz' for compressed NPZ files, 'video' for MP4 video files.",
     )
     parser.add_argument("--seed", type=int, default=42, help="Seed for reproducibility.")
     parser.add_argument(
@@ -227,102 +223,17 @@ def get_args() -> Dict[str, Any]:
         action="store_true",
         help="Skip processing if output files already exist.",
     )
+    parser.add_argument(
+        "--selective_processing",
+        nargs="+",
+        type=str,
+        default=None,
+        help="Only process specific file types. Useful when some files already exist. Options: images, image_latents, images_goal, image_goal_latents, videos, video_latents, disparity, disparity_latents, raymaps, raymaps_abs, prompts, human_motions",
+    )
     return parser.parse_args()
 
 
-def _get_t5_prompt_embeds(
-    tokenizer: T5Tokenizer,
-    text_encoder: T5EncoderModel,
-    prompt: Union[str, List[str]],
-    num_videos_per_prompt: int = 1,
-    max_sequence_length: int = 226,
-    device: Optional[torch.device] = None,
-    dtype: Optional[torch.dtype] = None,
-    text_input_ids=None,
-):
-    prompt = [prompt] if isinstance(prompt, str) else prompt
-    batch_size = len(prompt)
 
-    if tokenizer is not None:
-        text_inputs = tokenizer(
-            prompt,
-            padding="max_length",
-            max_length=max_sequence_length,
-            truncation=True,
-            add_special_tokens=True,
-            return_tensors="pt",
-        )
-        text_input_ids = text_inputs.input_ids
-    else:
-        if text_input_ids is None:
-            raise ValueError("`text_input_ids` must be provided when the tokenizer is not specified.")
-
-    prompt_embeds = text_encoder(text_input_ids.to(device))[0]
-    prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
-
-    # duplicate text embeddings for each generation per prompt, using mps friendly method
-    _, seq_len, _ = prompt_embeds.shape
-    prompt_embeds = prompt_embeds.repeat(1, num_videos_per_prompt, 1)
-    prompt_embeds = prompt_embeds.view(batch_size * num_videos_per_prompt, seq_len, -1)
-
-    return prompt_embeds
-
-
-def encode_prompt(
-    tokenizer: T5Tokenizer,
-    text_encoder: T5EncoderModel,
-    prompt: Union[str, List[str]],
-    num_videos_per_prompt: int = 1,
-    max_sequence_length: int = 226,
-    device: Optional[torch.device] = None,
-    dtype: Optional[torch.dtype] = None,
-    text_input_ids=None,
-):
-    prompt = [prompt] if isinstance(prompt, str) else prompt
-    prompt_embeds = _get_t5_prompt_embeds(
-        tokenizer,
-        text_encoder,
-        prompt=prompt,
-        num_videos_per_prompt=num_videos_per_prompt,
-        max_sequence_length=max_sequence_length,
-        device=device,
-        dtype=dtype,
-        text_input_ids=text_input_ids,
-    )
-    return prompt_embeds
-
-
-def compute_prompt_embeddings(
-    tokenizer: T5Tokenizer,
-    text_encoder: T5EncoderModel,
-    prompts: List[str],
-    max_sequence_length: int,
-    device: torch.device,
-    dtype: torch.dtype,
-    requires_grad: bool = False,
-):
-    if requires_grad:
-        prompt_embeds = encode_prompt(
-            tokenizer,
-            text_encoder,
-            prompts,
-            num_videos_per_prompt=1,
-            max_sequence_length=max_sequence_length,
-            device=device,
-            dtype=dtype,
-        )
-    else:
-        with torch.no_grad():
-            prompt_embeds = encode_prompt(
-                tokenizer,
-                text_encoder,
-                prompts,
-                num_videos_per_prompt=1,
-                max_sequence_length=max_sequence_length,
-                device=device,
-                dtype=dtype,
-            )
-    return prompt_embeds
 
 
 to_pil_image = transforms.ToPILImage(mode="RGB")
@@ -358,6 +269,7 @@ def serialize_artifacts(
     action_name: str,
     video_paths: Optional[List[pathlib.Path]] = None,  # Add video paths parameter
     skip_existing: bool = False,  # Add skip_existing parameter
+    selective_processing: Optional[List[str]] = None,  # Add selective processing parameter
     images_dir: Optional[pathlib.Path] = None,
     image_latents_dir: Optional[pathlib.Path] = None,
     images_goal_dir: Optional[pathlib.Path] = None,
@@ -370,6 +282,7 @@ def serialize_artifacts(
     raymap_abs_dir: Optional[pathlib.Path] = None,
     prompts_dir: Optional[pathlib.Path] = None,
     prompt_embeds_dir: Optional[pathlib.Path] = None,
+    human_motions_dir: Optional[pathlib.Path] = None,
     images: Optional[torch.Tensor] = None,
     image_latents: Optional[torch.Tensor] = None,
     images_goal: Optional[torch.Tensor] = None,
@@ -382,10 +295,16 @@ def serialize_artifacts(
     raymap_abs: Optional[torch.Tensor] = None,
     prompts: Optional[List[str]] = None,
     prompt_embeds: Optional[torch.Tensor] = None,
+    human_motions: Optional[torch.Tensor] = None,
 ) -> None:
-    num_frames, height, width = videos.size(1), videos.size(3), videos.size(4)
-    # Create metadata for each video in the batch
-    metadata = [{"num_frames": num_frames, "height": height, "width": width} for _ in range(batch_size)]
+    # Handle the case where videos is None (selective processing)
+    if videos is not None:
+        num_frames, height, width = videos.size(1), videos.size(3), videos.size(4)
+        # Create metadata for each video in the batch
+        metadata = [{"num_frames": num_frames, "height": height, "width": width} for _ in range(batch_size)]
+    else:
+        # For selective processing without videos, create dummy metadata
+        metadata = [{"num_frames": 0, "height": 0, "width": 0} for _ in range(batch_size)]
 
     data_folder_mapper_list = [
         (images, images_dir, lambda img, path: save_image(img[0], path), "png"),
@@ -399,9 +318,44 @@ def serialize_artifacts(
         (raymap, raymap_dir, torch.save, "pt"),
         (raymap_abs, raymap_abs_dir, torch.save, "pt"),
         (prompts, prompts_dir, save_prompt, "txt"),
-        (prompt_embeds, prompt_embeds_dir, torch.save, "pt"),
+        (human_motions, human_motions_dir, torch.save, "pt"),
         (metadata, videos_dir, save_metadata, "txt"),
     ]
+    
+    # Filter data_folder_mapper_list based on selective_processing
+    if selective_processing:
+        # Map file types to their index in data_folder_mapper_list
+        file_type_to_index = {
+            "images": 0,
+            "image_latents": 1,
+            "images_goal": 2,
+            "image_goal_latents": 3,
+            "videos": 4,
+            "video_latents": 5,
+            "disparity": 6,
+            "disparity_latents": 7,
+            "raymaps": 8,
+            "raymaps_abs": 9,
+            "prompts": 10,
+            "human_motions": 11,
+        }
+        
+        # Keep only the requested file types
+        filtered_mapper_list = []
+        for file_type in selective_processing:
+            if file_type in file_type_to_index:
+                index = file_type_to_index[file_type]
+                if index < len(data_folder_mapper_list):
+                    filtered_mapper_list.append(data_folder_mapper_list[index])
+        
+        # Only include metadata if we're processing videos or other file types that need it
+        # For human_motions only, we don't need metadata
+        should_include_metadata = any(ft in selective_processing for ft in ["videos", "video_latents", "disparity", "disparity_latents", "images", "image_latents", "human_motions"])
+        if should_include_metadata and 12 < len(data_folder_mapper_list):
+            filtered_mapper_list.append(data_folder_mapper_list[12])
+        
+        data_folder_mapper_list = filtered_mapper_list
+        print(f"Selective processing: Only saving {[item[3] for item in data_folder_mapper_list]} files")
     
     # Generate descriptive filenames using actual video names
     filenames = []
@@ -413,11 +367,7 @@ def serialize_artifacts(
             # Remove extension for base filename
             base_filename = filename.replace(".mp4", "")
         else:
-            # Fallback to index-based naming if no video paths provided
-            video_name = f"{i:05d}"  # Default to 5-digit format like '00000'
-            filename = generate_trumans_filename(scene_name, action_name, video_name, "mp4")
-            # Remove extension for base filename
-            base_filename = filename.replace(".mp4", "")
+            raise ValueError(f"No video paths provided for batch index {i}")
         filenames.append(base_filename)
     for data, folder, save_fn, extension in data_folder_mapper_list:
         if data is None:
@@ -490,7 +440,7 @@ def main():
     raymap_dir = tmp_dir.joinpath(f"raymaps/{rank}")
     raymap_abs_dir = tmp_dir.joinpath(f"raymaps_abs/{rank}")
     prompts_dir = tmp_dir.joinpath(f"prompts/{rank}")
-    prompt_embeds_dir = tmp_dir.joinpath(f"prompt_embeds/{rank}")
+    human_motions_dir = tmp_dir.joinpath(f"human_motions/{rank}")
 
     images_dir.mkdir(parents=True, exist_ok=True)
     image_latents_dir.mkdir(parents=True, exist_ok=True)
@@ -503,7 +453,7 @@ def main():
     raymap_dir.mkdir(parents=True, exist_ok=True)
     raymap_abs_dir.mkdir(parents=True, exist_ok=True)
     prompts_dir.mkdir(parents=True, exist_ok=True)
-    prompt_embeds_dir.mkdir(parents=True, exist_ok=True)
+    human_motions_dir.mkdir(parents=True, exist_ok=True)
 
     weight_dtype = DTYPE_MAPPING[args.dtype]
     target_fps = args.target_fps
@@ -512,7 +462,6 @@ def main():
     dataset_init_kwargs = {
         "data_root": args.data_root,
         "dataset_file": args.dataset_file,
-        "caption_column": args.caption_column,
         "video_column": args.video_column,
         "max_num_frames": args.max_num_frames,
         "id_token": args.id_token,
@@ -548,6 +497,15 @@ def main():
         pass
 
     rank_dataset_size = len(dataset)
+
+    # Look for human_motions folder in the data_root
+    human_motions_folder = Path(args.data_root) / "sequences" / "human_motions"
+    if human_motions_folder.exists():
+        print(f"📁 Found human_motions folder: {human_motions_folder}")
+        human_motions_data = human_motions_folder
+    else:
+        print(f"ℹ️  Human motions folder not found: {human_motions_folder}")
+        print(f"ℹ️  Expected location: {human_motions_folder}")
 
     # 2. Dataloader
     def collate_fn(data):
@@ -597,12 +555,6 @@ def main():
     device = f"cuda:{rank}"
 
     if args.save_latents_and_embeddings:
-        tokenizer = T5Tokenizer.from_pretrained(args.model_id, subfolder="tokenizer")
-        text_encoder = T5EncoderModel.from_pretrained(
-            args.model_id, subfolder="text_encoder", torch_dtype=weight_dtype
-        )
-        text_encoder = text_encoder.to(device)
-
         vae = AutoencoderKLCogVideoX.from_pretrained(args.model_id, subfolder="vae", torch_dtype=weight_dtype)
         vae = vae.to(device)
 
@@ -634,7 +586,7 @@ def main():
             disparity_latents = None
             raymap = None
             raymap_abs = None
-            prompt_embeds = None
+            pose_params = None
 
             if args.save_image_latents:
                 images = batch["images"].to(device, non_blocking=True)
@@ -649,42 +601,50 @@ def main():
             disparity = batch["disparity"].to(device, non_blocking=True)
             disparity = disparity.permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
 
-            prompts = batch["prompts"]
+            # Process prompts if requested
+            should_process_prompts = (args.selective_processing is None or "prompts" in args.selective_processing)
+            if should_process_prompts:
+                prompts = batch["prompts"]
+            else:
+                prompts = None
 
             # Encode videos & images
             if args.save_latents_and_embeddings:
+                # Check if we should process image latents
+                should_process_images = (args.save_image_latents and 
+                                       (args.selective_processing is None or 
+                                        any(ft in args.selective_processing for ft in ["images", "image_latents", "images_goal", "image_goal_latents"])))
+                
+                # Check if we should process video latents
+                should_process_videos = (args.selective_processing is None or 
+                                       any(ft in args.selective_processing for ft in ["video_latents", "disparity_latents", "prompt_embeds"]))
+                
                 if args.use_slicing:
-                    if args.save_image_latents:
+                    if should_process_images and args.save_image_latents:
                         encoded_slices = [vae._encode(image_slice) for image_slice in images.split(1)]
                         image_latents = torch.cat(encoded_slices)
                         image_latents = image_latents.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
 
-                    encoded_slices = [vae._encode(video_slice) for video_slice in videos.split(1)]
-                    video_latents = torch.cat(encoded_slices)
+                    if should_process_videos:
+                        encoded_slices = [vae._encode(video_slice) for video_slice in videos.split(1)]
+                        video_latents = torch.cat(encoded_slices)
 
                 else:
-                    if args.save_image_latents:
+                    if should_process_images and args.save_image_latents:
                         image_latents = vae._encode(images)
                         image_latents = image_latents.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
 
                         image_goal_latents = vae._encode(images_goal)
                         image_goal_latents = image_goal_latents.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
 
-                    video_latents = vae._encode(videos)
+                    if should_process_videos:
+                        video_latents = vae._encode(videos)
 
-                video_latents = video_latents.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
+                if should_process_videos:
+                    video_latents = video_latents.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
 
-                # Encode prompts
-                prompt_embeds = compute_prompt_embeddings(
-                    tokenizer,
-                    text_encoder,
-                    prompts,
-                    args.max_sequence_length,
-                    device,
-                    weight_dtype,
-                    requires_grad=False,
-                )
-                
+
+
                 # For video format, normalize to [0, 1] before sqrt operation
                 if args.disparity_format == "video" and disparity.max() > 1.0:
                     # sqrt already done in exr_to_disparity.py
@@ -695,17 +655,89 @@ def main():
                 disparity_temp = 2 * disparity_temp - 1  # Normalize to [-1, 1]
                 disparity_latents = vae._encode(disparity_temp)
 
-                raymap = batch["raymap"].to(device, non_blocking=True)
-                raymap_abs = batch["raymap_abs"].to(device, non_blocking=True)
-
+                # Process raymaps if requested
+                if should_process_raymaps:
+                    raymap = batch["raymap"].to(device, non_blocking=True)
+                else:
+                    raymap = None
+                    
+                if should_process_raymaps_abs:
+                    raymap_abs = batch["raymap_abs"].to(device, non_blocking=True)
+                else:
+                    raymap_abs = None
+                
             if images is not None:
-                images = (images.permute(0, 2, 1, 3, 4) + 1) / 2
-                images_goal = (images_goal.permute(0, 2, 1, 3, 4) + 1) / 2
+                # Only process images if they're in selective_processing or if no selective processing is specified
+                should_process_images = (args.selective_processing is None or 
+                                       any(ft in args.selective_processing for ft in ["images", "images_goal"]))
+                
+                if should_process_images:
+                    images = (images.permute(0, 2, 1, 3, 4) + 1) / 2
+                    images_goal = (images_goal.permute(0, 2, 1, 3, 4) + 1) / 2
+                else:
+                    # Set to None to skip saving
+                    images = None
+                    images_goal = None
 
-            videos = (videos.permute(0, 2, 1, 3, 4) + 1) / 2
-            disparity = disparity.permute(0, 2, 1, 3, 4)
+            # Make all data types selective - only process what's requested
+            # When selective_processing is None, process everything
+            # When selective_processing is specified, only process the requested types
+            should_process_videos = (args.selective_processing is None or "videos" in args.selective_processing)
+            should_process_disparity = (args.selective_processing is None or "disparity" in args.selective_processing)
+            should_process_raymaps = (args.selective_processing is None or "raymaps" in args.selective_processing)
+            should_process_raymaps_abs = (args.selective_processing is None or "raymaps_abs" in args.selective_processing)
+            should_process_prompts = (args.selective_processing is None or "prompts" in args.selective_processing)
 
-            # Get video paths for this batch
+            
+            # Process videos if requested
+            if should_process_videos:
+                videos = (videos.permute(0, 2, 1, 3, 4) + 1) / 2
+            else:
+                videos = None
+                
+            # Process disparity if requested
+            if should_process_disparity:
+                disparity = disparity.permute(0, 2, 1, 3, 4)
+            else:
+                disparity = None
+            
+            # Process human_motions data if available
+            human_motions = None
+            if human_motions_data is not None:
+                # Check if we should process human_motions based on selective_processing
+                should_process_human_motions = (args.selective_processing is None or 
+                                              "human_motions" in args.selective_processing)
+                
+                if should_process_human_motions:
+                    # Calculate the start index for this batch
+                    batch_start_idx = step * args.batch_size
+                    batch_end_idx = min(batch_start_idx + args.batch_size, len(dataset.video_paths))
+                    
+                    # Load human_motions data for this batch
+                    human_motions_batch = []
+                    for i in range(batch_start_idx, batch_end_idx):
+                        human_motion_path = human_motions_data / f"{i:05}.npz"
+                        if human_motion_path.exists():
+                            try:
+                                # Load NPZ file and convert to tensor
+                                npz_data = np.load(human_motion_path)
+                                # Convert all arrays in the NPZ to tensors
+                                human_motion_tensors = {}
+                                for key in npz_data.files:
+                                    human_motion_tensors[key] = torch.from_numpy(npz_data[key]).to(device, dtype=weight_dtype)
+                                human_motions_batch.append(human_motion_tensors)
+                            except Exception as e:
+                                print(f"Warning: Could not load human_motion file {human_motion_path}: {e}")
+                                human_motions_batch.append(None)
+                        else:
+                            print(f"Warning: Human motion file not found: {human_motion_path}")
+                            human_motions_batch.append(None)
+                    
+                    # Only set human_motions if we have valid data
+                    if any(h is not None for h in human_motions_batch):
+                        human_motions = human_motions_batch
+
+            # Get video paths for this batch (always needed for filename generation)
             batch_video_paths = []
             if hasattr(dataset, 'video_paths'):
                 # Calculate the start index for this batch
@@ -713,40 +745,75 @@ def main():
                 batch_end_idx = min(batch_start_idx + args.batch_size, len(dataset.video_paths))
                 batch_video_paths = dataset.video_paths[batch_start_idx:batch_end_idx]
             
-            output_queue.put(
-                {
-                    "batch_size": len(prompts),
-                    "fps": target_fps,
-                    "scene_name": args.scene_name,
-                    "action_name": args.action_name,
-                    "video_paths": batch_video_paths,  # Pass video paths
-                    "skip_existing": args.skip_existing,  # Pass skip_existing flag
+            # Build output data dictionary with only processed data
+            output_data = {
+                "batch_size": len(prompts) if should_process_prompts else len(batch["videos"]) if "videos" in batch else 1,
+                "fps": target_fps,
+                "scene_name": args.scene_name,
+                "action_name": args.action_name,
+                "video_paths": batch_video_paths,  # Pass video paths
+                "skip_existing": args.skip_existing,  # Pass skip_existing flag
+                "selective_processing": args.selective_processing, # Pass selective_processing
+            }
+            
+            # Only include directories and data that were actually processed
+            # When selective_processing is None, include all data
+            # When selective_processing is specified, only include requested data
+            if should_process_images or args.selective_processing is None:
+                output_data.update({
                     "images_dir": images_dir,
                     "image_latents_dir": image_latents_dir,
-                    "images_goal_dir": images_goal_dir,  # Save goal images in the same directory
-                    "image_goal_latents_dir": image_goal_latents_dir,  # Save goal image lat
-                    "videos_dir": videos_dir,
-                    "video_latents_dir": video_latents_dir,
-                    "disparity_dir": disparity_dir,
-                    "disparity_latents_dir": disparity_latents_dir,
-                    "raymap_dir": raymap_dir,
-                    "raymap_abs_dir": raymap_abs_dir,
-                    "prompts_dir": prompts_dir,
-                    "prompt_embeds_dir": prompt_embeds_dir,
+                    "images_goal_dir": images_goal_dir,
+                    "image_goal_latents_dir": image_goal_latents_dir,
                     "images": images,
                     "image_latents": image_latents,
                     "images_goal": images_goal,
                     "image_goal_latents": image_goal_latents,
+                })
+            
+            if should_process_videos or args.selective_processing is None:
+                output_data.update({
+                    "videos_dir": videos_dir,
+                    "video_latents_dir": video_latents_dir,
                     "videos": videos,
                     "video_latents": video_latents,
+                })
+            
+            if should_process_disparity or args.selective_processing is None:
+                output_data.update({
+                    "disparity_dir": disparity_dir,
+                    "disparity_latents_dir": disparity_latents_dir,
                     "disparity": disparity,
                     "disparity_latents": disparity_latents,
+                })
+            
+            if should_process_raymaps or args.selective_processing is None:
+                output_data.update({
+                    "raymap_dir": raymap_dir,
                     "raymap": raymap,
+                })
+            
+            if should_process_raymaps_abs or args.selective_processing is None:
+                output_data.update({
+                    "raymap_abs_dir": raymap_abs_dir,
                     "raymap_abs": raymap_abs,
+                })
+            
+            if should_process_prompts or args.selective_processing is None:
+                output_data.update({
+                    "prompts_dir": prompts_dir,
                     "prompts": prompts,
-                    "prompt_embeds": prompt_embeds,
-                }
-            )
+                })
+            
+
+            
+            if should_process_human_motions or args.selective_processing is None:
+                output_data.update({
+                    "human_motions_dir": human_motions_dir,
+                    "human_motions": human_motions,
+                })
+            
+            output_queue.put(output_data)
 
         except Exception:
             print("-------------------------")
@@ -781,7 +848,7 @@ def main():
             ("raymaps", "pt"),
             ("raymaps_abs", "pt"),
             ("prompts", "txt"),
-            ("prompt_embeds", "pt"),
+            ("human_motions", "pt"),
             ("videos", "txt"),
         ]:
             tmp_subfolder = tmp_dir.joinpath(subfolder)
@@ -833,19 +900,37 @@ def main():
 
                 data = {
                     "prompt": prompt,
-                    "prompt_embed": f"prompt_embeds/{stem}.pt",
-                    "image": f"images/{stem}.png",
-                    "image_latent": f"image_latents/{stem}.pt",
-                    "image_goal": f"images_goal/{stem}.png",
-                    "image_goal_latent": f"image_goal_latents/{stem}.pt",
-                    "video": f"videos/{stem}.mp4",
-                    "video_latent": f"video_latents/{stem}.pt",
-                    "disparity": f"disparity/{stem}.mp4",
-                    "disparity_latent": f"disparity_latents/{stem}.pt",
-                    "raymap": f"raymaps/{stem}.pt",
-                    "raymap_abs": f"raymaps_abs/{stem}.pt",
                     "metadata": metadata,
                 }
+                
+                # Only add file types that were actually processed
+                if args.selective_processing is None or "videos" in args.selective_processing:
+                    data["video"] = f"videos/{stem}.mp4"
+                if args.selective_processing is None or "disparity" in args.selective_processing:
+                    data["disparity"] = f"disparity/{stem}.mp4"
+                if args.selective_processing is None or "raymaps" in args.selective_processing:
+                    data["raymap"] = f"raymaps/{stem}.pt"
+                if args.selective_processing is None or "raymaps_abs" in args.selective_processing:
+                    data["raymap_abs"] = f"raymaps_abs/{stem}.pt"
+
+                
+                # Only add file types that were actually processed
+                if args.selective_processing is None or "images" in args.selective_processing:
+                    data["image"] = f"images/{stem}.png"
+                if args.selective_processing is None or "image_latents" in args.selective_processing:
+                    data["image_latent"] = f"image_latents/{stem}.pt"
+                if args.selective_processing is None or "images_goal" in args.selective_processing:
+                    data["image_goal"] = f"images_goal/{stem}.png"
+                if args.selective_processing is None or "image_goal_latents" in args.selective_processing:
+                    data["image_goal_latent"] = f"image_goal_latents/{stem}.pt"
+                if args.selective_processing is None or "video_latents" in args.selective_processing:
+                    data["video_latent"] = f"video_latents/{stem}.pt"
+                if args.selective_processing is None or "disparity_latents" in args.selective_processing:
+                    data["disparity_latent"] = f"disparity_latents/{stem}.pt"
+
+                if args.selective_processing is None or "human_motions" in args.selective_processing:
+                    data["human_motion"] = f"human_motions/{stem}.pt"
+                
                 file.write(json.dumps(data) + "\n")
 
         print(f"Completed preprocessing. All files saved to `{output_dir.as_posix()}`")
