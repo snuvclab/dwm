@@ -23,8 +23,6 @@ from tqdm import tqdm
 from transformers import T5EncoderModel, T5Tokenizer
 
 import decord  # isort:skip
-from dataset import BucketSampler, VideoDatasetWithResizing, VideoDatasetWithResizeAndRectangleCrop  # isort:skip
-
 decord.bridge.set_bridge("torch")
 
 logger = get_logger(__name__)
@@ -211,16 +209,28 @@ def get_args() -> argparse.Namespace:
     parser.add_argument(
         "--model_type",
         type=str,
-        choices=["aether", "custom"],
+        choices=["aether", "cogvideox_pose", "custom"],
         default="custom",
-        help="Predefined file type combinations for different training models. 'aether' includes all file types for Aether training. 'custom' allows manual specification via --check_file_types.",
+        help="Predefined file type combinations for different training models. 'aether' includes all file types for Aether training. 'cogvideox_pose' includes file types for CogVideoX pose training. 'custom' allows manual specification via --check_file_types.",
     )
     parser.add_argument(
         "--check_file_types",
         nargs="+",
         type=str,
         default=None,
-        help="Only check these specific file types when using --skip_existing. If --model_type is not 'custom', this argument is ignored. Options: videos, images, images_goal, image_latents, image_goal_latents, video_latents, disparity, disparity_latents, raymaps, raymaps_abs, prompts, prompt_embeds, human_motions",
+        help="Only check these specific file types when using --skip_existing. If --model_type is not 'custom', this argument is ignored. Options: videos, images, images_goal, image_latents, image_goal_latents, video_latents, disparity, disparity_latents, raymaps, raymaps_abs, prompts, prompt_embeds, human_motions, hand_videos, hand_video_latents, hand_mask_videos, static_videos, static_video_latents",
+    )
+    parser.add_argument(
+        "--scene_filter",
+        nargs="+",
+        type=str,
+        default=None,
+        help="Only process scenes that match these filter patterns. If not specified, all scenes are processed.",
+    )
+    parser.add_argument(
+        "--save_prompt_embeds",
+        action="store_true",
+        help="Whether to save prompt embeddings. This is automatically enabled for cogvideox_pose model type.",
     )
     return parser.parse_args()
 
@@ -233,10 +243,13 @@ def get_model_file_types(model_type: str) -> List[str]:
             "image_goal_latents", "image_latents", "images", "images_goal",
             "prompts", "prompt_embeds", "raymaps", "raymaps_abs", "human_motions"
         ]
+    elif model_type == "cogvideox_pose":
+        return [
+            "videos", "video_latents", "prompts", "prompt_embeds",
+            "hand_videos", "hand_video_latents", "hand_mask_videos", "static_videos", "static_video_latents"
+        ]
     else:  # custom
         return []
-    
-    return []
 
 
 def get_expected_file_count(sequences_path: pathlib.Path) -> int:
@@ -248,7 +261,7 @@ def get_expected_file_count(sequences_path: pathlib.Path) -> int:
     return 0
 
 
-def find_scene_action_pairs(data_root: pathlib.Path, sequences_dir: str, rank: int = 0) -> List[tuple]:
+def find_scene_action_pairs(data_root: pathlib.Path, sequences_dir: str, scene_filter: Optional[List[str]] = None, rank: int = 0) -> List[tuple]:
     """Find all scene-action pairs that have valid sequence data."""
     scene_action_pairs = []
     
@@ -257,6 +270,19 @@ def find_scene_action_pairs(data_root: pathlib.Path, sequences_dir: str, rank: i
             continue
             
         scene_name = scene_dir.name
+        
+        # Apply scene filter if specified
+        if scene_filter is not None:
+            scene_matches = False
+            for filter_pattern in scene_filter:
+                if filter_pattern in scene_name:
+                    scene_matches = True
+                    break
+            if not scene_matches:
+                if rank == 0:
+                    print(f"Skipping scene {scene_name} (does not match filter patterns: {scene_filter})")
+                continue
+        
         for action_dir in natsorted(scene_dir.iterdir(), key=lambda x: x.name):
             if not action_dir.is_dir():
                 continue
@@ -311,18 +337,28 @@ def process_single_scene_action(
         print(f"Full processing: Generating all file types")
     print(f"{'='*60}")
     
-    # Create processed directory for this action
+    # Create processed directory for this action based on model_type
+    if args.model_type == "aether":
+        # Aether uses 'processed' directory
+        processed_dir = sequences_path.parent / "processed"
+    else:
+        # cogvideox_pose and custom use 'processed2' directory
+        processed_dir = sequences_path.parent / "processed2"
+    
     processed_dir.mkdir(parents=True, exist_ok=True)
     
-    # Build command to run the original script
+    # Build command to run the appropriate script based on model_type
+
+    script_path = "data_processing/trumans/prepare_dataset_trumans.py"  # Default to unified script
+    
     cmd_parts = [
-        "python", "training/aether/prepare_dataset_trumans.py",
+        "python", script_path,
         "--model_id", args.model_id,
         "--data_root", str(sequences_path),
         "--output_dir", str(processed_dir),
         "--caption_column", args.caption_column,
         "--video_column", args.video_column,
-
+        "--model_type", args.model_type,
         "--height_buckets"] + [str(h) for h in args.height_buckets] + [
         "--width_buckets"] + [str(w) for w in args.width_buckets] + [
         "--frame_buckets"] + [str(f) for f in args.frame_buckets] + [
@@ -342,39 +378,50 @@ def process_single_scene_action(
     if hasattr(args, 'skip_existing') and args.skip_existing:
         cmd_parts.append("--skip_existing")
     
-    # Add selective processing flags based on missing file types
-    if missing_file_types:
-        # Map file types to their corresponding flags
-        file_type_to_flag = {
-            "images": "--save_image_latents",
-            "image_latents": "--save_image_latents",
-            "images_goal": "--save_image_latents", 
-            "image_goal_latents": "--save_image_latents",
-            "video_latents": "--save_latents_and_embeddings",
-            "disparity_latents": "--save_latents_and_embeddings",
-            "prompt_embeds": "--save_latents_and_embeddings",
-
-        }
-        
-        # Add flags for missing file types
-        for file_type in missing_file_types:
-            if file_type in file_type_to_flag:
-                flag = file_type_to_flag[file_type]
-                if flag not in cmd_parts:
-                    cmd_parts.append(flag)
-        
-        # Always include basic processing flags for required file types
-        # (videos, disparity, raymaps, prompts are always processed)
-        if "images" in missing_file_types or "image_latents" in missing_file_types:
-            if "--save_image_latents" not in cmd_parts:
-                cmd_parts.append("--save_image_latents")
-        if ("video_latents" in missing_file_types or "disparity_latents" in missing_file_types or 
-            "prompt_embeds" in missing_file_types):
-            if "--save_latents_and_embeddings" not in cmd_parts:
-                cmd_parts.append("--save_latents_and_embeddings")
-        
-        # Add selective processing argument to only process missing file types
-        cmd_parts.extend(["--selective_processing"] + missing_file_types)
+            # Add selective processing flags based on missing file types
+        if missing_file_types:
+            # Map file types to their corresponding flags
+            file_type_to_flag = {
+                "images": "--save_image_latents",
+                "image_latents": "--save_image_latents",
+                "images_goal": "--save_image_latents", 
+                "image_goal_latents": "--save_image_latents",
+                "video_latents": "--save_latents_and_embeddings",
+                "disparity_latents": "--save_latents_and_embeddings",
+                "prompt_embeds": "--save_latents_and_embeddings",
+                            "hand_videos": "--save_latents_and_embeddings",
+            "hand_video_latents": "--save_latents_and_embeddings",
+            "hand_mask_videos": "--save_latents_and_embeddings",
+            "static_videos": "--save_latents_and_embeddings",
+            "static_video_latents": "--save_latents_and_embeddings",
+            }
+            
+            # Add flags for missing file types
+            for file_type in missing_file_types:
+                if file_type in file_type_to_flag:
+                    flag = file_type_to_flag[file_type]
+                    if flag not in cmd_parts:
+                        cmd_parts.append(flag)
+            
+            # Always include basic processing flags for required file types
+            # (videos, disparity, raymaps, prompts are always processed)
+            if "images" in missing_file_types or "image_latents" in missing_file_types:
+                if "--save_image_latents" not in cmd_parts:
+                    cmd_parts.append("--save_image_latents")
+            if ("video_latents" in missing_file_types or "disparity_latents" in missing_file_types or 
+                "prompt_embeds" in missing_file_types or "hand_videos" in missing_file_types or
+                "hand_video_latents" in missing_file_types or "hand_mask_videos" in missing_file_types or
+                "static_videos" in missing_file_types or "static_video_latents" in missing_file_types):
+                if "--save_latents_and_embeddings" not in cmd_parts:
+                    cmd_parts.append("--save_latents_and_embeddings")
+            
+            # Add prompt embeddings flag for aether and cogvideox_pose model types or if explicitly requested
+            if (args.model_type in ["aether", "cogvideox_pose"] or args.save_prompt_embeds) and "prompt_embeds" in missing_file_types:
+                if "--save_prompt_embeddings" not in cmd_parts:
+                    cmd_parts.append("--save_prompt_embeddings")
+            
+            # Add selective processing argument to only process missing file types
+            cmd_parts.extend(["--selective_processing"] + missing_file_types)
     
     if args.id_token:
         cmd_parts.extend(["--id_token", args.id_token])
@@ -392,6 +439,10 @@ def process_single_scene_action(
         cmd_parts.append("--use_slicing")
     if args.use_tiling:
         cmd_parts.append("--use_tiling")
+    
+    # Add prompt embeddings flag for aether and cogvideox_pose model types or if explicitly requested
+    if args.model_type in ["aether", "cogvideox_pose"] or args.save_prompt_embeds:
+        cmd_parts.append("--save_prompt_embeds")
     if args.dataloader_num_workers:
         cmd_parts.extend(["--dataloader_num_workers", str(args.dataloader_num_workers)])
     if args.num_decode_threads:
@@ -465,6 +516,20 @@ def process_single_scene_action(
 def main():
     args = get_args()
     set_seed(args.seed)
+    
+    # Dynamically import dataset classes based on model_type
+    if args.model_type == "aether":
+        # Import Aether-specific dataset classes
+        from training.aether.dataset import BucketSampler, VideoDatasetWithResizing, VideoDatasetWithResizeAndRectangleCrop
+        print(f"Using Aether dataset classes from training/aether/dataset.py")
+    elif args.model_type == "cogvideox_pose":
+        # Import CogVideoX pose-specific dataset classes
+        from training.cogvideox_static_pose.dataset import BucketSampler, VideoDatasetWithConditions, VideoDatasetWithConditionsAndResizing, VideoDatasetWithConditionsAndResizeAndRectangleCrop
+        print(f"Using CogVideoX pose dataset classes from training/cogvideox_static_pose/dataset.py")
+    else:  # custom
+        # Default to unified dataset classes
+        from training.cogvideox_static_pose.dataset import BucketSampler, VideoDatasetWithConditions, VideoDatasetWithConditionsAndResizing, VideoDatasetWithConditionsAndResizeAndRectangleCrop
+        print(f"Using default dataset classes from training/cogvideox_static_pose/dataset.py")
 
     # Initialize distributed processing
     if "LOCAL_RANK" in os.environ:
@@ -494,7 +559,7 @@ def main():
 
     # Find all scene-action pairs
     data_root = pathlib.Path(args.data_root)
-    scene_action_pairs = find_scene_action_pairs(data_root, args.sequences_dir, rank)
+    scene_action_pairs = find_scene_action_pairs(data_root, args.sequences_dir, args.scene_filter, rank)
     
     # Filter out already processed scene-action pairs if skip_existing is enabled
     if args.skip_existing:
@@ -526,8 +591,12 @@ def main():
             expected_file_count = get_expected_file_count(sequences_path)
             
             for file_type in file_types_to_check:
-                # Check in the processed directory within this action's sequences directory
-                processed_dir = sequences_path.parent / "processed" / file_type
+                # Check in the appropriate processed directory based on model_type
+                if args.model_type == "aether":
+                    processed_dir = sequences_path.parent / "processed" / file_type
+                else:
+                    processed_dir = sequences_path.parent / "processed2" / file_type
+                
                 if not processed_dir.exists():
                     missing_file_types.append(file_type)
                     has_all_files = False
@@ -600,8 +669,11 @@ def main():
         else:
             scene_name, action_name, sequences_path, missing_file_types = pair_data
         
-        # Create processed directory within this action's sequences directory
-        processed_dir = sequences_path.parent / "processed"
+        # Create processed directory within this action's sequences directory based on model_type
+        if args.model_type == "aether":
+            processed_dir = sequences_path.parent / "processed"
+        else:
+            processed_dir = sequences_path.parent / "processed2"
         processed_dir.mkdir(parents=True, exist_ok=True)
         
         # Process the scene-action pair
