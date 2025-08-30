@@ -134,8 +134,7 @@ def compute_prompt_embeddings(
 
 
 def generate_trumans_filename(scene_name: str, action_name: str, video_name: str, extension: str) -> str:
-    """Generate filename following Trumans naming convention:
-    {first 8 chars of scene}_{action name}_{video name}.{ext}
+    """Generate simple filename: {video_name}.{extension}
     
     Args:
         scene_name: Full scene name (e.g., 0a7618195-4647-8896747201b1)
@@ -144,13 +143,10 @@ def generate_trumans_filename(scene_name: str, action_name: str, video_name: str
         extension: File extension (e.g., 'mp4', 'pt', 'png')
     
     Returns:
-        Formatted filename (e.g., 0a761819_20231-14_22-06-10_00000.mp4')
+        Simple filename (e.g., '00000.mp4')
     """
-    # Extract first 8 characters of scene name
-    scene_prefix = scene_name[:8]
-    
-    # Generate filename
-    filename = f"{scene_prefix}_{action_name}_{video_name}.{extension}"
+    # Generate simple filename
+    filename = f"{video_name}.{extension}"
     return filename
 
 
