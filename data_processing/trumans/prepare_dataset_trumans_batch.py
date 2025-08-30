@@ -417,8 +417,8 @@ def process_single_scene_action(
             
             # Add prompt embeddings flag for aether and cogvideox_pose model types or if explicitly requested
             if (args.model_type in ["aether", "cogvideox_pose"] or args.save_prompt_embeds) and "prompt_embeds" in missing_file_types:
-                if "--save_prompt_embeddings" not in cmd_parts:
-                    cmd_parts.append("--save_prompt_embeddings")
+                if "--save_prompt_embeds" not in cmd_parts:
+                    cmd_parts.append("--save_prompt_embeds")
             
             # Add selective processing argument to only process missing file types
             cmd_parts.extend(["--selective_processing"] + missing_file_types)
