@@ -127,13 +127,15 @@ def log_validation_with_dataset(
         # For concat/adapter, load hand and static videos
         if validation_hand_video_path and os.path.exists(validation_hand_video_path):
             hand_video = iio.imread(validation_hand_video_path).astype(np.float32) / 255.0
-            hand_video = hand_video.transpose(0, 3, 1, 2)
+            hand_video = hand_video.transpose(3, 0, 1, 2)  # [F, H, W, C] -> [C, F, H, W]
+            hand_video = hand_video[np.newaxis, :]  # Add batch dimension: [C, F, H, W] -> [1, C, F, H, W]
         else:
             hand_video = None
             
         if validation_static_video_path and os.path.exists(validation_static_video_path):
             static_video = iio.imread(validation_static_video_path).astype(np.float32) / 255.0
-            static_video = static_video.transpose(0, 3, 1, 2)
+            static_video = static_video.transpose(3, 0, 1, 2)  # [F, H, W, C] -> [C, F, H, W]
+            static_video = static_video[np.newaxis, :]  # Add batch dimension: [C, F, H, W] -> [1, C, F, H, W]
         else:
             static_video = None
         
@@ -157,7 +159,7 @@ def log_validation_with_dataset(
     pipeline_args = {
         "prompt": validation_prompt,
         "guidance_scale": 6.0,  # Default guidance scale
-        "use_dynamic_cfg": True,  # Default dynamic cfg
+        "use_dynamic_cfg": False,  # Disable dynamic cfg to match comparison script
         "height": 480,
         "width": 720,
         "num_frames": 49,
@@ -227,6 +229,7 @@ def log_validation_with_dataset(
                 pipeline_args["hand_videos"] = hand_video
             elif pipeline_type == "cogvideox_fun_static_to_video":
                 pipeline_args["static_videos"] = static_video
+                pipeline_args["mask_video"] = np.zeros_like(static_video)
             elif pipeline_type == "cogvideox_fun_static_to_video_pose_concat":
                 pipeline_args["static_videos"] = static_video
                 pipeline_args["hand_videos"] = hand_video
@@ -235,15 +238,20 @@ def log_validation_with_dataset(
         pipeline_args["hand_videos"] = hand_video
         pipeline_args["static_videos"] = static_video
 
-    generated_video = pipe(**pipeline_args, generator=generator, output_type="np").frames[0]
+    output = pipe(**pipeline_args, generator=generator)
+    generated_video = output.frames[0]
+    if isinstance(generated_video, torch.Tensor):
+        generated_video = generated_video.cpu().numpy()
 
     # Ensure all videos have the same number of frames (49 frames at 8fps)
     # Only consider non-None videos for frame calculation
     frame_shapes = [generated_video.shape[0], gt_video.shape[0]]
-    if hand_video is not None:
-        frame_shapes.append(hand_video.shape[0])
     if static_video is not None:
+        static_video = static_video[0].transpose(1, 2, 3, 0)  # [1, C, F, H, W] -> [C, F, H, W] -> [F, H, W, C]
         frame_shapes.append(static_video.shape[0])
+    if hand_video is not None:
+        hand_video = hand_video[0].transpose(1, 2, 3, 0)  # [1, C, F, H, W] -> [C, F, H, W] -> [F, H, W, C]
+        frame_shapes.append(hand_video.shape[0])
     
     num_frames = min(*frame_shapes, 49)
     generated_video = generated_video[:num_frames]
@@ -256,9 +264,9 @@ def log_validation_with_dataset(
     # Create comparison video: only include non-None videos
     video_components = []
     if static_video is not None:
-        video_components.append(static_video.transpose(0, 2, 3, 1))
+        video_components.append(static_video)
     if hand_video is not None:
-        video_components.append(hand_video.transpose(0, 2, 3, 1))
+        video_components.append(hand_video)
     video_components.extend([generated_video, gt_video])
     
     comparison_video = np.concatenate(video_components, axis=2)  # Concatenate along width
@@ -269,7 +277,7 @@ def log_validation_with_dataset(
     # Extract filename from path
     validation_video_path = Path(validation_video_path)
     scene_code = validation_video_path.parent.parent.parent.parent.stem[:8]
-    action_name = validation_video_path.parnet.parent.parent.stem
+    action_name = validation_video_path.parent.parent.parent.stem
     video_name = validation_video_path.stem
     save_name = f"{scene_code}_{action_name}_{video_name}"
     
@@ -319,6 +327,7 @@ def run_validation(
     model_config: Dict[str, Any],
     weight_dtype: torch.dtype,
     step: int = 0,
+    should_run_max_validation: bool = False,
 ) -> None:
     """Run validation during training."""
     accelerator.print("===== Memory before validation =====")
@@ -465,20 +474,27 @@ def run_validation(
             validation_set = validation_set[::validation_stride]
         
         # Limit validation to just a few videos to speed up validation
-        max_validation_videos = data_config.get("max_validation_videos", 4)
+        if should_run_max_validation:
+            max_validation_videos = data_config.get("max_validation_videos", 4)
+        else:
+            max_validation_videos = min(1, data_config.get("max_validation_videos", 4))
         
         # For multi-GPU training, multiply by number of GPUs to ensure each GPU gets different videos
         total_validation_videos = max_validation_videos * accelerator.num_processes
         
-        # Randomize validation set selection for variety
+        # Select validation videos (randomized or sequential)
         if len(validation_set) > total_validation_videos:
-            # Use step number to seed random selection for reproducibility
-            random.seed(step // data_config.get("validation_steps", 1000))
-            validation_set = random.sample(validation_set, total_validation_videos)
+            if data_config.get("random_validation", False):
+                # Use step number to seed random selection for reproducibility
+                random.seed(step // data_config.get("validation_steps", 1000))
+                validation_set = random.sample(validation_set, total_validation_videos)
+            else:
+                # Take first N videos without randomization
+                validation_set = validation_set[:total_validation_videos]
         else:
             validation_set = validation_set[:total_validation_videos]
         
-        # Distribute videos across GPUs
+        # Distribute videos across GPUs - each GPU gets different videos
         videos_per_gpu = len(validation_set) // accelerator.num_processes
         start_idx = accelerator.process_index * videos_per_gpu
         end_idx = start_idx + videos_per_gpu if accelerator.process_index < accelerator.num_processes - 1 else len(validation_set)
@@ -513,7 +529,6 @@ def run_validation(
         for video_path in validation_set:
             # Convert video path to prompt path
             video_path_obj = Path(video_path)
-            # prompt_path = video_path_obj.parent.parent / "prompts" / video_path_obj.stem + ".txt"
             prompt_path = video_path_obj.parent.parent / "prompts" / f"{video_path_obj.stem}.txt"
             validation_prompts.append(Path(data_config["data_root"]) / prompt_path)
         
@@ -859,14 +874,23 @@ def setup_lora_training(transformer, config: Dict[str, Any]):
     lora_rank = config["training"].get("lora_rank", 64)
     lora_alpha = config["training"].get("lora_alpha", 32)
     freeze_projection = config["training"].get("freeze_projection", False)
+    projection_lr_scale = config["training"].get("projection_lr_scale", 0.1)  # Projection layer learning rate scale
     
     print(f"   LoRA Rank: {lora_rank}")
     print(f"   LoRA Alpha: {lora_alpha}")
     print(f"   Freeze Projection: {freeze_projection}")
+    print(f"   Projection LR Scale: {projection_lr_scale}")
     
     # First, freeze all parameters
     for name, param in transformer.named_parameters():
         param.requires_grad_(False)
+    
+    # Enable gradient checkpointing BEFORE adding LoRA adapters (CRITICAL!)
+    if config["training"].get("custom_settings", {}).get("gradient_checkpointing", False):
+        transformer.enable_gradient_checkpointing()
+        print("✅ Gradient checkpointing enabled BEFORE LoRA setup")
+    else:
+        print("⚠️  Gradient checkpointing disabled - this may cause high VRAM usage!")
     
     # Add LoRA to attention layers
     transformer_lora_config = LoraConfig(
@@ -1200,8 +1224,11 @@ def main():
         experiment_config["output_dir"] = f"{base_output_dir}_slurm_test"
         print(f"🧪 SLURM test mode: Output directory set to {experiment_config['output_dir']}")
     elif args.mode == "slurm":
-        experiment_config["output_dir"] = f"{base_output_dir}_slurm"
+        # Get SLURM job ID from environment variable
+        slurm_job_id = os.environ.get("SLURM_JOB_ID", "unknown")
+        experiment_config["output_dir"] = f"{base_output_dir}_slurm_{slurm_job_id}"
         print(f"🚀 SLURM mode: Output directory set to {experiment_config['output_dir']}")
+        print(f"   SLURM Job ID: {slurm_job_id}")
     
     print(f"📁 Final output directory: {experiment_config['output_dir']}")
     print(f"   - Base: {base_output_dir}")
@@ -1263,8 +1290,40 @@ def main():
     accelerator.register_load_state_pre_hook(load_model_hook)
     
     # Setup optimizer and scheduler
+    if training_config["mode"] == "lora" and not training_config.get("freeze_projection", False):
+        # For LoRA with trainable projection layer, use different learning rates
+        projection_lr_scale = training_config.get("projection_lr_scale", 0.1)
+        base_lr = float(training_config["learning_rate"])  # Convert to float in case it's a string
+        projection_lr = base_lr * projection_lr_scale
+        
+        # Separate parameters for different learning rates
+        lora_params = []
+        projection_params = []
+        
+        for name, param in transformer.named_parameters():
+            if param.requires_grad:
+                if "lora" in name.lower():
+                    lora_params.append(param)
+                elif "patch_embed.proj" in name:
+                    projection_params.append(param)
+                else:
+                    lora_params.append(param)  # Default to LoRA learning rate
+        
+        params_to_optimize = [
+            {"params": lora_params, "lr": base_lr},
+            {"params": projection_params, "lr": projection_lr}
+        ]
+        
+        print(f"🔧 LoRA learning rate: {base_lr}")
+        print(f"🔧 Projection learning rate: {projection_lr} (scale: {projection_lr_scale})")
+        print(f"🔧 LoRA parameters: {len(lora_params)}")
+        print(f"🔧 Projection parameters: {len(projection_params)}")
+    else:
+        # Standard optimizer setup for full training or frozen projection
+        params_to_optimize = [{"params": list(filter(lambda p: p.requires_grad, transformer.parameters()))}]
+    
     optimizer = get_optimizer(
-        params_to_optimize=[{"params": list(filter(lambda p: p.requires_grad, transformer.parameters()))}],
+        params_to_optimize=params_to_optimize,
         optimizer_name=training_config.get("optimizer", "adamw"),
         learning_rate=training_config["learning_rate"],
         weight_decay=training_config.get("weight_decay", 0.01),
@@ -1399,8 +1458,9 @@ def main():
         else:
             date_suffix = "unknown"
         
-        # Create run name: {date}_{name}_{mode}_{pipeline_type}
-        run_name = f"{date_suffix}_{exp_name}_{args.mode}"
+        # Create run name: {date}_{name}_{mode}_{job_id}
+        slurm_job_id = os.environ.get("SLURM_JOB_ID", "local")
+        run_name = f"{date_suffix}_{exp_name}_{args.mode}_{slurm_job_id}"
         
         # Initialize accelerator trackers (this will handle WandB initialization)
         project_name = logging_config.get("project_name", "world_model")
@@ -1440,14 +1500,21 @@ def main():
         }
         
         # Initialize accelerator trackers with custom config and wandb settings
+        # Set wandb to offline mode for debug and slurm_test modes
+        wandb_init_kwargs = {
+            "name": run_name,
+            "entity": entity_name,
+        }
+        
+        if args.mode in ["debug", "slurm_test"]:
+            wandb_init_kwargs["mode"] = "offline"
+            print(f"🔧 WandB set to offline mode for {args.mode}")
+        
         accelerator.init_trackers(
             project_name=project_name,
             config=accelerator_config,
             init_kwargs={
-                "wandb": {
-                    "name": run_name,
-                    "entity": entity_name,
-                }
+                "wandb": wandb_init_kwargs
             }
         )
         
@@ -1632,532 +1699,523 @@ def main():
             scheduler=scheduler,
             model_config=transformer_config,
             weight_dtype=weight_dtype,
-            step=0
+            step=0,
+            should_run_max_validation=False
         )
 
-    # Training loop - iteration based
-    transformer.train()
-    
-    # Calculate current epoch for display purposes
-    current_epoch = first_epoch
-    
-    for step, batch in enumerate(train_dataloader):
-        models_to_accumulate = [transformer]
-        logs = {}
+    # Training loop - epoch based (like original CogVideoX)
+        transformer.train()
 
-        with accelerator.accumulate(models_to_accumulate):
-            # Update epoch for display
-            current_epoch = first_epoch + (global_step // num_update_steps_per_epoch)
-            videos = batch["videos"].to(accelerator.device, non_blocking=True)
-            prompts = batch["prompts"]
-            hand_videos = batch.get("hand_videos")
-            static_videos = batch.get("static_videos")
-            human_motions = batch.get("human_motions")  # For AdaLN pipeline
+    for epoch in range(first_epoch, num_epochs):
+        for step, batch in enumerate(train_dataloader):
+            models_to_accumulate = [transformer]
+            logs = {}
 
-            # Encode videos
-            if not training_config.get("custom_settings", {}).get("load_tensors", False):
-                videos = videos.permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
-                latent_dist = vae.encode(videos).latent_dist
-            else:
-                latent_dist = DiagonalGaussianDistribution(videos)
+            with accelerator.accumulate(models_to_accumulate):
+                # Update epoch for display
+                current_epoch = epoch
+                
+                videos = batch["videos"].to(accelerator.device, non_blocking=True)
+                prompts = batch["prompts"]
+                hand_videos = batch.get("hand_videos")
+                static_videos = batch.get("static_videos")
+                human_motions = batch.get("human_motions")  # For AdaLN pipeline
 
-            videos = latent_dist.sample() * VAE_SCALING_FACTOR
-            videos = videos.permute(0, 2, 1, 3, 4)  # [B, F, C, H, W]
-            videos = videos.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
-            model_input = videos
-
-            # Encode condition videos if provided
-            if hand_videos is not None and static_videos is not None:
+                # Encode videos
                 if not training_config.get("custom_settings", {}).get("load_tensors", False):
-                    hand_videos = hand_videos.permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
-                    static_videos = static_videos.permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
-                    hand_latent_dist = vae.encode(hand_videos).latent_dist
-                    static_latent_dist = vae.encode(static_videos).latent_dist
+                    videos = videos.permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
+                    with torch.no_grad():
+                        latent_dist = vae.encode(videos).latent_dist
                 else:
-                    hand_latent_dist = DiagonalGaussianDistribution(hand_videos)
-                    static_latent_dist = DiagonalGaussianDistribution(static_videos)
+                    latent_dist = DiagonalGaussianDistribution(videos)
 
-                hand_videos = hand_latent_dist.sample() * VAE_SCALING_FACTOR
-                hand_videos = hand_videos.permute(0, 2, 1, 3, 4)  # [B, F, C, H, W]
-                hand_videos = hand_videos.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
-                
-                static_videos = static_latent_dist.sample() * VAE_SCALING_FACTOR
-                static_videos = static_videos.permute(0, 2, 1, 3, 4)  # [B, F, C, H, W]
-                static_videos = static_videos.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
-            else:
-                # If no condition videos provided, set to None
-                hand_videos = None
-                static_videos = None
+                videos = latent_dist.sample() * VAE_SCALING_FACTOR
+                videos = videos.permute(0, 2, 1, 3, 4)  # [B, F, C, H, W]
+                videos = videos.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
+                model_input = videos
 
-            # Encode prompts
-            if not training_config.get("custom_settings", {}).get("load_tensors", False):
-                # Handle case where prompts might be a list of strings
-                if isinstance(prompts, list):
-                    prompt_embeds = compute_prompt_embeddings(
-                        tokenizer,
-                        text_encoder,
-                        prompts,
-                        model_config.max_text_seq_length,
-                        accelerator.device,
-                        weight_dtype,
-                        requires_grad=False,
-                    )
+                # Encode condition videos if provided
+                if hand_videos is not None and static_videos is not None:
+                    if not training_config.get("custom_settings", {}).get("load_tensors", False):
+                        # hand_videos = hand_videos.permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
+                        # static_videos = static_videos.permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
+                        # hand_latent_dist = vae.encode(hand_videos).latent_dist
+                        # static_latent_dist = vae.encode(static_videos).latent_dist
+                        combined_videos = torch.cat([hand_videos, static_videos], dim=0)
+                        combined_latent_dist = vae.encode(combined_videos).latent_dist
+                        hand_latent_dist, static_latent_dist = combined_latent_dist.chunk(2, dim=0)
+                    else:
+                        hand_latent_dist = DiagonalGaussianDistribution(hand_videos)
+                        static_latent_dist = DiagonalGaussianDistribution(static_videos)
+
+                    hand_videos = hand_latent_dist.sample() * VAE_SCALING_FACTOR
+                    hand_videos = hand_videos.permute(0, 2, 1, 3, 4)  # [B, F, C, H, W]
+                    hand_videos = hand_videos.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
+                    
+                    static_videos = static_latent_dist.sample() * VAE_SCALING_FACTOR
+                    static_videos = static_videos.permute(0, 2, 1, 3, 4)  # [B, F, C, H, W]
+                    static_videos = static_videos.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
                 else:
-                    prompt_embeds = prompts.to(dtype=weight_dtype)
-            else:
-                # When load_tensors=True, prompts is already a batched tensor
-                prompt_embeds = prompts.to(dtype=weight_dtype)
-
-            # Sample noise that will be added to the latents
-            noise = torch.randn_like(model_input)
-            batch_size, num_frames, num_channels, height, width = model_input.shape
-
-            # Sample a random timestep for each image
-            timesteps = torch.randint(
-                0,
-                scheduler.config.num_train_timesteps,
-                (batch_size,),
-                dtype=torch.int64,
-                device=model_input.device,
-            )
-
-            # Prepare rotary embeds
-            image_rotary_emb = (
-                prepare_rotary_positional_embeddings(
-                    height=height * VAE_SCALE_FACTOR_SPATIAL,
-                    width=width * VAE_SCALE_FACTOR_SPATIAL,
-                    num_frames=num_frames,
-                    vae_scale_factor_spatial=VAE_SCALE_FACTOR_SPATIAL,
-                    patch_size=transformer_config.patch_size,
-                    patch_size_t=transformer_config.patch_size_t if hasattr(transformer_config, "patch_size_t") else None,
-                    attention_head_dim=transformer_config.attention_head_dim,
-                    device=accelerator.device,
-                    base_height=RoPE_BASE_HEIGHT,
-                    base_width=RoPE_BASE_WIDTH,
-                )
-                if transformer_config.use_rotary_positional_embeddings
-                else None
-            )
-
-            # Add noise to the model input according to the noise magnitude at each timestep
-            # (this is the forward diffusion process)
-            noisy_model_input = scheduler.add_noise(model_input, noise, timesteps)
-
-            # Prepare condition latents based on pipeline type
-            if pipeline_config["type"] == "cogvideox_i2v":
-                # For basic I2V pipeline, no conditioning needed
-                transformer_input = noisy_model_input
-                condition_latents = None
-                
-            elif pipeline_config["type"] == "cogvideox_pose_concat":
-                # Check condition control flags
-                conditions_config = config.get("conditions", {})
-                static_only = conditions_config.get("static_only", False)
-                hand_only = conditions_config.get("hand_only", False)
-                
-                # Zero out conditions based on flags
-                if static_only:
-                    print("🔧 Static-only mode: Zeroing out hand conditions")
+                    # If no condition videos provided, set to None
                     hand_videos = None
-                elif hand_only:
-                    print("🔧 Hand-only mode: Zeroing out static conditions")
                     static_videos = None
-                
-                # Use the pipeline's prepare_latents method (handles all cases including zero-padding)
-                _, condition_latents = pipeline.prepare_latents(
-                    hand_videos=hand_videos,
-                    static_videos=static_videos,
-                    batch_size=batch_size,
-                    num_frames=num_frames,
-                    height=height * VAE_SCALE_FACTOR_SPATIAL,
-                    width=width * VAE_SCALE_FACTOR_SPATIAL,
-                    dtype=weight_dtype,
-                    device=accelerator.device,
-                    generator=None,
-                )
-                
-                # Check if we need to use mask (VideoX-Fun-InP compatible)
-                use_mask = transformer_config.in_channels == (noisy_model_input.shape[2] + condition_latents.shape[2] + 1)
-                if use_mask:  # VideoX-Fun-InP compatible
-                    mask_input = torch.ones_like(noisy_model_input[:, :, :1])
-                    transformer_input = torch.cat([noisy_model_input, mask_input, condition_latents], dim=2)
+
+                # Encode prompts
+                if not training_config.get("custom_settings", {}).get("load_tensors", False):
+                    # Handle case where prompts might be a list of strings
+                    if isinstance(prompts, list):
+                        prompt_embeds = compute_prompt_embeddings(
+                            tokenizer,
+                            text_encoder,
+                            prompts,
+                            model_config.max_text_seq_length,
+                            accelerator.device,
+                            weight_dtype,
+                            requires_grad=False,
+                        )
+                    else:
+                        prompt_embeds = prompts.to(dtype=weight_dtype)
                 else:
+                    # When load_tensors=True, prompts is already a batched tensor
+                    prompt_embeds = prompts.to(dtype=weight_dtype)
+
+                # Sample noise that will be added to the latents
+                noise = torch.randn_like(model_input)
+                batch_size, num_frames, num_channels, height, width = model_input.shape
+
+                # Sample a random timestep for each image
+                timesteps = torch.randint(
+                    0,
+                    scheduler.config.num_train_timesteps,
+                    (batch_size,),
+                    dtype=torch.int64,
+                    device=model_input.device,
+                )
+
+                # Prepare rotary embeds
+                image_rotary_emb = (
+                    prepare_rotary_positional_embeddings(
+                        height=height * VAE_SCALE_FACTOR_SPATIAL,
+                        width=width * VAE_SCALE_FACTOR_SPATIAL,
+                        num_frames=num_frames,
+                        vae_scale_factor_spatial=VAE_SCALE_FACTOR_SPATIAL,
+                        patch_size=transformer_config.patch_size,
+                        patch_size_t=transformer_config.patch_size_t if hasattr(transformer_config, "patch_size_t") else None,
+                        attention_head_dim=transformer_config.attention_head_dim,
+                        device=accelerator.device,
+                        base_height=RoPE_BASE_HEIGHT,
+                        base_width=RoPE_BASE_WIDTH,
+                    )
+                    if transformer_config.use_rotary_positional_embeddings
+                    else None
+                )
+
+                # Add noise to the model input according to the noise magnitude at each timestep
+                # (this is the forward diffusion process)
+                noisy_model_input = scheduler.add_noise(model_input, noise, timesteps)
+
+                # Prepare condition latents based on pipeline type
+                if pipeline_config["type"] == "cogvideox_i2v":
+                    # For basic I2V pipeline, no conditioning needed
+                    transformer_input = noisy_model_input
+                    condition_latents = None
+                    
+                elif pipeline_config["type"] == "cogvideox_pose_concat":
+                    # Check condition control flags
+                    conditions_config = config.get("conditions", {})
+                    static_only = conditions_config.get("static_only", False)
+                    hand_only = conditions_config.get("hand_only", False)
+                    
+                    # Zero out conditions based on flags
+                    if static_only:
+                        print("🔧 Static-only mode: Zeroing out hand conditions")
+                        hand_videos = None
+                    elif hand_only:
+                        print("🔧 Hand-only mode: Zeroing out static conditions")
+                        static_videos = None
+                    
+                    # Use the pipeline's prepare_latents method (handles all cases including zero-padding)
+                    _, condition_latents = pipeline.prepare_latents(
+                        hand_videos=hand_videos,
+                        static_videos=static_videos,
+                        batch_size=batch_size,
+                        num_frames=num_frames,
+                        height=height * VAE_SCALE_FACTOR_SPATIAL,
+                        width=width * VAE_SCALE_FACTOR_SPATIAL,
+                        dtype=weight_dtype,
+                        device=accelerator.device,
+                        generator=None,
+                    )
+                    
                     # Concatenate condition latents with noisy model input for transformer
                     transformer_input = torch.cat([noisy_model_input, condition_latents], dim=2)
-            
-            elif pipeline_config["type"] == "cogvideox_pose_adapter":
-                # Check condition control flags
-                conditions_config = config.get("conditions", {})
-                static_only = conditions_config.get("static_only", False)
-                hand_only = conditions_config.get("hand_only", False)
                 
-                # Zero out conditions based on flags
-                if static_only:
-                    print("🔧 Static-only mode: Zeroing out hand conditions")
-                    hand_videos = None
-                elif hand_only:
-                    print("🔧 Hand-only mode: Zeroing out static conditions")
-                    static_videos = None
-                
-                # For adapter pipeline, use residual conditioning
-                if hand_videos is not None and static_videos is not None:
-                    # Handle condition videos based on load_tensors setting
-                    if not training_config.get("custom_settings", {}).get("load_tensors", False):
-                        # Encode condition videos to latents
-                        hand_videos_permuted = hand_videos.permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
-                        static_videos_permuted = static_videos.permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
+                elif pipeline_config["type"] == "cogvideox_pose_adapter":
+                    # Check condition control flags
+                    conditions_config = config.get("conditions", {})
+                    static_only = conditions_config.get("static_only", False)
+                    hand_only = conditions_config.get("hand_only", False)
+                    
+                    # Zero out conditions based on flags
+                    if static_only:
+                        print("🔧 Static-only mode: Zeroing out hand conditions")
+                        hand_videos = None
+                    elif hand_only:
+                        print("🔧 Hand-only mode: Zeroing out static conditions")
+                        static_videos = None
+                    
+                    # For adapter pipeline, use residual conditioning
+                    if hand_videos is not None and static_videos is not None:
+                        # Handle condition videos based on load_tensors setting
+                        if not training_config.get("custom_settings", {}).get("load_tensors", False):
+                            # Encode condition videos to latents
+                            hand_videos_permuted = hand_videos.permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
+                            static_videos_permuted = static_videos.permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
+                            
+                            # Encode to latents
+                            hand_latent_dist = vae.encode(hand_videos_permuted).latent_dist
+                            static_latent_dist = vae.encode(static_videos_permuted).latent_dist
+                            
+                            hand_videos_latents = hand_latent_dist.sample() * VAE_SCALING_FACTOR
+                            static_videos_latents = static_latent_dist.sample() * VAE_SCALING_FACTOR
+                            
+                            # Convert back to [B, F, C, H, W] format
+                            hand_videos_latents = hand_videos_latents.permute(0, 2, 1, 3, 4)
+                            static_videos_latents = static_videos_latents.permute(0, 2, 1, 3, 4)
+                        else:
+                            # Already latents, just ensure correct format
+                            hand_videos_latents = hand_videos
+                            static_videos_latents = static_videos
                         
-                        # Encode to latents
-                        hand_latent_dist = vae.encode(hand_videos_permuted).latent_dist
-                        static_latent_dist = vae.encode(static_videos_permuted).latent_dist
+                        # For adapter pipeline, we pass the noisy latents directly
+                        transformer_input = noisy_model_input
                         
-                        hand_videos_latents = hand_latent_dist.sample() * VAE_SCALING_FACTOR
-                        static_videos_latents = static_latent_dist.sample() * VAE_SCALING_FACTOR
-                        
-                        # Convert back to [B, F, C, H, W] format
-                        hand_videos_latents = hand_videos_latents.permute(0, 2, 1, 3, 4)
-                        static_videos_latents = static_videos_latents.permute(0, 2, 1, 3, 4)
+                        # Store condition latents for adapter
+                        condition_latents = {
+                            "hand_videos_latents": hand_videos_latents,
+                            "static_videos_latents": static_videos_latents,
+                        }
                     else:
-                        # Already latents, just ensure correct format
-                        hand_videos_latents = hand_videos
-                        static_videos_latents = static_videos
-                    
-                    # For adapter pipeline, we pass the noisy latents directly
+                        transformer_input = noisy_model_input
+                        condition_latents = None
+                        
+                elif pipeline_config["type"] in ["cogvideox_pose_adaln", "cogvideox_pose_adaln_perframe"]:
+                    # For AdaLN pipeline, we pass the noisy latents directly
                     transformer_input = noisy_model_input
                     
-                    # Store condition latents for adapter
-                    condition_latents = {
-                        "hand_videos_latents": hand_videos_latents,
-                        "static_videos_latents": static_videos_latents,
-                    }
-                else:
-                    transformer_input = noisy_model_input
+                    # Store human_motions for AdaLN conditioning
+                    if human_motions is not None:
+                        # Ensure human_motions is on the correct device and dtype
+                        human_motions = human_motions.to(device=accelerator.device, dtype=weight_dtype)
+                        condition_latents = {
+                            "human_motions": human_motions,
+                        }
+                    else:
+                        condition_latents = None
+                        
+                elif pipeline_config["type"] == "cogvideox_static_to_video":
+                    # For static-to-video pipeline, use static videos as condition
+                    # Use the pipeline's prepare_latents method
+                    _, static_videos_latents = pipeline.prepare_latents(
+                        None,  # image not used
+                        static_videos=static_videos,
+                        batch_size=batch_size,
+                        num_frames=num_frames,
+                        height=height * VAE_SCALE_FACTOR_SPATIAL,
+                        width=width * VAE_SCALE_FACTOR_SPATIAL,
+                        dtype=weight_dtype,
+                        device=accelerator.device,
+                        generator=None,
+                    )
+                    
+                    # Check if we need to use mask (VideoX-Fun-InP compatible)
+                    use_mask = transformer_config.in_channels == (noisy_model_input.shape[2] + static_videos_latents.shape[2] + 1)
+                    if use_mask:  # VideoX-Fun-InP compatible
+                        mask_input = torch.ones_like(noisy_model_input[:, :, :1])
+                        transformer_input = torch.cat([noisy_model_input, mask_input, static_videos_latents], dim=2)
+                    else:
+                        # Concatenate static video latents with noisy model input for transformer
+                        transformer_input = torch.cat([noisy_model_input, static_videos_latents], dim=2)
                     condition_latents = None
                     
-            elif pipeline_config["type"] in ["cogvideox_pose_adaln", "cogvideox_pose_adaln_perframe"]:
-                # For AdaLN pipeline, we pass the noisy latents directly
-                transformer_input = noisy_model_input
-                
-                # Store human_motions for AdaLN conditioning
-                if human_motions is not None:
-                    # Ensure human_motions is on the correct device and dtype
-                    human_motions = human_motions.to(device=accelerator.device, dtype=weight_dtype)
-                    condition_latents = {
-                        "human_motions": human_motions,
-                    }
-                else:
+                elif pipeline_config["type"] == "cogvideox_static_to_video_pose_concat":
+                    # For static-to-video pose concat pipeline, use both static and hand videos as conditions
+                    # Use the pipeline's prepare_latents method
+                    _, static_videos_latents, hand_video_latents = pipeline.prepare_latents(
+                        None,  # image not used
+                        static_videos=static_videos,
+                        hand_videos=hand_videos,
+                        batch_size=batch_size,
+                        num_frames=num_frames,
+                        height=height * VAE_SCALE_FACTOR_SPATIAL,
+                        width=width * VAE_SCALE_FACTOR_SPATIAL,
+                        dtype=weight_dtype,
+                        device=accelerator.device,
+                        generator=None,
+                    )
+                    
+                    # Check if we need to use mask (VideoX-Fun-InP compatible)
+                    total_condition_channels = static_videos_latents.shape[2] + hand_video_latents.shape[2]
+                    use_mask = transformer_config.in_channels == (noisy_model_input.shape[2] + total_condition_channels + 1)
+                    if use_mask:  # VideoX-Fun-InP compatible
+                        mask_input = torch.ones_like(noisy_model_input[:, :, :1])
+                        transformer_input = torch.cat([noisy_model_input, mask_input, static_videos_latents, hand_video_latents], dim=2)
+                    else:
+                        # Concatenate both condition latents with noisy model input for transformer
+                        transformer_input = torch.cat([noisy_model_input, static_videos_latents, hand_video_latents], dim=2)
                     condition_latents = None
                     
-            elif pipeline_config["type"] == "cogvideox_static_to_video":
-                # For static-to-video pipeline, use static videos as condition
-                # Use the pipeline's prepare_latents method
-                _, static_videos_latents = pipeline.prepare_latents(
-                    None,  # image not used
-                    static_videos=static_videos,
-                    batch_size=batch_size,
-                    num_frames=num_frames,
-                    height=height * VAE_SCALE_FACTOR_SPATIAL,
-                    width=width * VAE_SCALE_FACTOR_SPATIAL,
-                    dtype=weight_dtype,
-                    device=accelerator.device,
-                    generator=None,
-                )
-                
-                # Check if we need to use mask (VideoX-Fun-InP compatible)
-                use_mask = transformer_config.in_channels == (noisy_model_input.shape[2] + static_videos_latents.shape[2] + 1)
-                if use_mask:  # VideoX-Fun-InP compatible
-                    mask_input = torch.ones_like(noisy_model_input[:, :, :1])
+                elif pipeline_config["type"] == "cogvideox_fun_static_to_video":
+                    # For VideoX-Fun static-to-video pipeline, use static video as condition
+                    # Training loop: static_videos are already in latent space
+                    static_videos_latents = static_videos.to(device=accelerator.device, dtype=weight_dtype)
+                    static_videos_latents = static_videos_latents * VAE_SCALING_FACTOR
+                    hand_video_latents = None
+
+                    # VideoX-Fun always uses mask (zeros for static video conditioning)
+                    mask_input = torch.ones_like(noisy_model_input[:, :, :1]) * VAE_SCALING_FACTOR
                     transformer_input = torch.cat([noisy_model_input, mask_input, static_videos_latents], dim=2)
-                else:
-                    # Concatenate static video latents with noisy model input for transformer
-                    transformer_input = torch.cat([noisy_model_input, static_videos_latents], dim=2)
-                condition_latents = None
-                
-            elif pipeline_config["type"] == "cogvideox_static_to_video_pose_concat":
-                # For static-to-video pose concat pipeline, use both static and hand videos as conditions
-                # Use the pipeline's prepare_latents method
-                _, static_videos_latents, hand_video_latents = pipeline.prepare_latents(
-                    None,  # image not used
-                    static_videos=static_videos,
-                    hand_videos=hand_videos,
-                    batch_size=batch_size,
-                    num_frames=num_frames,
-                    height=height * VAE_SCALE_FACTOR_SPATIAL,
-                    width=width * VAE_SCALE_FACTOR_SPATIAL,
-                    dtype=weight_dtype,
-                    device=accelerator.device,
-                    generator=None,
-                )
-                
-                # Check if we need to use mask (VideoX-Fun-InP compatible)
-                total_condition_channels = static_videos_latents.shape[2] + hand_video_latents.shape[2]
-                use_mask = transformer_config.in_channels == (noisy_model_input.shape[2] + total_condition_channels + 1)
-                if use_mask:  # VideoX-Fun-InP compatible
-                    mask_input = torch.ones_like(noisy_model_input[:, :, :1])
-                    transformer_input = torch.cat([noisy_model_input, mask_input, static_videos_latents, hand_video_latents], dim=2)
-                else:
-                    # Concatenate both condition latents with noisy model input for transformer
-                    transformer_input = torch.cat([noisy_model_input, static_videos_latents, hand_video_latents], dim=2)
-                condition_latents = None
-                
-            elif pipeline_config["type"] == "cogvideox_fun_static_to_video":
-                # For VideoX-Fun static-to-video pipeline, use static videos as condition
-                # Use the pipeline's prepare_latents method
-                _, static_videos_latents = pipeline.prepare_latents(
-                    batch_size=batch_size,
-                    num_channels_latents=transformer_config.original_in_channels,
-                    height=height * VAE_SCALE_FACTOR_SPATIAL,
-                    width=width * VAE_SCALE_FACTOR_SPATIAL,
-                    video_length=num_frames,
-                    dtype=weight_dtype,
-                    device=accelerator.device,
-                    generator=None,
-                    static_videos=static_videos,
-                    return_video_latents=True,
-                )
-                
-                # VideoX-Fun always uses mask (zeros for static video conditioning)
-                mask_input = torch.zeros_like(noisy_model_input[:, :, :1])
-                transformer_input = torch.cat([noisy_model_input, mask_input, static_videos_latents], dim=2)
-                condition_latents = None
-                
-            elif pipeline_config["type"] == "cogvideox_fun_static_to_video_pose_concat":
-                # For VideoX-Fun static-to-video pose concat pipeline, use both static and hand videos as conditions
-                # Use the pipeline's prepare_latents method
-                _, static_videos_latents, hand_video_latents = pipeline.prepare_latents(
-                    batch_size=batch_size,
-                    num_channels_latents=transformer_config.original_in_channels,
-                    height=height * VAE_SCALE_FACTOR_SPATIAL,
-                    width=width * VAE_SCALE_FACTOR_SPATIAL,
-                    video_length=num_frames,
-                    dtype=weight_dtype,
-                    device=accelerator.device,
-                    generator=None,
-                    static_videos=static_videos,
-                    hand_videos=hand_videos,
-                    return_video_latents=True,
-                )
-                
-                # VideoX-Fun always uses mask (zeros for static video conditioning)
-                mask_input = torch.zeros_like(noisy_model_input[:, :, :1])
-                transformer_input = torch.cat([noisy_model_input, mask_input, static_videos_latents, hand_video_latents], dim=2)
-                condition_latents = None
-
-            # Predict the noise residual
-            if pipeline_config["type"] == "cogvideox_i2v":
-                # For basic I2V pipeline, use standard transformer forward
-                model_output = transformer(
-                    hidden_states=transformer_input,
-                    encoder_hidden_states=prompt_embeds,
-                    timestep=timesteps,
-                    image_rotary_emb=image_rotary_emb,
-                    return_dict=False,
-                )[0]
-                
-            elif pipeline_config["type"] == "cogvideox_pose_concat":
-                model_output = transformer(
-                    hidden_states=transformer_input,
-                    encoder_hidden_states=prompt_embeds,
-                    timestep=timesteps,
-                    image_rotary_emb=image_rotary_emb,
-                    return_dict=False,
-                )[0]
-            elif pipeline_config["type"] == "cogvideox_pose_adapter":
-                # For adapter pipeline, use the transformer's forward method with conditions
-                if condition_latents is not None:
-                    model_output = transformer(
-                        hidden_states=transformer_input,
-                        encoder_hidden_states=prompt_embeds,
-                        timestep=timesteps,
-                        image_rotary_emb=image_rotary_emb,
-                        hand_conditions=condition_latents["hand_videos_latents"],
-                        static_conditions=condition_latents["static_videos_latents"],
-                        return_dict=False,
-                    )[0]
-                else:
-                    model_output = transformer(
-                        hidden_states=transformer_input,
-                        encoder_hidden_states=prompt_embeds,
-                        timestep=timesteps,
-                        image_rotary_emb=image_rotary_emb,
-                        return_dict=False,
-                    )[0]
-            elif pipeline_config["type"] in ["cogvideox_pose_adaln", "cogvideox_pose_adaln_perframe"]:
-                # For AdaLN pipeline, use the transformer's forward method with human_motions
-                if condition_latents is not None and "human_motions" in condition_latents:
-                    model_output = transformer(
-                        hidden_states=transformer_input,
-                        encoder_hidden_states=prompt_embeds,
-                        timestep=timesteps,
-                        image_rotary_emb=image_rotary_emb,
-                        pose_params=condition_latents["human_motions"],
-                        return_dict=False,
-                    )[0]
-                else:
-                    model_output = transformer(
-                        hidden_states=transformer_input,
-                        encoder_hidden_states=prompt_embeds,
-                        timestep=timesteps,
-                        image_rotary_emb=image_rotary_emb,
-                        return_dict=False,
-                    )[0]
-            elif pipeline_config["type"] in ["cogvideox_static_to_video", "cogvideox_static_to_video_pose_concat"]:
-                # For static-to-video pipelines, use standard transformer forward (conditions already concatenated)
-                model_output = transformer(
-                    hidden_states=transformer_input,
-                    encoder_hidden_states=prompt_embeds,
-                    timestep=timesteps,
-                    image_rotary_emb=image_rotary_emb,
-                    return_dict=False,
-                )[0]
-            elif pipeline_config["type"] in ["cogvideox_fun_static_to_video", "cogvideox_fun_static_to_video_pose_concat"]:
-                # For VideoX-Fun static-to-video pipelines, use standard transformer forward (conditions already concatenated)
-                model_output = transformer(
-                    hidden_states=transformer_input,
-                    encoder_hidden_states=prompt_embeds,
-                    timestep=timesteps,
-                    image_rotary_emb=image_rotary_emb,
-                    return_dict=False,
-                )[0]
+                    condition_latents = None
                     
+                elif pipeline_config["type"] == "cogvideox_fun_static_to_video_pose_concat":
+                    # For VideoX-Fun static-to-video pose concat pipeline, use both static and hand videos as conditions
+                    # Training loop: static_videos and hand_videos are already in latent space
+                    static_videos_latents = static_videos.to(device=accelerator.device, dtype=weight_dtype)
+                    static_videos_latents = static_videos_latents * VAE_SCALING_FACTOR
+                    hand_video_latents = hand_videos.to(device=accelerator.device, dtype=weight_dtype)
+                    hand_video_latents = hand_video_latents * VAE_SCALING_FACTOR
 
-            model_pred = scheduler.get_velocity(model_output, noisy_model_input, timesteps)
+                    # VideoX-Fun always uses mask (zeros for static video conditioning)
+                    mask_input = torch.ones_like(noisy_model_input[:, :, :1]) * VAE_SCALING_FACTOR
+                    transformer_input = torch.cat([noisy_model_input, mask_input, static_videos_latents, hand_video_latents], dim=2)
+                    condition_latents = None
 
-            weights = 1 / (1 - alphas_cumprod[timesteps])
-            while len(weights.shape) < len(model_pred.shape):
-                weights = weights.unsqueeze(-1)
+                # Predict the noise residual
+                if pipeline_config["type"] == "cogvideox_i2v":
+                    # For basic I2V pipeline, use standard transformer forward
+                    model_output = transformer(
+                        hidden_states=transformer_input,
+                        encoder_hidden_states=prompt_embeds,
+                        timestep=timesteps,
+                        image_rotary_emb=image_rotary_emb,
+                        return_dict=False,
+                    )[0]
+                    
+                elif pipeline_config["type"] == "cogvideox_pose_concat":
+                    model_output = transformer(
+                        hidden_states=transformer_input,
+                        encoder_hidden_states=prompt_embeds,
+                        timestep=timesteps,
+                        image_rotary_emb=image_rotary_emb,
+                        return_dict=False,
+                    )[0]
+                elif pipeline_config["type"] == "cogvideox_pose_adapter":
+                    # For adapter pipeline, use the transformer's forward method with conditions
+                    if condition_latents is not None:
+                        model_output = transformer(
+                            hidden_states=transformer_input,
+                            encoder_hidden_states=prompt_embeds,
+                            timestep=timesteps,
+                            image_rotary_emb=image_rotary_emb,
+                            hand_conditions=condition_latents["hand_videos_latents"],
+                            static_conditions=condition_latents["static_videos_latents"],
+                            return_dict=False,
+                        )[0]
+                    else:
+                        model_output = transformer(
+                            hidden_states=transformer_input,
+                            encoder_hidden_states=prompt_embeds,
+                            timestep=timesteps,
+                            image_rotary_emb=image_rotary_emb,
+                            return_dict=False,
+                        )[0]
+                elif pipeline_config["type"] in ["cogvideox_pose_adaln", "cogvideox_pose_adaln_perframe"]:
+                    # For AdaLN pipeline, use the transformer's forward method with human_motions
+                    if condition_latents is not None and "human_motions" in condition_latents:
+                        model_output = transformer(
+                            hidden_states=transformer_input,
+                            encoder_hidden_states=prompt_embeds,
+                            timestep=timesteps,
+                            image_rotary_emb=image_rotary_emb,
+                            pose_params=condition_latents["human_motions"],
+                            return_dict=False,
+                        )[0]
+                    else:
+                        model_output = transformer(
+                            hidden_states=transformer_input,
+                            encoder_hidden_states=prompt_embeds,
+                            timestep=timesteps,
+                            image_rotary_emb=image_rotary_emb,
+                            return_dict=False,
+                        )[0]
+                elif pipeline_config["type"] in ["cogvideox_static_to_video", "cogvideox_static_to_video_pose_concat"]:
+                    # For static-to-video pipelines, use standard transformer forward (conditions already concatenated)
+                    model_output = transformer(
+                        hidden_states=transformer_input,
+                        encoder_hidden_states=prompt_embeds,
+                        timestep=timesteps,
+                        image_rotary_emb=image_rotary_emb,
+                        return_dict=False,
+                    )[0]
+                elif pipeline_config["type"] in ["cogvideox_fun_static_to_video", "cogvideox_fun_static_to_video_pose_concat"]:
+                    # For VideoX-Fun static-to-video pipelines, use standard transformer forward (conditions already concatenated)
+                    model_output = transformer(
+                        hidden_states=transformer_input,
+                        encoder_hidden_states=prompt_embeds,
+                        timestep=timesteps,
+                        image_rotary_emb=image_rotary_emb,
+                        return_dict=False,
+                    )[0]
+                        
 
-            target = model_input
+                model_pred = scheduler.get_velocity(model_output, noisy_model_input, timesteps)
 
-            # Ensure model_pred and target have the same shape for loss calculation
-            # For pose concat pipeline, model_pred includes condition channels, so we need to extract only the video part
-            if pipeline_config["type"] == "cogvideox_i2v":
-                # For basic I2V pipeline, model_pred is already the correct shape
-                pass
-            elif pipeline_config["type"] == "cogvideox_pose_concat":
-                # Extract only the video part (first original_in_channels channels)
-                model_pred = model_pred[:, :, :transformer_config.original_in_channels, :, :]
-            elif pipeline_config["type"] == "cogvideox_pose_adapter":
-                # For adapter pipeline, model_pred is already the correct shape
-                pass
-            elif pipeline_config["type"] in ["cogvideox_pose_adaln", "cogvideox_pose_adaln_perframe"]:
-                # For AdaLN pipeline, model_pred is already the correct shape
-                pass
-            elif pipeline_config["type"] in ["cogvideox_static_to_video", "cogvideox_static_to_video_pose_concat"]:
-                # For static-to-video pipelines, model_pred is already the correct shape
-                pass
-            elif pipeline_config["type"] in ["cogvideox_fun_static_to_video", "cogvideox_fun_static_to_video_pose_concat"]:
-                # For VideoX-Fun static-to-video pipelines, model_pred is already the correct shape
-                pass
+                weights = 1 / (1 - alphas_cumprod[timesteps])
+                while len(weights.shape) < len(model_pred.shape):
+                    weights = weights.unsqueeze(-1)
 
-            loss = torch.mean(
-                (weights * (model_pred - target) ** 2).reshape(batch_size, -1),
-                dim=1,
-            )
-            loss = loss.mean()
-            accelerator.backward(loss)
+                target = model_input
 
-            if accelerator.sync_gradients and accelerator.distributed_type != DistributedType.DEEPSPEED:
-                gradient_norm_before_clip = get_gradient_norm(transformer.parameters())
-                accelerator.clip_grad_norm_(transformer.parameters(), training_config.get("max_grad_norm", 1.0))
-                gradient_norm_after_clip = get_gradient_norm(transformer.parameters())
+                loss = torch.mean(
+                    (weights * (model_pred - target) ** 2).reshape(batch_size, -1),
+                    dim=1,
+                )
+                loss = loss.mean()
+                accelerator.backward(loss)
+
+                if accelerator.sync_gradients and accelerator.distributed_type != DistributedType.DEEPSPEED:
+                    gradient_norm_before_clip = get_gradient_norm(transformer.parameters())
+                    accelerator.clip_grad_norm_(transformer.parameters(), training_config.get("max_grad_norm", 1.0))
+                    gradient_norm_after_clip = get_gradient_norm(transformer.parameters())
+                    logs.update(
+                        {
+                            "gradient_norm_before_clip": gradient_norm_before_clip,
+                            "gradient_norm_after_clip": gradient_norm_after_clip,
+                        }
+                    )
+
+                if accelerator.state.deepspeed_plugin is None:
+                    optimizer.step()
+                    optimizer.zero_grad()
+
+                if lr_scheduler is not None and not training_config.get("custom_settings", {}).get("use_cpu_offload_optimizer", False):
+                    lr_scheduler.step()
+
+            # Checks if the accelerator has performed an optimization step behind the scenes
+            if accelerator.sync_gradients:
+                progress_bar.update(1)
+                global_step += 1
+
+                # Log metrics
+                last_lr = lr_scheduler.get_last_lr()[0] if lr_scheduler is not None else training_config["learning_rate"]
                 logs.update(
                     {
-                        "gradient_norm_before_clip": gradient_norm_before_clip,
-                        "gradient_norm_after_clip": gradient_norm_after_clip,
+                        "loss": loss.detach().item(),
+                        "lr": last_lr,
+                        "epoch": current_epoch,
+                        "step": global_step,
                     }
                 )
+                progress_bar.set_postfix(**logs)
+                accelerator.log(logs, step=global_step)
 
-            if accelerator.state.deepspeed_plugin is None:
-                optimizer.step()
-                optimizer.zero_grad()
+                # Save checkpoint
+                checkpointing_steps = training_config.get("custom_settings", {}).get("checkpointing_steps", 500)
+                optimizer_checkpointing_steps = training_config.get("custom_settings", {}).get("optimizer_checkpointing_steps", checkpointing_steps * 2)
+                validation_steps = data_config.get("validation_steps", 500)
+                init_validation_steps = data_config.get("init_validation_steps", 100)
+                max_validation_steps = data_config.get("max_validation_steps", validation_steps * 2)
+                if global_step % checkpointing_steps == 0:
+                    if accelerator.is_main_process or accelerator.distributed_type == DistributedType.DEEPSPEED:
+                        # Determine if we should save optimizer state
+                        save_optimizer = global_step % optimizer_checkpointing_steps == 0
+                        
+                        # Check if we need to remove old checkpoints
+                        if training_config.get("custom_settings", {}).get("checkpoints_total_limit") is not None:
+                            checkpoints = os.listdir(experiment_config["output_dir"])
+                            checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
+                            checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
 
-            if lr_scheduler is not None and not training_config.get("custom_settings", {}).get("use_cpu_offload_optimizer", False):
-                lr_scheduler.step()
+                            if len(checkpoints) >= training_config["custom_settings"]["checkpoints_total_limit"]:
+                                num_to_remove = len(checkpoints) - training_config["custom_settings"]["checkpoints_total_limit"] + 1
+                                removing_checkpoints = checkpoints[0:num_to_remove]
 
-        # Checks if the accelerator has performed an optimization step behind the scenes
-        if accelerator.sync_gradients:
-            progress_bar.update(1)
-            global_step += 1
+                                logger.info(
+                                    f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
+                                )
+                                logger.info(f"Removing checkpoints: {', '.join(removing_checkpoints)}")
 
-            # Log metrics
-            last_lr = lr_scheduler.get_last_lr()[0] if lr_scheduler is not None else training_config["learning_rate"]
-            logs.update(
-                {
-                    "loss": loss.detach().item(),
-                    "lr": last_lr,
-                    "epoch": current_epoch,
-                    "step": global_step,
-                }
-            )
-            progress_bar.set_postfix(**logs)
-            accelerator.log(logs, step=global_step)
+                                for removing_checkpoint in removing_checkpoints:
+                                    removing_checkpoint = os.path.join(experiment_config["output_dir"], removing_checkpoint)
+                                    shutil.rmtree(removing_checkpoint)
 
-            # Save checkpoint
-            if global_step % training_config.get("custom_settings", {}).get("checkpointing_steps", 500) == 0:
-                if accelerator.is_main_process or accelerator.distributed_type == DistributedType.DEEPSPEED:
-                    # Check if we need to remove old checkpoints
-                    if training_config.get("custom_settings", {}).get("checkpoints_total_limit") is not None:
-                        checkpoints = os.listdir(experiment_config["output_dir"])
-                        checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
-                        checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
+                        save_path = os.path.join(experiment_config["output_dir"], f"checkpoint-{global_step}")
+                        
+                        # Save checkpoint with memory optimization
+                        try:
+                            if save_optimizer:
+                                logger.info(f"💾 Saving full checkpoint (including optimizer) to {save_path}")
+                                accelerator.save_state(save_path)
+                            else:
+                                logger.info(f"💾 Saving model-only checkpoint (no optimizer) to {save_path}")
+                                # For DeepSpeed, we need to handle model-only saving differently
+                                if hasattr(accelerator.state, 'deepspeed_plugin') and accelerator.state.deepspeed_plugin is not None:
+                                    # DeepSpeed doesn't support save_optimizer parameter
+                                    # Save only the model weights
+                                    unwrapped_model = accelerator.unwrap_model(transformer)
+                                    unwrapped_model.save_pretrained(save_path)
+                                    logger.info(f"💾 Saved model weights only (DeepSpeed compatible) to {save_path}")
+                                else:
+                                    # For non-DeepSpeed, use the original method
+                                    accelerator.save_state(save_path, save_optimizer=False)
+                            logger.info(f"✅ Saved state to {save_path}")
+                        except RuntimeError as e:
+                            if "out of memory" in str(e).lower():
+                                logger.warning(f"⚠️ OOM during checkpoint save, retrying with CPU offload...")
+                                # Additional cleanup and retry
+                                gc.collect()
+                                torch.cuda.empty_cache()
+                                torch.cuda.synchronize(accelerator.device)
+                                
+                                # Try saving again
+                                if save_optimizer:
+                                    accelerator.save_state(save_path)
+                                else:
+                                    accelerator.save_state(save_path, save_optimizer=False)
+                                logger.info(f"✅ Saved state to {save_path} (after retry)")
+                            else:
+                                raise e
+                        
+                        # Clean up after checkpoint save
+                        gc.collect()
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize(accelerator.device)
 
-                        if len(checkpoints) >= training_config["custom_settings"]["checkpoints_total_limit"]:
-                            num_to_remove = len(checkpoints) - training_config["custom_settings"]["checkpoints_total_limit"] + 1
-                            removing_checkpoints = checkpoints[0:num_to_remove]
-
-                            logger.info(
-                                f"{len(checkpoints)} checkpoints already exist, removing {len(removing_checkpoints)} checkpoints"
-                            )
-                            logger.info(f"Removing checkpoints: {', '.join(removing_checkpoints)}")
-
-                            for removing_checkpoint in removing_checkpoints:
-                                removing_checkpoint = os.path.join(experiment_config["output_dir"], removing_checkpoint)
-                                shutil.rmtree(removing_checkpoint)
-
-                    save_path = os.path.join(experiment_config["output_dir"], f"checkpoint-{global_step}")
-                    accelerator.save_state(save_path)
-                    logger.info(f"Saved state to {save_path}")
-
-            # Validation during training steps
-            should_run_validation = data_config.get("validation_set") is not None and (
-                data_config.get("validation_steps") is not None and 
-                global_step % data_config["validation_steps"] == 0
-            )
-            if should_run_validation:
-                logger.info(f"Running validation at step {global_step}")
-                run_validation(
-                    config=config,
-                    accelerator=accelerator,
-                    transformer=transformer,
-                    scheduler=scheduler,
-                    model_config=transformer_config,
-                    weight_dtype=weight_dtype,
-                    step=global_step
+                # Validation during training steps
+                should_run_validation = data_config.get("validation_set") is not None and (
+                    (global_step % init_validation_steps == 0 and global_step < optimizer_checkpointing_steps) 
+                    or
+                    global_step % validation_steps == 0
                 )
+                should_run_max_validation = global_step % max_validation_steps == 0
+                if should_run_validation:
+                    logger.info(f"Running validation at step {global_step}")
+                    run_validation(
+                        config=config,
+                        accelerator=accelerator,
+                        transformer=transformer,
+                        scheduler=scheduler,
+                        model_config=transformer_config,
+                        weight_dtype=weight_dtype,
+                        step=global_step,
+                        should_run_max_validation=should_run_max_validation
+                    )
 
 
-            # Check if we've reached max_train_steps
-            if global_step >= max_train_steps:
-                break
+                # Check if we've reached max_train_steps
+                if global_step >= max_train_steps:
+                    break
 
-        # Run validation at the end of each epoch (all GPUs participate)
-        should_run_validation = data_config.get("validation_set") is not None and (
-            data_config.get("validation_epochs") is not None and 
-            (current_epoch + 1) % data_config["validation_epochs"] == 0
-        )
-        if should_run_validation:
-            logger.info(f"Running validation at end of epoch {current_epoch + 1}")
-            run_validation(
-                config=config,
-                accelerator=accelerator,
-                transformer=transformer,
-                scheduler=scheduler,
-                model_config=transformer_config,
-                weight_dtype=weight_dtype,
-                step=global_step
-            )
-    
     accelerator.wait_for_everyone()
     
     # Save final model
