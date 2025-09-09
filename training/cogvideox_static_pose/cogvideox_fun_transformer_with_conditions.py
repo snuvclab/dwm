@@ -43,6 +43,77 @@ class CogVideoXFunTransformer3DModel(CogVideoXTransformer3DModel):
         self.add_noise_in_inpaint_model = kwargs.pop("add_noise_in_inpaint_model", False)
         super().__init__(*args, **kwargs)
     
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path=None,
+        base_model_name_or_path="alibaba-pai/CogVideoX-Fun-V1.1-5b-InP",
+        subfolder="transformer",
+        **kwargs
+    ):
+        """
+        Load a CogVideoXFunTransformer3DModel from a pretrained model.
+
+        Args:
+            pretrained_model_name_or_path (str): Fine-tuned checkpoint path
+            base_model_name_or_path (str): Base CogVideoX-Fun model path
+        """
+        if pretrained_model_name_or_path is not None:
+            # === Load fine-tuned checkpoint ===
+            print(f"📥 Loading fine-tuned VideoX-Fun transformer: {pretrained_model_name_or_path}")
+
+            # 1) Create child class structure first
+            config_path = os.path.join(pretrained_model_name_or_path, subfolder, "config.json")
+            if os.path.exists(config_path):
+                import json
+                with open(config_path, "r") as f:
+                    config = json.load(f)
+                model = cls(**config)
+            else:
+                # Use base config
+                model = cls()
+
+            # 2) Load checkpoint state_dict directly
+            state_dict_path = os.path.join(pretrained_model_name_or_path, subfolder, "diffusion_pytorch_model.safetensors")
+            if not os.path.exists(state_dict_path):
+                # Try alternative paths
+                state_dict_path = os.path.join(pretrained_model_name_or_path, subfolder, "pytorch_model.bin")
+                if not os.path.exists(state_dict_path):
+                    raise FileNotFoundError(f"No model file found in {pretrained_model_name_or_path}")
+            
+            if state_dict_path.endswith(".safetensors"):
+                from safetensors.torch import load_file
+                state_dict = load_file(state_dict_path)
+            else:
+                state_dict = torch.load(state_dict_path, map_location="cpu")
+
+            # 3) Load with strict=False for flexibility
+            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            if missing:
+                print(f"⚠️ Missing keys (new layers, need initialization during training): {missing}")
+            if unexpected:
+                print(f"⚠️ Unexpected keys (replaced layers, etc.): {unexpected}")
+
+            return model
+
+        else:
+            # === Initialize from base model ===
+            print(f"🔧 Initializing from base model: {base_model_name_or_path}")
+            # First load the base CogVideoX transformer
+            base_model = CogVideoXTransformer3DModel.from_pretrained(
+                base_model_name_or_path,
+                subfolder=subfolder,
+                torch_dtype=kwargs.get("torch_dtype", torch.bfloat16),
+                revision=kwargs.get("revision", None),
+                variant=kwargs.get("variant", None),
+            )
+            
+            # Then create CogVideoXFun transformer and copy state_dict
+            fun_model = CogVideoXFunTransformer3DModel(**base_model.config)
+            fun_model.load_state_dict(base_model.state_dict())
+            
+            return fun_model
+    
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -180,7 +251,6 @@ class CogVideoXFunTransformer3DModelWithConcat(CogVideoXFunTransformer3DModel):
         original_in_channels = kwargs.get("in_channels", 16)
         self.original_in_channels = original_in_channels
         
-        # Accept VideoX-Fun specific parameters but don't use them
         self.add_noise_in_inpaint_model = kwargs.pop("add_noise_in_inpaint_model", False)
         
         super().__init__(*args, **kwargs)

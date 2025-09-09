@@ -63,6 +63,10 @@ class ExperimentConfigLoader:
         if "adapter" in experiment_config:
             merged["adapter"] = {**merged.get("adapter", {}), **experiment_config["adapter"]}
         
+        # Merge pipeline settings (experiment config can override pipeline defaults)
+        if "pipeline" in experiment_config:
+            merged["pipeline"] = {**merged.get("pipeline", {}), **experiment_config["pipeline"]}
+        
         # Add experiment metadata
         merged["experiment"] = experiment_config.get("experiment", {})
         merged["data"] = experiment_config.get("data", {})
@@ -89,8 +93,19 @@ class ExperimentConfigLoader:
         
         # Validate pipeline type
         pipeline_type = config["pipeline"]["type"]
-        if pipeline_type not in ["cogvideox_pose", "cogvideox_pose_adapter"]:
-            raise ValueError(f"Unsupported pipeline type: {pipeline_type}")
+        supported_pipeline_types = [
+            "cogvideox_i2v",
+            "cogvideox_pose_concat",
+            "cogvideox_pose_adapter",
+            "cogvideox_pose_adaln",
+            "cogvideox_pose_adaln_perframe",
+            "cogvideox_static_to_video",
+            "cogvideox_static_to_video_pose_concat",
+            "cogvideox_fun_static_to_video",
+            "cogvideox_fun_static_to_video_pose_concat"
+        ]
+        if pipeline_type not in supported_pipeline_types:
+            raise ValueError(f"Unsupported pipeline type: {pipeline_type}. Supported types: {supported_pipeline_types}")
         
         print("✅ Configuration validation passed")
         return True
@@ -164,7 +179,10 @@ class ExperimentConfigLoader:
         print(f"\n🚀 Training Mode: {training.get('mode', 'Unknown')}")
         print(f"   Learning Rate: {training.get('learning_rate', 'Unknown')}")
         print(f"   Batch Size: {training.get('batch_size', 'Unknown')}")
-        print(f"   Epochs: {training.get('num_epochs', 'Unknown')}")
+        if 'max_train_steps' in training:
+            print(f"   Max Train Steps: {training.get('max_train_steps', 'Unknown')}")
+        else:
+            print(f"   Epochs: {training.get('num_epochs', 'Unknown')}")
         
         # Adapter info (if applicable)
         if "adapter" in config:

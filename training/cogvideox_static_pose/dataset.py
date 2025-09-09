@@ -1,4 +1,5 @@
 import random
+import logging
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -6,7 +7,6 @@ import numpy as np
 import pandas as pd
 import torch
 import torchvision.transforms as TT
-from accelerate.logging import get_logger
 from torch.utils.data import Dataset, Sampler
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
@@ -19,7 +19,14 @@ import decord  # isort:skip
 
 decord.bridge.set_bridge("torch")
 
-logger = get_logger(__name__)
+# Set up logging
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
 
 HEIGHT_BUCKETS = [256, 320, 384, 480, 512, 576, 720, 768, 960, 1024, 1280, 1536]
 WIDTH_BUCKETS = [256, 320, 384, 480, 512, 576, 720, 768, 960, 1024, 1280, 1536]
@@ -56,7 +63,15 @@ class VideoDataset(Dataset):
         self.load_tensors = load_tensors
         self.random_flip = random_flip
         self.image_to_video = image_to_video
-
+        
+        # Ensure buckets are lists
+        if not isinstance(self.height_buckets, list):
+            self.height_buckets = [self.height_buckets]
+        if not isinstance(self.width_buckets, list):
+            self.width_buckets = [self.width_buckets]
+        if not isinstance(self.frame_buckets, list):
+            self.frame_buckets = [self.frame_buckets]
+        
         self.resolutions = [
             (f, h, w) for h in self.height_buckets for w in self.width_buckets for f in self.frame_buckets
         ]
@@ -118,6 +133,13 @@ class VideoDataset(Dataset):
             # that data is not loaded a second time. PRs are welcome for improvements.
             return index
 
+        # Handle index out of range with mod operation to prevent training interruption
+        original_index = index
+        if index >= len(self.video_paths):
+            logger.warning(f"Index {index} is out of range (dataset size: {len(self.video_paths)}). Using mod operation: {index} % {len(self.video_paths)} = {index % len(self.video_paths)}")
+            index = index % len(self.video_paths)
+
+        # try:
         if self.load_tensors:
             image_latents, video_latents, prompt_embeds = self._preprocess_video(self.video_paths[index])
 
@@ -156,6 +178,19 @@ class VideoDataset(Dataset):
                     "width": video.shape[3],
                 },
             }
+        # except Exception as e:
+        #     logger.error(f"Failed to load main video data for index {index}: {e}")
+        #     # Return a minimal valid data structure to prevent training from crashing
+        #     return {
+        #         "prompt": "ERROR_LOADING_DATA",
+        #         "image": None,
+        #         "video": torch.zeros(1, 3, 16, 256, 256),  # Dummy video tensor
+        #         "video_metadata": {
+        #             "num_frames": 16,
+        #             "height": 256,
+        #             "width": 256,
+        #         },
+        #     }
 
     def _load_dataset_from_local_path(self) -> Tuple[List[str], List[str]]:
         if not self.data_root.exists():
@@ -198,7 +233,6 @@ class VideoDataset(Dataset):
     def _load_dataset_from_datafile(self) -> Tuple[List[str], List[str]]:
         with open(self.data_root / self.dataset_file, "r") as f:
             video_paths = [self.data_root.joinpath(line.strip()) for line in f.readlines() if len(line.strip()) > 0]
-        video_paths = [self.data_root.joinpath(path) for path in video_paths]
         prompt_paths = [path.parent.parent.joinpath("prompts", path.name.replace(".mp4", ".txt")) for path in video_paths]
         prompts = [path.read_text() for path in prompt_paths]
 
@@ -215,62 +249,86 @@ class VideoDataset(Dataset):
         F, C, H and W are the frames, channels, height and width of the latent, and S, D are the sequence length
         and embedding dimension of prompt embeddings.
         """
-        if self.load_tensors:
-            return self._load_preprocessed_latents_and_embeds(path)
-        else:
-            video_reader = decord.VideoReader(uri=path.as_posix())
-            video_num_frames = len(video_reader)
+        try:
+            if self.load_tensors:
+                return self._load_preprocessed_latents_and_embeds(path)
+            else:
+                video_reader = decord.VideoReader(uri=path.as_posix())
+                video_num_frames = len(video_reader)
 
-            indices = list(range(0, video_num_frames, video_num_frames // self.max_num_frames))
-            frames = video_reader.get_batch(indices)
-            frames = frames[: self.max_num_frames].float()
-            frames = frames.permute(0, 3, 1, 2).contiguous()
-            frames = torch.stack([self.video_transforms(frame) for frame in frames], dim=0)
+                indices = list(range(0, video_num_frames, video_num_frames // self.max_num_frames))
+                frames = video_reader.get_batch(indices)
+                frames = frames[: self.max_num_frames].float()
+                frames = frames.permute(0, 3, 1, 2).contiguous()
+                frames = torch.stack([self.video_transforms(frame) for frame in frames], dim=0)
 
-            image = frames[:1].clone() if self.image_to_video else None
+                image = frames[:1].clone() if self.image_to_video else None
 
-            return image, frames, None
+                return image, frames, None
+        except Exception as e:
+            logger.error(f"Failed to preprocess video {path}: {e}")
+            raise e
 
     def _load_preprocessed_latents_and_embeds(self, path: Path) -> Tuple[torch.Tensor, torch.Tensor]:
-        filename_without_ext = path.name.split(".")[0]
-        pt_filename = f"{filename_without_ext}.pt"
+        try:
+            filename_without_ext = path.name.split(".")[0]
+            pt_filename = f"{filename_without_ext}.pt"
 
-        # The current path is something like: /a/b/c/d/videos/00001.mp4
-        # We need to reach: /a/b/c/d/video_latents/00001.pt
-        image_latents_path = path.parent.parent.joinpath("image_latents")
-        video_latents_path = path.parent.parent.joinpath("video_latents")
-        embeds_path = path.parent.parent.joinpath("prompt_embeds")
+            # The current path is something like: /a/b/c/d/videos/00001.mp4
+            # We need to reach: /a/b/c/d/video_latents/00001.pt
+            image_latents_path = path.parent.parent.joinpath("image_latents")
+            video_latents_path = path.parent.parent.joinpath("video_latents")
+            embeds_path = path.parent.parent.joinpath("prompt_embeds")
 
-        if (
-            not video_latents_path.exists()
-            or not embeds_path.exists()
-            or (self.image_to_video and not image_latents_path.exists())
-        ):
-            raise ValueError(
-                f"When setting the load_tensors parameter to `True`, it is expected that the `{self.data_root=}` contains two folders named `video_latents` and `prompt_embeds`. However, these folders were not found. Please make sure to have prepared your data correctly using `prepare_data.py`. Additionally, if you're training image-to-video, it is expected that an `image_latents` folder is also present."
-            )
+            if (
+                not video_latents_path.exists()
+                or not embeds_path.exists()
+                or (self.image_to_video and not image_latents_path.exists())
+            ):
+                logger.error(f"Required folders not found for {path}")
+                logger.error(f"video_latents_path exists: {video_latents_path.exists()}")
+                logger.error(f"embeds_path exists: {embeds_path.exists()}")
+                if self.image_to_video:
+                    logger.error(f"image_latents_path exists: {image_latents_path.exists()}")
+                raise ValueError(
+                    f"When setting the load_tensors parameter to `True`, it is expected that the `{self.data_root=}` contains two folders named `video_latents` and `prompt_embeds`. However, these folders were not found. Please make sure to have prepared your data correctly using `prepare_data.py`. Additionally, if you're training image-to-video, it is expected that an `image_latents` folder is also present."
+                )
 
-        if self.image_to_video:
-            image_latent_filepath = image_latents_path.joinpath(pt_filename)
-        video_latent_filepath = video_latents_path.joinpath(pt_filename)
-        embeds_filepath = embeds_path.joinpath(pt_filename)
-
-        if not video_latent_filepath.is_file() or not embeds_filepath.is_file():
             if self.image_to_video:
-                image_latent_filepath = image_latent_filepath.as_posix()
-            video_latent_filepath = video_latent_filepath.as_posix()
-            embeds_filepath = embeds_filepath.as_posix()
-            raise ValueError(
-                f"The file {video_latent_filepath=} or {embeds_filepath=} could not be found. Please ensure that you've correctly executed `prepare_dataset.py`."
-            )
+                image_latent_filepath = image_latents_path.joinpath(pt_filename)
+            video_latent_filepath = video_latents_path.joinpath(pt_filename)
+            embeds_filepath = embeds_path.joinpath(pt_filename)
 
-        images = (
-            torch.load(image_latent_filepath, map_location="cpu", weights_only=True) if self.image_to_video else None
-        )
-        latents = torch.load(video_latent_filepath, map_location="cpu", weights_only=True)
-        embeds = torch.load(embeds_filepath, map_location="cpu", weights_only=True)
+            if not video_latent_filepath.is_file() or not embeds_filepath.is_file():
+                if self.image_to_video:
+                    image_latent_filepath = image_latent_filepath.as_posix()
+                video_latent_filepath = video_latent_filepath.as_posix()
+                embeds_filepath = embeds_filepath.as_posix()
+                logger.error(f"Required files not found:")
+                logger.error(f"video_latent_filepath exists: {Path(video_latent_filepath).exists()}")
+                logger.error(f"embeds_filepath exists: {Path(embeds_filepath).exists()}")
+                raise ValueError(
+                    f"The file {video_latent_filepath=} or {embeds_filepath=} could not be found. Please ensure that you've correctly executed `prepare_dataset.py`."
+                )
 
-        return images, latents, embeds
+            try:
+                images = (
+                    torch.load(image_latent_filepath, map_location="cpu", weights_only=True) if self.image_to_video else None
+                )
+                latents = torch.load(video_latent_filepath, map_location="cpu", weights_only=True)
+                embeds = torch.load(embeds_filepath, map_location="cpu", weights_only=True)
+            except Exception as e:
+                logger.error(f"Failed to load torch files for {path}: {e}")
+                logger.error(f"image_latent_filepath: {image_latent_filepath if self.image_to_video else 'N/A'}")
+                logger.error(f"video_latent_filepath: {video_latent_filepath}")
+                logger.error(f"embeds_filepath: {embeds_filepath}")
+                raise e
+
+            return images, latents, embeds
+            
+        except Exception as e:
+            logger.error(f"Error in _load_preprocessed_latents_and_embeds for {path}: {e}")
+            raise e
 
 
 class VideoDatasetWithConditions(VideoDataset):
@@ -358,56 +416,97 @@ class VideoDatasetWithConditions(VideoDataset):
         if isinstance(index, list):
             return index
 
-        # Get main video data from parent class
-        main_data = super().__getitem__(index)
-        
-        # Load condition videos
-        if self.load_tensors:
-            # Load preprocessed latents for condition videos
-            hand_video_latents = self._load_condition_video_latents(self.hand_video_paths[index], "hand_video_latents")
-            static_video_latents = self._load_condition_video_latents(self.static_video_paths[index], "static_video_latents")
-            main_data["hand_videos"] = hand_video_latents
-            main_data["static_videos"] = static_video_latents
-        else:
-            # Load raw videos for condition videos
-            _, hand_video, _ = self._preprocess_video(self.hand_video_paths[index])
-            _, static_video, _ = self._preprocess_video(self.static_video_paths[index])
+        try:
+            # Get main video data from parent class
+            main_data = super().__getitem__(index)
             
-            main_data["hand_videos"] = hand_video
-            main_data["static_videos"] = static_video
+            # Load condition videos
+            if self.load_tensors:
+                # Load preprocessed latents for condition videos
+                try:
+                    hand_video_latents = self._load_condition_video_latents(self.hand_video_paths[index], "hand_video_latents")
+                    main_data["hand_videos"] = hand_video_latents
+                except Exception as e:
+                    logger.warning(f"Failed to load hand video latents for index {index}: {e}")
+                    main_data["hand_videos"] = None
+                
+                try:
+                    static_video_latents = self._load_condition_video_latents(self.static_video_paths[index], "static_video_latents")
+                    main_data["static_videos"] = static_video_latents
+                except Exception as e:
+                    logger.warning(f"Failed to load static video latents for index {index}: {e}")
+                    main_data["static_videos"] = None
+            else:
+                # Load raw videos for condition videos
+                try:
+                    _, hand_video, _ = self._preprocess_video(self.hand_video_paths[index])
+                    main_data["hand_videos"] = hand_video
+                except Exception as e:
+                    logger.warning(f"Failed to load hand video for index {index}: {e}")
+                    main_data["hand_videos"] = None
+                
+                try:
+                    _, static_video, _ = self._preprocess_video(self.static_video_paths[index])
+                    main_data["static_videos"] = static_video
+                except Exception as e:
+                    logger.warning(f"Failed to load static video for index {index}: {e}")
+                    main_data["static_videos"] = None
 
-        return main_data
+            return main_data
+            
+        except Exception as e:
+            logger.error(f"Failed to load data for index {index}: {e}")
+            # Return a minimal valid data structure to prevent training from crashing
+            # This will be filtered out by the dataloader or training loop
+            return {
+                "prompt": "ERROR_LOADING_DATA",
+                "video": torch.zeros(1, 3, 16, 256, 256),  # Dummy video tensor
+                "hand_videos": None,
+                "static_videos": None,
+                "video_metadata": {
+                    "num_frames": 16,
+                    "height": 256,
+                    "width": 256,
+                }
+            }
 
     def _load_condition_video_latents(self, path: Path, latent_folder: str) -> torch.Tensor:
         """Load preprocessed latents for condition videos."""
-        filename_without_ext = path.name.split(".")[0]
-        pt_filename = f"{filename_without_ext}.pt"
-        
-        # The current path is something like: /a/b/c/sequences/videos_hands/00001.mp4
-        # We need to reach: /a/b/c/processed/hand_video_latents/00001.pt
-        # or: /a/b/c/processed/static_video_latents/00001.pt
-        
-        # Get the sequences directory (parent of the condition folder)
-        sequences_dir = path.parent.parent
-        # Get the action directory (parent of sequences)
-        action_dir = sequences_dir.parent
-        # Construct the latents path
-        latents_path = action_dir / "processed2" / latent_folder
-        
-        if not latents_path.exists():
-            raise ValueError(
-                f"When setting the load_tensors parameter to `True`, it is expected that the `{action_dir=}` contains a folder named `processed2/{latent_folder}`. However, this folder was not found. Please make sure to have prepared your data correctly using `prepare_data.py`."
-            )
-        
-        latent_filepath = latents_path.joinpath(pt_filename)
-        
-        if not latent_filepath.is_file():
-            raise ValueError(
-                f"The file {latent_filepath=} could not be found. Please ensure that you've correctly executed `prepare_dataset.py`."
-            )
-        
-        latents = torch.load(latent_filepath, map_location="cpu", weights_only=True)
-        return latents
+        try:
+            filename_without_ext = path.name.split(".")[0]
+            pt_filename = f"{filename_without_ext}.pt"
+            
+            # The current path is something like: /a/b/c/sequences/videos_hands/00001.mp4
+            # We need to reach: /a/b/c/processed/hand_video_latents/00001.pt
+            # or: /a/b/c/processed/static_video_latents/00001.pt
+            
+            # Get the sequences directory (parent of the condition folder)
+            sequences_dir = path.parent.parent
+            # Get the action directory (parent of sequences)
+            action_dir = sequences_dir.parent
+            # Construct the latents path
+            latents_path = action_dir / "processed2" / latent_folder
+            
+            if not latents_path.exists():
+                logger.warning(f"Latents folder not found: {latents_path}")
+                raise FileNotFoundError(f"Latents folder not found: {latents_path}")
+            
+            latent_filepath = latents_path.joinpath(pt_filename)
+            
+            if not latent_filepath.is_file():
+                logger.warning(f"Latent file not found: {latent_filepath}")
+                raise FileNotFoundError(f"Latent file not found: {latent_filepath}")
+            
+            try:
+                latents = torch.load(latent_filepath, map_location="cpu", weights_only=True)
+                return latents
+            except Exception as e:
+                logger.error(f"Failed to load latent file {latent_filepath}: {e}")
+                raise e
+                
+        except Exception as e:
+            logger.error(f"Error in _load_condition_video_latents for {path} in {latent_folder}: {e}")
+            raise e
 
 
 class VideoDatasetWithConditionsAndResizing(VideoDatasetWithConditions):
@@ -547,6 +646,220 @@ class VideoDatasetWithResizing(VideoDataset):
 
 
 class VideoDatasetWithResizeAndRectangleCrop(VideoDataset):
+    def __init__(self, video_reshape_mode: str = "center", *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.video_reshape_mode = video_reshape_mode
+
+    def _resize_for_rectangle_crop(self, arr, image_size):
+        reshape_mode = self.video_reshape_mode
+        if arr.shape[3] / arr.shape[2] > image_size[1] / image_size[0]:
+            arr = resize(
+                arr,
+                size=[image_size[0], int(arr.shape[3] * image_size[0] / arr.shape[2])],
+                interpolation=InterpolationMode.BICUBIC,
+            )
+        else:
+            arr = resize(
+                arr,
+                size=[int(arr.shape[2] * image_size[1] / arr.shape[3]), image_size[1]],
+                interpolation=InterpolationMode.BICUBIC,
+            )
+
+        h, w = arr.shape[2], arr.shape[3]
+        arr = arr.squeeze(0)
+
+        delta_h = h - image_size[0]
+        delta_w = w - image_size[1]
+
+        if reshape_mode == "random" or reshape_mode == "none":
+            top = np.random.randint(0, delta_h + 1)
+            left = np.random.randint(0, delta_w + 1)
+        elif reshape_mode == "center":
+            top, left = delta_h // 2, delta_w // 2
+        else:
+            raise NotImplementedError
+        arr = TT.functional.crop(arr, top=top, left=left, height=image_size[0], width=image_size[1])
+        return arr
+
+    def _preprocess_video(self, path: Path) -> torch.Tensor:
+        if self.load_tensors:
+            return self._load_preprocessed_latents_and_embeds(path)
+        else:
+            video_reader = decord.VideoReader(uri=path.as_posix())
+            video_num_frames = len(video_reader)
+            nearest_frame_bucket = min(
+                self.frame_buckets, key=lambda x: abs(x - min(video_num_frames, self.max_num_frames))
+            )
+
+            frame_indices = list(range(0, video_num_frames, video_num_frames // nearest_frame_bucket))
+
+            frames = video_reader.get_batch(frame_indices)
+            frames = frames[:nearest_frame_bucket].float()
+            frames = frames.permute(0, 3, 1, 2).contiguous()
+
+            nearest_res = self._find_nearest_resolution(frames.shape[2], frames.shape[3])
+            frames_resized = self._resize_for_rectangle_crop(frames, nearest_res)
+            frames = torch.stack([self.video_transforms(frame) for frame in frames_resized], dim=0)
+
+            image = frames[:1].clone() if self.image_to_video else None
+
+            return image, frames, None
+
+    def _find_nearest_resolution(self, height, width):
+        nearest_res = min(self.resolutions, key=lambda x: abs(x[1] - height) + abs(x[2] - width))
+        return nearest_res[1], nearest_res[2]
+
+
+class VideoDatasetWithHumanMotions(VideoDatasetWithConditions):
+    """
+    Extended VideoDatasetWithConditions that also supports human_motions data.
+    
+    This dataset loads:
+    - video_latents/*.pt: Main video latents
+    - prompt_embeds/*.pt: Text prompt embeddings  
+    - image_latents/*.pt: Image latents (for image-to-video)
+    - human_motions/*.pt: SMPL pose parameters for AdaLN conditioning
+    """
+    
+    def __init__(
+        self,
+        data_root: str,
+        dataset_file: Optional[str] = None,
+        caption_column: str = "text",
+        video_column: str = "video",
+        max_num_frames: int = 49,
+        id_token: Optional[str] = None,
+        height_buckets: List[int] = None,
+        width_buckets: List[int] = None,
+        frame_buckets: List[int] = None,
+        load_tensors: bool = False,
+        random_flip: Optional[float] = None,
+        image_to_video: bool = False,
+    ) -> None:
+        # Initialize parent class with main video column
+        super().__init__(
+            data_root=data_root,
+            dataset_file=dataset_file,
+            caption_column=caption_column,
+            video_column=video_column,
+            max_num_frames=max_num_frames,
+            id_token=id_token,
+            height_buckets=height_buckets,
+            width_buckets=width_buckets,
+            frame_buckets=frame_buckets,
+            load_tensors=load_tensors,
+            random_flip=random_flip,
+            image_to_video=image_to_video,
+        )
+        
+        # Automatically derive human_motions paths from main video paths
+        self.human_motions_paths = self._derive_human_motions_paths()
+        
+        # Validate that all human_motions files exist
+        if not self.load_tensors:
+            if any(not path.is_file() for path in self.human_motions_paths):
+                missing_human_motions = [path for path in self.human_motions_paths if not path.is_file()]
+                raise ValueError(
+                    f"Some human_motions files are missing. First few missing files: {missing_human_motions[:5]}"
+                )
+
+    def _derive_human_motions_paths(self) -> List[Path]:
+        """Derive human_motions paths from main video paths.
+        
+        Returns:
+            List of human_motions file paths
+        """
+        human_motions_paths = []
+        
+        for video_path in self.video_paths:
+            # Example: video_path = /path/to/sequences/videos/00001.mp4
+            # We want: /path/to/sequences/human_motions/00001.pt
+            
+            # Get the parent directory (sequences)
+            parent_dir = video_path.parent
+            # Get the filename without extension (00001)
+            filename_without_ext = video_path.stem
+            # Construct the human_motions path
+            human_motions_path = parent_dir.parent / "human_motions" / f"{filename_without_ext}.pt"
+            human_motions_paths.append(human_motions_path)
+        
+        return human_motions_paths
+
+    def __getitem__(self, index: int) -> Dict[str, Any]:
+        if isinstance(index, list):
+            return index
+
+        # Get main video data from parent class
+        main_data = super().__getitem__(index)
+        
+        # Load human_motions data
+        if self.load_tensors:
+            # Load preprocessed human_motions latents
+            human_motions = self._load_human_motions(self.human_motions_paths[index])
+            main_data["human_motions"] = human_motions
+        else:
+            # For raw video mode, we don't load human_motions as it's SMPL data
+            main_data["human_motions"] = None
+
+        return main_data
+
+    def _load_human_motions(self, path: Path) -> torch.Tensor:
+        """Load preprocessed human_motions data and extract body_pose."""
+        if not path.exists():
+            raise FileNotFoundError(f"Human motions file not found: {path}")
+        
+        # Load SMPL pose parameters dictionary
+        human_motions_dict = torch.load(path, map_location="cpu", weights_only=True)
+        
+        # Extract body_pose from the dictionary
+        if isinstance(human_motions_dict, dict) and "body_pose" in human_motions_dict:
+            body_pose = human_motions_dict["body_pose"]
+            logger.debug(f"Loaded body_pose with shape: {body_pose.shape}")
+            return body_pose
+        else:
+            available_keys = list(human_motions_dict.keys()) if isinstance(human_motions_dict, dict) else 'Not a dict'
+            raise KeyError(f"body_pose not found in human_motions data: {path}. Available keys: {available_keys}")
+
+
+class VideoDatasetWithHumanMotionsAndResizing(VideoDatasetWithHumanMotions):
+    """
+    Extended VideoDatasetWithHumanMotions that also supports resizing.
+    """
+    
+    def _preprocess_video(self, path: Path) -> torch.Tensor:
+        if self.load_tensors:
+            return self._load_preprocessed_latents_and_embeds(path)
+        else:
+            video_reader = decord.VideoReader(uri=path.as_posix())
+            video_num_frames = len(video_reader)
+            nearest_frame_bucket = min(
+                self.frame_buckets, key=lambda x: abs(x - min(video_num_frames, self.max_num_frames))
+            )
+
+            frame_indices = list(range(0, video_num_frames, video_num_frames // nearest_frame_bucket))
+
+            frames = video_reader.get_batch(frame_indices)
+            frames = frames[:nearest_frame_bucket].float()
+            frames = frames.permute(0, 3, 1, 2).contiguous()
+
+            nearest_res = self._find_nearest_resolution(frames.shape[2], frames.shape[3])
+            frames_resized = torch.stack([resize(frame, nearest_res) for frame in frames], dim=0)
+            frames = torch.stack([self.video_transforms(frame) for frame in frames_resized], dim=0)
+
+            image = frames[:1].clone() if self.image_to_video else None
+
+            return image, frames, None
+
+    def _find_nearest_resolution(self, height, width):
+        nearest_res = min(self.resolutions, key=lambda x: abs(x[1] - height) + abs(x[2] - width))
+        return nearest_res[1], nearest_res[2]
+
+
+class VideoDatasetWithHumanMotionsAndResizeAndRectangleCrop(VideoDatasetWithHumanMotions):
+    """
+    Extended VideoDatasetWithHumanMotions that supports resizing and rectangle crop.
+    """
+    
     def __init__(self, video_reshape_mode: str = "center", *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.video_reshape_mode = video_reshape_mode

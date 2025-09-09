@@ -35,7 +35,7 @@ from diffusers.video_processor import VideoProcessor
 from einops import rearrange
 
 # Import our custom VideoX-Fun transformer
-from cogvideox_fun_transformer_with_conditions import CogVideoXFunTransformer3DModel, CogVideoXFunTransformer3DModelWithConcat
+from .cogvideox_fun_transformer_with_conditions import CogVideoXFunTransformer3DModel, CogVideoXFunTransformer3DModelWithConcat
 
 # Import models from diffusers (same as cogvideox_static_to_video_pose_concat_pipeline.py)
 from diffusers import (
@@ -68,7 +68,43 @@ def get_resize_crop_region_for_grid(src, tgt_width, tgt_height):
 
     return (crop_top, crop_left), (crop_top + resize_height, crop_left + resize_width)
 
-logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+logger = logging.get_logger(__name__)
+
+def crop(img, start_h, start_w, crop_h, crop_w):
+    img_src = np.zeros((crop_h, crop_w, *img.shape[2:]), dtype=img.dtype)
+    hsize, wsize = crop_h, crop_w
+    dh, dw, sh, sw = start_h, start_w, 0, 0
+    if dh < 0:
+        sh = -dh
+        hsize += dh
+        dh = 0
+    if dh + hsize > img.shape[0]:
+        hsize = img.shape[0] - dh
+    if dw < 0:
+        sw = -dw
+        wsize += dw
+        dw = 0
+    if dw + wsize > img.shape[1]:
+        wsize = img.shape[1] - dw
+    img_src[sh : sh + hsize, sw : sw + wsize] = img[dh : dh + hsize, dw : dw + wsize]
+    return img_src
+
+def imcrop_center(img_list, crop_p_h, crop_p_w):
+    new_img = []
+    for i, _img in enumerate(img_list):
+        if crop_p_h / crop_p_w > _img.shape[0] / _img.shape[1]:  # crop left and right
+            start_h = int(0)
+            start_w = int((_img.shape[1] - _img.shape[0] / crop_p_h * crop_p_w) / 2)
+            crop_size = (_img.shape[0], int(_img.shape[0] / crop_p_h * crop_p_w))
+        else:
+            start_h = int((_img.shape[0] - _img.shape[1] / crop_p_w * crop_p_h) / 2)
+            start_w = int(0)
+            crop_size = (int(_img.shape[1] / crop_p_w * crop_p_h), _img.shape[1])
+
+        _img_src = crop(_img, start_h, start_w, crop_size[0], crop_size[1])
+        new_img.append(_img_src)
+
+    return new_img  # pylint: disable=invalid-name
 
 @dataclass
 class CogVideoXFunPipelineOutput(BaseOutput):
@@ -370,8 +406,8 @@ class CogVideoXFunInpaintPipeline(DiffusionPipeline):
 
         frames = self.vae.decode(latents).sample
         frames = (frames / 2 + 0.5).clamp(0, 1)
-        # we always cast to float32 as this does not cause significant overhead and is compatible with bfloa16
-        frames = frames.cpu().float().numpy()
+        # Return PyTorch tensor instead of numpy array for video_processor compatibility
+        frames = frames.cpu().float()
         return frames
 
     # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.prepare_extra_step_kwargs
@@ -608,7 +644,8 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
             else:
                 print(f"🔧 Loading base VideoX-Fun transformer")
                 transformer = CogVideoXFunTransformer3DModel.from_pretrained(
-                    pretrained_model_name_or_path or base_model_name_or_path,
+                    pretrained_model_name_or_path=pretrained_model_name_or_path,
+                    base_model_name_or_path=base_model_name_or_path,
                     subfolder="transformer",
                     torch_dtype=kwargs.get("torch_dtype", torch.bfloat16),
                     revision=kwargs.get("revision", None),
@@ -675,20 +712,31 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
 
     def prepare_latents(
         self,
-        image: Optional[torch.Tensor] = None,  # For I2V fallback
-        static_videos: Optional[torch.Tensor] = None,
         batch_size: int = 1,
         num_channels_latents: int = 16,
-        num_frames: int = 13,
         height: int = 60,
         width: int = 90,
+        num_frames: int = 13,
         dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
         generator: Optional[torch.Generator] = None,
         latents: Optional[torch.Tensor] = None,
+        video: Optional[torch.Tensor] = None,
+        image: Optional[torch.Tensor] = None,  # For I2V fallback
+        static_videos: Optional[torch.Tensor] = None,
+        hand_videos: Optional[torch.Tensor] = None,
+        return_video_latents: bool = False,
+        timestep: Optional[torch.Tensor] = None,
+        is_strength_max: bool = True,
+        return_noise: bool = False,
     ):
         """Prepare latents for the pipeline with static conditions."""
-        shape = (batch_size, num_channels_latents, num_frames, height, width)
+        # Calculate latent dimensions
+        latent_height = height // self.vae_scale_factor_spatial
+        latent_width = width // self.vae_scale_factor_spatial
+        num_channels_latents = self.vae.config.latent_channels
+
+        shape = (batch_size, num_frames, num_channels_latents, latent_height, latent_width)
         if isinstance(generator, list) and len(generator) != batch_size:
             raise ValueError(
                 f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
@@ -696,18 +744,38 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
             )
 
         if latents is None:
-            latents = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+            noise = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+            # if strength is 1. then initialise the latents to noise, else initial to image + noise
+            if static_videos is not None and not is_strength_max:
+                # Use static_videos as the reference for strength-based initialization
+                static_videos = static_videos.to(device=device, dtype=self.vae.dtype)
+                bs = 1
+                new_static_videos = []
+                for i in range(0, static_videos.shape[0], bs):
+                    static_videos_bs = static_videos[i : i + bs]
+                    static_videos_bs = self.vae.encode(static_videos_bs)[0]
+                    static_videos_bs = static_videos_bs.sample()
+                    new_static_videos.append(static_videos_bs)
+                video_latents = torch.cat(new_static_videos, dim=0)
+                video_latents = video_latents * self.vae.config.scaling_factor
+                video_latents = video_latents.repeat(batch_size // video_latents.shape[0], 1, 1, 1, 1)
+                video_latents = video_latents.to(device=device, dtype=dtype)
+                video_latents = rearrange(video_latents, "b c f h w -> b f c h w")
+                latents = self.scheduler.add_noise(video_latents, noise, timestep)
+            else:
+                latents = noise
+            # if pure noise then scale the initial latents by the Scheduler's init sigma
+            latents = latents * self.scheduler.init_noise_sigma if is_strength_max else latents
         else:
-            latents = latents.to(device)
-
-        # Scale the initial noise by the standard deviation required by the scheduler
-        latents = latents * self.scheduler.init_noise_sigma
+            noise = latents.to(device)
+            latents = noise * self.scheduler.init_noise_sigma
 
         # Prepare condition latents
         static_videos_latents = None
+        hand_videos_latents = None
         
         if static_videos is not None:
-            # Process static videos
+            # Process static videos with VAE encoding
             static_videos = static_videos.to(device=device, dtype=self.vae.dtype)
             bs = 1
             new_static_videos = []
@@ -722,7 +790,34 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
             static_videos_latents = static_videos_latents.to(device=device, dtype=dtype)
             static_videos_latents = rearrange(static_videos_latents, "b c f h w -> b f c h w")
 
-        return latents, static_videos_latents, None
+        if hand_videos is not None:
+            # Process hand videos with VAE encoding
+            hand_videos = hand_videos.to(device=device, dtype=self.vae.dtype)
+            bs = 1
+            new_hand_videos = []
+            for i in range(0, hand_videos.shape[0], bs):
+                hand_videos_bs = hand_videos[i : i + bs]
+                hand_videos_bs = self.vae.encode(hand_videos_bs)[0]
+                hand_videos_bs = hand_videos_bs.sample()
+                new_hand_videos.append(hand_videos_bs)
+            hand_videos_latents = torch.cat(new_hand_videos, dim=0)
+            hand_videos_latents = hand_videos_latents * self.vae.config.scaling_factor
+            hand_videos_latents = hand_videos_latents.repeat(batch_size // hand_videos_latents.shape[0], 1, 1, 1, 1)
+            hand_videos_latents = hand_videos_latents.to(device=device, dtype=dtype)
+            hand_videos_latents = rearrange(hand_videos_latents, "b c f h w -> b f c h w")
+
+        # Prepare outputs
+        outputs = (latents,)
+        
+        if return_noise:
+            outputs += (noise,)
+            
+        if return_video_latents:
+            outputs += (static_videos_latents,)
+        else:
+            outputs += (static_videos_latents, hand_videos_latents)
+            
+        return outputs
 
     def preprocess_hand_conditions(
         self,
@@ -731,21 +826,39 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
         width,
         num_frames,
     ):
-        """Preprocess hand condition videos."""
-        if isinstance(hand_videos, (list, tuple)):
-            hand_videos = [self._preprocess_images(video, height, width) for video in hand_videos]
-            hand_videos = torch.stack(hand_videos)
+        """Preprocess hand condition videos.
+        
+        Args:
+            hand_videos: Input video tensor of shape [B, C, F, H, W]
+            height: Target height
+            width: Target width  
+            num_frames: Target number of frames
+            
+        Returns:
+            Preprocessed video tensor of shape [B, C, F, H, W]
+        """
+        # Convert to torch tensor if needed
+        if isinstance(hand_videos, np.ndarray):
+            hand_videos = torch.from_numpy(hand_videos)
+        
+        # Ensure input is [B, C, F, H, W]
+        if hand_videos.ndim == 4:  # [C, F, H, W] -> [1, C, F, H, W]
+            hand_videos = hand_videos.unsqueeze(0)
+        elif hand_videos.ndim == 5:  # Already [B, C, F, H, W]
+            pass
         else:
-            hand_videos = self._preprocess_images(hand_videos, height, width)
+            raise ValueError(f"Expected 4D or 5D tensor, got {hand_videos.ndim}D tensor")
+        
+        # Input is already [B, C, F, H, W], no need to permute
         
         # Ensure correct number of frames
         if hand_videos.shape[2] != num_frames:
             hand_videos = F.interpolate(
-                hand_videos.permute(0, 2, 1, 3, 4),  # [B, T, C, H, W]
+                hand_videos,  # [B, C, F, H, W]
                 size=(num_frames, height, width),
                 mode='trilinear',
                 align_corners=False
-            ).permute(0, 2, 1, 3, 4)  # [B, C, T, H, W]
+            )
         
         return hand_videos
 
@@ -763,11 +876,9 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
         if height % 8 != 0 or width % 8 != 0:
             raise ValueError(f"`height` and `width` have to be divisible by 8 but are {height} and {width}.")
 
-        if (callback_on_step_end_tensor_inputs is not None) and (
-            not isinstance(callback_on_step_end_tensor_inputs, list) or len(callback_on_step_end_tensor_inputs) != 0
-        ):
+        if callback_on_step_end_tensor_inputs is not None and not isinstance(callback_on_step_end_tensor_inputs, list):
             raise ValueError(
-                f"`callback_on_step_end_tensor_inputs` has to be a list with {0} tensor(s) but is {callback_on_step_end_tensor_inputs}."
+                f"`callback_on_step_end_tensor_inputs` has to be a list but is {type(callback_on_step_end_tensor_inputs)}."
             )
 
         if prompt is not None and prompt_embeds is not None:
@@ -799,26 +910,44 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
 
     def preprocess_static_conditions(
         self,
-        static_videos,
+        static_videos,  
         height,
         width,
         num_frames,
     ):
-        """Preprocess static condition videos."""
-        if isinstance(static_videos, (list, tuple)):
-            static_videos = [self._preprocess_images(video, height, width) for video in static_videos]
-            static_videos = torch.stack(static_videos)
+        """Preprocess static condition videos.
+        
+        Args:
+            static_videos: Input video tensor of shape [B, C, F, H, W]
+            height: Target height
+            width: Target width  
+            num_frames: Target number of frames
+            
+        Returns:
+            Preprocessed video tensor of shape [B, C, F, H, W]
+        """
+        # Convert to torch tensor if needed
+        if isinstance(static_videos, np.ndarray):
+            static_videos = torch.from_numpy(static_videos)
+        
+        # Ensure input is [B, C, F, H, W]
+        if static_videos.ndim == 4:  # [C, F, H, W] -> [1, C, F, H, W]
+            static_videos = static_videos.unsqueeze(0)
+        elif static_videos.ndim == 5:  # Already [B, C, F, H, W]
+            pass
         else:
-            static_videos = self._preprocess_images(static_videos, height, width)
+            raise ValueError(f"Expected 4D or 5D tensor, got {static_videos.ndim}D tensor")
+        
+        # Input is already [B, C, F, H, W], no need to permute
         
         # Ensure correct number of frames
         if static_videos.shape[2] != num_frames:
             static_videos = F.interpolate(
-                static_videos.permute(0, 2, 1, 3, 4),  # [B, T, C, H, W]
+                static_videos,  # [B, C, F, H, W]
                 size=(num_frames, height, width),
                 mode='trilinear',
                 align_corners=False
-            ).permute(0, 2, 1, 3, 4)  # [B, C, T, H, W]
+            )
         
         return static_videos
 
@@ -833,7 +962,7 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
         if images.ndim == 3:
             images = [images]
             
-        # Simple center crop for now - can be enhanced later
+        images = imcrop_center(images, height, width)
         images = self.video_processor.preprocess(images, height, width)
         return images
 
@@ -861,7 +990,7 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
         latents: Optional[torch.FloatTensor] = None,
         prompt_embeds: Optional[torch.FloatTensor] = None,
         negative_prompt_embeds: Optional[torch.FloatTensor] = None,
-        output_type: str = "numpy",
+        output_type: str = "np",
         return_dict: bool = False,
         callback_on_step_end: Optional[
             Union[Callable[[int, int, Dict], None], PipelineCallback, MultiPipelineCallbacks]
@@ -1002,7 +1131,10 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
 
         # 4. set timesteps
-        timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, num_inference_steps, device, timesteps)
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        timesteps, num_inference_steps = self.get_timesteps(
+            num_inference_steps=num_inference_steps, strength=strength, device=device
+        )
         self._num_timesteps = len(timesteps)
         if comfyui_progressbar:
             try:
@@ -1054,25 +1186,25 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
         return_image_latents = num_channels_transformer == num_channels_latents
 
         latents_outputs = self.prepare_latents(
-            batch_size * num_videos_per_prompt,
-            num_channels_latents,
-            height,
-            width,
-            video_length,
-            prompt_embeds.dtype,
-            device,
-            generator,
-            latents,
-            video=init_video,
+            batch_size=batch_size * num_videos_per_prompt,
+            num_channels_latents=num_channels_latents,
+            height=height,
+            width=width,
+            num_frames=local_latent_length,
+            dtype=prompt_embeds.dtype,
+            device=device,
+            generator=generator,
+            latents=latents,
+            static_videos=init_video,
             timestep=latent_timestep,
             is_strength_max=is_strength_max,
             return_noise=True,
             return_video_latents=return_image_latents,
         )
         if return_image_latents:
-            latents, noise, image_latents = latents_outputs
+            latents, noise, static_videos_latents = latents_outputs
         else:
-            latents, noise = latents_outputs
+            latents, noise, static_videos_latents, _ = latents_outputs
         if comfyui_progressbar and pbar is not None:
             pbar.update(1)
         
@@ -1094,7 +1226,9 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
             control_latents = control_latents.repeat(batch_size // control_latents.shape[0], 1, 1, 1, 1)
             control_latents = control_latents.to(device=device, dtype=latents.dtype)
             control_latents = rearrange(control_latents, "b c f h w -> b f c h w")
-        
+            control_latents = (
+                torch.cat([control_latents] * 2) if do_classifier_free_guidance else control_latents
+            )
         if mask_video is not None:
             if (mask_video == 255).all():  # redraw all frames
                 mask_latents = torch.zeros_like(latents)[:, :, :1].to(latents.device, latents.dtype)
@@ -1107,7 +1241,6 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
                 inpaint_latents = torch.cat([mask_input, masked_video_latents_input], dim=2).to(latents.dtype)
             else:
                 # Prepare mask latent variables
-                video_length = video.shape[2]
                 mask_condition = self.mask_processor.preprocess(rearrange(mask_video, "b c f h w -> (b f) c h w"), height=height, width=width) 
                 mask_condition = mask_condition.to(dtype=torch.float32)
                 mask_condition = rearrange(mask_condition, "(b f) c h w -> b c f h w", f=video_length)
@@ -1155,15 +1288,38 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
                     inpaint_latents = None
         else:
             if num_channels_transformer != num_channels_latents:
-                mask = torch.zeros_like(latents).to(latents.device, latents.dtype)
-                masked_video_latents = torch.zeros_like(latents).to(latents.device, latents.dtype)
+                # Create 1-channel mask
+                mask = torch.zeros_like(latents[:, :, :1]).to(latents.device, latents.dtype)  # [B, 1, F, H, W]
+                
+                if static_videos_latents is not None:
+                    # Use static_videos_latents as masked_video_latents
+                    masked_video_latents = static_videos_latents.to(latents.device, latents.dtype)
+                else:
+                    # No static videos, use zeros
+                    masked_video_latents = torch.zeros_like(latents).to(latents.device, latents.dtype)
+                masked_video_latents = rearrange(masked_video_latents, "b f c h w -> b c f h w")
 
-                mask_input = torch.cat([mask] * 2) if do_classifier_free_guidance else mask
-                masked_video_latents_input = (
-                    torch.cat([masked_video_latents] * 2) if do_classifier_free_guidance else masked_video_latents
-                )
-                inpaint_latents = torch.cat([mask_input, masked_video_latents_input], dim=1).to(latents.dtype)
+                # Create mask_latents using resize_mask function (similar to mask_video is not None case)
+                mask_condition = self.mask_processor.preprocess(rearrange(mask, "b f c h w -> (b f) c h w"), height=height, width=width) 
+                mask_condition = mask_condition.to(dtype=torch.float32)
+                mask_condition = rearrange(mask_condition, "(b f) c h w -> b c f h w", f=local_latent_length)
+                mask_latents = resize_mask(1 - mask_condition, masked_video_latents)
+                mask_latents = mask_latents.to(masked_video_latents.device) * self.vae.config.scaling_factor
+
+                # Handle classifier-free guidance
+                if do_classifier_free_guidance:
+                    mask_input = torch.cat([mask_latents, mask_latents], dim=0)  # [2B, 1, F, H, W]
+                    masked_video_latents_input = torch.cat([masked_video_latents, masked_video_latents], dim=0)  # [2B, C, F, H, W]
+                else:
+                    mask_input = mask_latents
+                    masked_video_latents_input = masked_video_latents
+                
+                # Concatenate mask (1 channel) + masked_video_latents (C channels) = [B, C+1, F, H, W]
+                mask_input = rearrange(mask_input, "b c f h w -> b f c h w")
+                masked_video_latents_input = rearrange(masked_video_latents_input, "b c f h w -> b f c h w")
+                inpaint_latents = torch.cat([mask_input, masked_video_latents_input], dim=2).to(latents.dtype)
             else:
+                # Standard case without additional channels
                 mask = torch.zeros_like(init_video[:, :1])
                 mask = torch.tile(mask, [1, num_channels_latents, 1, 1, 1])
                 mask = F.interpolate(mask, size=latents.size()[-3:], mode='trilinear', align_corners=True).to(latents.device, latents.dtype)
@@ -1251,18 +1407,59 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
                 if comfyui_progressbar:
                     pbar.update(1)
 
-        if output_type == "numpy":
+        if not output_type == "latent":
             video = self.decode_latents(latents)
-        elif not output_type == "latent":
-            video = self.decode_latents(latents)
-            video = self.video_processor.postprocess_video(video=video, output_type=output_type)
+            video = rearrange(video, "b c f h w -> b f h w c")
+            # video = self.video_processor.postprocess_video(video=video, output_type=output_type)
+            # video = rearrange(video, "b f h w c -> b c f h w")
         else:
             video = latents
 
         # Offload all models
         self.maybe_free_model_hooks()
 
-        if not return_dict:
-            video = torch.from_numpy(video)
-
+        # if not return_dict:
+        #     if isinstance(video, np.ndarray):
+        #         video = torch.from_numpy(video)
         return CogVideoXFunPipelineOutput(frames=video)
+
+    @classmethod
+    def save_lora_weights(
+        cls,
+        save_directory: str,
+        transformer_lora_layers: Optional[Dict[str, torch.Tensor]] = None,
+        is_main_process: bool = True,
+        weight_name: str = "pytorch_lora_weights.safetensors",
+        save_function: Optional[Callable] = None,
+        safe_serialization: bool = True,
+    ):
+        """Save LoRA weights to a directory."""
+        if transformer_lora_layers is not None:
+            # Save LoRA weights
+            os.makedirs(save_directory, exist_ok=True)
+            
+            if save_function is not None:
+                save_function(transformer_lora_layers, os.path.join(save_directory, weight_name))
+            elif safe_serialization:
+                from safetensors.torch import save_file
+                save_file(transformer_lora_layers, os.path.join(save_directory, weight_name))
+            else:
+                torch.save(transformer_lora_layers, os.path.join(save_directory, weight_name))
+
+    @classmethod
+    def lora_state_dict(cls, input_dir: str) -> Dict[str, torch.Tensor]:
+        """Load LoRA state dict from a directory."""
+        lora_state_dict = {}
+        
+        # Try to load from safetensors first
+        safetensors_path = os.path.join(input_dir, "pytorch_lora_weights.safetensors")
+        if os.path.exists(safetensors_path):
+            from safetensors.torch import load_file
+            lora_state_dict = load_file(safetensors_path)
+        else:
+            # Try to load from pytorch format
+            pytorch_path = os.path.join(input_dir, "pytorch_lora_weights.bin")
+            if os.path.exists(pytorch_path):
+                lora_state_dict = torch.load(pytorch_path, map_location="cpu")
+        
+        return lora_state_dict
