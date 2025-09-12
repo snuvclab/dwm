@@ -580,6 +580,12 @@ class CogVideoXPatchEmbedWithAdapter(CogVideoXPatchEmbed):
         else:
             # CogVideoX 1.5 checkpoints
             self.cond_proj = nn.Linear(condition_channels * patch_size * patch_size * patch_size_t, embed_dim)
+        
+        # Zero initialize cond_proj weights for stable training
+        with torch.no_grad():
+            self.cond_proj.weight.zero_()
+            if hasattr(self.cond_proj, 'bias') and self.cond_proj.bias is not None:
+                self.cond_proj.bias.zero_()
 
     def forward(self, text_embeds: torch.Tensor, image_embeds: torch.Tensor, 
                 ref_image_embeds: torch.Tensor = None, cond_embeds: torch.Tensor = None):
@@ -953,7 +959,7 @@ class CogVideoXFunTransformer3DModelWithAdapter(CogVideoXFunTransformer3DModel):
             patch_embed_input['cond_embeds'] = control_latents
     
         # Use adapter patch embed
-        hidden_states, ref_hidden_states = self.patch_embed(**patch_embed_input)
+        hidden_states, _ = self.patch_embed(**patch_embed_input)
         
         hidden_states = self.embedding_dropout(hidden_states)
 

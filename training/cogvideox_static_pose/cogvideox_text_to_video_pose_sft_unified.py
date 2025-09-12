@@ -1695,8 +1695,8 @@ def main():
             
             print(f"🔧 LoRA learning rate: {base_lr}")
             print(f"🔧 Non-LoRA learning rate: {non_lora_lr} (scale: {non_lora_lr_scale})")
-            print(f"🔧 LoRA parameters: {len(lora_params)}")
-            print(f"🔧 Non-LoRA parameters: {len(non_lora_params)}")
+            print(f"🔧 LoRA parameters: {lora_params}")
+            print(f"🔧 Non-LoRA parameters: {non_lora_params}")
         else:
             # Use same learning rate for all parameters
             params_to_optimize = [{"params": list(filter(lambda p: p.requires_grad, transformer.parameters()))}]
@@ -2439,7 +2439,8 @@ def main():
 
                     # VideoX-Fun always uses mask (zeros for static video conditioning)
                     mask_input = torch.ones_like(noisy_model_input[:, :, :1]) * VAE_SCALING_FACTOR
-                    transformer_input = torch.cat([noisy_model_input, mask_input, static_videos_latents, hand_video_latents], dim=2)
+                    transformer_input = torch.cat([noisy_model_input, mask_input, static_videos_latents], dim=2)
+                    control_latents = hand_video_latents
                     condition_latents = None
 
                 # Predict the noise residual
@@ -2547,6 +2548,7 @@ def main():
                         encoder_hidden_states=prompt_embeds,
                         timestep=timesteps,
                         image_rotary_emb=image_rotary_emb,
+                        control_latents=control_latents,
                         return_dict=False,
                     )[0]
                         
