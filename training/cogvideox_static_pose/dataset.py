@@ -121,17 +121,17 @@ class VideoDataset(Dataset):
         return len(self.video_paths)
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
-        if isinstance(index, list):
-            # Here, index is actually a list of data objects that we need to return.
-            # The BucketSampler should ideally return indices. But, in the sampler, we'd like
-            # to have information about num_frames, height and width. Since this is not stored
-            # as metadata, we need to read the video to get this information. You could read this
-            # information without loading the full video in memory, but we do it anyway. In order
-            # to not load the video twice (once to get the metadata, and once to return the loaded video
-            # based on sampled indices), we cache it in the BucketSampler. When the sampler is
-            # to yield, we yield the cache data instead of indices. So, this special check ensures
-            # that data is not loaded a second time. PRs are welcome for improvements.
-            return index
+        # if isinstance(index, list):
+        #     # Here, index is actually a list of data objects that we need to return.
+        #     # The BucketSampler should ideally return indices. But, in the sampler, we'd like
+        #     # to have information about num_frames, height and width. Since this is not stored
+        #     # as metadata, we need to read the video to get this information. You could read this
+        #     # information without loading the full video in memory, but we do it anyway. In order
+        #     # to not load the video twice (once to get the metadata, and once to return the loaded video
+        #     # based on sampled indices), we cache it in the BucketSampler. When the sampler is
+        #     # to yield, we yield the cache data instead of indices. So, this special check ensures
+        #     # that data is not loaded a second time. PRs are welcome for improvements.
+        #     return index
 
         # Handle index out of range with mod operation to prevent training interruption
         original_index = index
@@ -413,62 +413,45 @@ class VideoDatasetWithConditions(VideoDataset):
         return condition_paths
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
-        if isinstance(index, list):
-            return index
+        # if isinstance(index, list):
+        #     return index
 
-        try:
-            # Get main video data from parent class
-            main_data = super().__getitem__(index)
+        # Get main video data from parent class
+        main_data = super().__getitem__(index)
+        
+        # Load condition videos
+        if self.load_tensors:
+            # Load preprocessed latents for condition videos
+            try:
+                hand_video_latents = self._load_condition_video_latents(self.hand_video_paths[index], "hand_video_latents")
+                main_data["hand_videos"] = hand_video_latents
+            except Exception as e:
+                logger.warning(f"Failed to load hand video latents for index {index}: {e}")
+                main_data["hand_videos"] = None
             
-            # Load condition videos
-            if self.load_tensors:
-                # Load preprocessed latents for condition videos
-                try:
-                    hand_video_latents = self._load_condition_video_latents(self.hand_video_paths[index], "hand_video_latents")
-                    main_data["hand_videos"] = hand_video_latents
-                except Exception as e:
-                    logger.warning(f"Failed to load hand video latents for index {index}: {e}")
-                    main_data["hand_videos"] = None
-                
-                try:
-                    static_video_latents = self._load_condition_video_latents(self.static_video_paths[index], "static_video_latents")
-                    main_data["static_videos"] = static_video_latents
-                except Exception as e:
-                    logger.warning(f"Failed to load static video latents for index {index}: {e}")
-                    main_data["static_videos"] = None
-            else:
-                # Load raw videos for condition videos
-                try:
-                    _, hand_video, _ = self._preprocess_video(self.hand_video_paths[index])
-                    main_data["hand_videos"] = hand_video
-                except Exception as e:
-                    logger.warning(f"Failed to load hand video for index {index}: {e}")
-                    main_data["hand_videos"] = None
-                
-                try:
-                    _, static_video, _ = self._preprocess_video(self.static_video_paths[index])
-                    main_data["static_videos"] = static_video
-                except Exception as e:
-                    logger.warning(f"Failed to load static video for index {index}: {e}")
-                    main_data["static_videos"] = None
+            try:
+                static_video_latents = self._load_condition_video_latents(self.static_video_paths[index], "static_video_latents")
+                main_data["static_videos"] = static_video_latents
+            except Exception as e:
+                logger.warning(f"Failed to load static video latents for index {index}: {e}")
+                main_data["static_videos"] = None
+        else:
+            # Load raw videos for condition videos
+            try:
+                _, hand_video, _ = self._preprocess_video(self.hand_video_paths[index])
+                main_data["hand_videos"] = hand_video
+            except Exception as e:
+                logger.warning(f"Failed to load hand video for index {index}: {e}")
+                main_data["hand_videos"] = None
+            
+            try:
+                _, static_video, _ = self._preprocess_video(self.static_video_paths[index])
+                main_data["static_videos"] = static_video
+            except Exception as e:
+                logger.warning(f"Failed to load static video for index {index}: {e}")
+                main_data["static_videos"] = None
 
-            return main_data
-            
-        except Exception as e:
-            logger.error(f"Failed to load data for index {index}: {e}")
-            # Return a minimal valid data structure to prevent training from crashing
-            # This will be filtered out by the dataloader or training loop
-            return {
-                "prompt": "ERROR_LOADING_DATA",
-                "video": torch.zeros(1, 3, 16, 256, 256),  # Dummy video tensor
-                "hand_videos": None,
-                "static_videos": None,
-                "video_metadata": {
-                    "num_frames": 16,
-                    "height": 256,
-                    "width": 256,
-                }
-            }
+        return main_data
 
     def _load_condition_video_latents(self, path: Path, latent_folder: str) -> torch.Tensor:
         """Load preprocessed latents for condition videos."""
@@ -786,8 +769,8 @@ class VideoDatasetWithHumanMotions(VideoDatasetWithConditions):
         return human_motions_paths
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
-        if isinstance(index, list):
-            return index
+        # if isinstance(index, list):
+        #     return index
 
         # Get main video data from parent class
         main_data = super().__getitem__(index)
@@ -795,8 +778,12 @@ class VideoDatasetWithHumanMotions(VideoDatasetWithConditions):
         # Load human_motions data
         if self.load_tensors:
             # Load preprocessed human_motions latents
-            human_motions = self._load_human_motions(self.human_motions_paths[index])
-            main_data["human_motions"] = human_motions
+            try:
+                human_motions = self._load_human_motions(self.human_motions_paths[index])
+                main_data["human_motions"] = human_motions
+            except Exception as e:
+                logger.warning(f"Failed to load human_motions for index {index}: {e}")
+                main_data["human_motions"] = None
         else:
             # For raw video mode, we don't load human_motions as it's SMPL data
             main_data["human_motions"] = None
