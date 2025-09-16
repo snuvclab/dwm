@@ -14,9 +14,12 @@
 # limitations under the License.
 
 import os
+import glob
+import math
 import torch
 import torch.nn as nn
 from typing import Optional, Union, Tuple, Dict, Any
+from safetensors.torch import load_file
 from diffusers.models import ModelMixin
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
@@ -29,6 +32,12 @@ from diffusers.models.normalization import AdaLayerNorm, CogVideoXLayerNormZero
 from diffusers import CogVideoXTransformer3DModel
 
 logger = logging.get_logger(__name__)
+
+def reshape_tensor(tensor, num_heads):
+    """Reshape tensor for multi-head attention."""
+    batch_size, seq_len, dim = tensor.shape
+    head_dim = dim // num_heads
+    return tensor.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
 
 # copied from TrajectoryCrafter/models/crosstransformer3d.py
 class PerceiverCrossAttention(nn.Module):
@@ -160,18 +169,29 @@ class CogVideoXFunTransformer3DModel(CogVideoXTransformer3DModel):
                 model = cls()
 
             # 2) Load checkpoint state_dict directly
-            state_dict_path = os.path.join(pretrained_model_name_or_path, subfolder, "diffusion_pytorch_model.safetensors")
-            if not os.path.exists(state_dict_path):
-                # Try alternative paths
-                state_dict_path = os.path.join(pretrained_model_name_or_path, subfolder, "pytorch_model.bin")
-                if not os.path.exists(state_dict_path):
-                    raise FileNotFoundError(f"No model file found in {pretrained_model_name_or_path}")
-            
-            if state_dict_path.endswith(".safetensors"):
-                from safetensors.torch import load_file
-                state_dict = load_file(state_dict_path)
+            # Try to find all safetensors files first
+            safetensors_files = glob.glob(os.path.join(pretrained_model_name_or_path, subfolder, "*.safetensors"))
+            if safetensors_files:
+                print(f"🔧 Loading weights from {len(safetensors_files)} safetensors files")
+                # Load and merge all safetensors files
+                state_dict = {}
+                for file_path in safetensors_files:
+                    print(f"   Loading: {os.path.basename(file_path)}")
+                    file_state_dict = load_file(file_path)
+                    state_dict.update(file_state_dict)
             else:
-                state_dict = torch.load(state_dict_path, map_location="cpu")
+                # Fallback to single file approach
+                state_dict_path = os.path.join(pretrained_model_name_or_path, subfolder, "diffusion_pytorch_model.safetensors")
+                if not os.path.exists(state_dict_path):
+                    # Try alternative paths
+                    state_dict_path = os.path.join(pretrained_model_name_or_path, subfolder, "pytorch_model.bin")
+                    if not os.path.exists(state_dict_path):
+                        raise FileNotFoundError(f"No model file found in {pretrained_model_name_or_path}")
+                
+                if state_dict_path.endswith(".safetensors"):
+                    state_dict = load_file(state_dict_path)
+                else:
+                    state_dict = torch.load(state_dict_path, map_location="cpu")
 
             # 3) Load with strict=False for flexibility
             missing, unexpected = model.load_state_dict(state_dict, strict=False)
@@ -426,18 +446,29 @@ class CogVideoXFunTransformer3DModelWithConcat(CogVideoXFunTransformer3DModel):
                 model = cls(condition_channels=condition_channels)
 
             # 2) Load checkpoint state_dict directly
-            state_dict_path = os.path.join(pretrained_model_name_or_path, subfolder, "diffusion_pytorch_model.safetensors")
-            if not os.path.exists(state_dict_path):
-                # Try alternative paths
-                state_dict_path = os.path.join(pretrained_model_name_or_path, subfolder, "pytorch_model.bin")
-                if not os.path.exists(state_dict_path):
-                    raise FileNotFoundError(f"No model file found in {pretrained_model_name_or_path}")
-            
-            if state_dict_path.endswith(".safetensors"):
-                from safetensors.torch import load_file
-                state_dict = load_file(state_dict_path)
+            # Try to find all safetensors files first
+            safetensors_files = glob.glob(os.path.join(pretrained_model_name_or_path, subfolder, "*.safetensors"))
+            if safetensors_files:
+                print(f"🔧 Loading weights from {len(safetensors_files)} safetensors files")
+                # Load and merge all safetensors files
+                state_dict = {}
+                for file_path in safetensors_files:
+                    print(f"   Loading: {os.path.basename(file_path)}")
+                    file_state_dict = load_file(file_path)
+                    state_dict.update(file_state_dict)
             else:
-                state_dict = torch.load(state_dict_path, map_location="cpu")
+                # Fallback to single file approach
+                state_dict_path = os.path.join(pretrained_model_name_or_path, subfolder, "diffusion_pytorch_model.safetensors")
+                if not os.path.exists(state_dict_path):
+                    # Try alternative paths
+                    state_dict_path = os.path.join(pretrained_model_name_or_path, subfolder, "pytorch_model.bin")
+                    if not os.path.exists(state_dict_path):
+                        raise FileNotFoundError(f"No model file found in {pretrained_model_name_or_path}")
+                
+                if state_dict_path.endswith(".safetensors"):
+                    state_dict = load_file(state_dict_path)
+                else:
+                    state_dict = torch.load(state_dict_path, map_location="cpu")
 
             # 3) Load with strict=False for flexibility
             missing, unexpected = model.load_state_dict(state_dict, strict=False)
@@ -699,6 +730,176 @@ class CogVideoXPatchEmbedWithAdapter(CogVideoXPatchEmbed):
             embeds = embeds + pos_embedding
 
         return embeds, ref_image_embeds
+
+class CogVideoXPatchEmbedWithAdapterV2(CogVideoXPatchEmbed):
+    """
+    VideoX-Fun Patch Embed with conditional input support via adapter.
+    Adds GroupNorm and gating to stabilize conditioning signal.
+    """
+
+    def __init__(self, *args, **kwargs):
+        condition_channels = kwargs.pop("condition_channels", None)
+        super().__init__(*args, **kwargs)
+
+        in_channels = kwargs.get("in_channels", 16)
+        patch_size = kwargs.get("patch_size", 16)
+        patch_size_t = kwargs.get("patch_size_t", None)
+        embed_dim = kwargs.get("embed_dim", 16)
+        bias = kwargs.get("bias", True)
+
+        if condition_channels is None:
+            condition_channels = in_channels
+
+        # Adapter projection layer
+        if patch_size_t is None:
+            # CogVideoX 1.0
+            self.cond_proj = nn.Conv2d(
+                condition_channels,
+                embed_dim,
+                kernel_size=(patch_size, patch_size),
+                stride=patch_size,
+                bias=bias,
+            )
+        else:
+            # CogVideoX 1.5
+            self.cond_proj = nn.Linear(
+                condition_channels * patch_size * patch_size * patch_size_t, embed_dim
+            )
+
+        # Zero-init for stable start
+        with torch.no_grad():
+            self.cond_proj.weight.zero_()
+            if hasattr(self.cond_proj, "bias") and self.cond_proj.bias is not None:
+                self.cond_proj.bias.zero_()
+
+        # GroupNorm for cond stabilization
+        self.cond_norm = nn.GroupNorm(1, embed_dim, affine=True)
+        with torch.no_grad():
+            self.cond_norm.weight.fill_(1.0)
+            self.cond_norm.bias.zero_()
+
+        # Learnable gate for gradual conditioning
+        self.cond_gate = nn.Parameter(torch.zeros(1))
+
+    def forward(
+        self,
+        text_embeds: torch.Tensor,
+        image_embeds: torch.Tensor,
+        ref_image_embeds: torch.Tensor = None,
+        cond_embeds: torch.Tensor = None,
+    ):
+        """
+        Args:
+            text_embeds (`torch.Tensor`): [B, seq_length, embed_dim]
+            image_embeds (`torch.Tensor`): [B, F, C, H, W]
+            ref_image_embeds (`torch.Tensor`, optional): [B, F, C, H, W]
+            cond_embeds (`torch.Tensor`, optional): [B, F, C, H, W]
+        """
+        text_embeds = self.text_proj(text_embeds)
+        batch_size, num_frames, channels, height, width = image_embeds.shape
+
+        # ---- Patchify image + ref ----
+        if self.patch_size_t is None:
+            # Combine image & ref
+            if ref_image_embeds is not None:
+                combined_embeds = torch.cat([image_embeds, ref_image_embeds], dim=0)
+            else:
+                combined_embeds = image_embeds
+
+            combined_embeds = combined_embeds.reshape(-1, channels, height, width)
+            combined_embeds = self.proj(combined_embeds)
+
+            # Split back
+            if ref_image_embeds is not None:
+                image_embeds, ref_image_embeds = torch.chunk(combined_embeds, 2, dim=0)
+                image_embeds = image_embeds.view(batch_size, num_frames, *image_embeds.shape[1:])
+                ref_image_embeds = ref_image_embeds.view(batch_size, num_frames, *ref_image_embeds.shape[1:])
+            else:
+                image_embeds = combined_embeds.view(batch_size, num_frames, *combined_embeds.shape[1:])
+
+            # Flatten for transformer
+            image_embeds = image_embeds.flatten(3).transpose(2, 3).flatten(1, 2)
+            if ref_image_embeds is not None:
+                ref_image_embeds = ref_image_embeds.flatten(3).transpose(2, 3).flatten(1, 2)
+
+            # ---- Process conditioning ----
+            if cond_embeds is not None:
+                cond_channels = cond_embeds.shape[2]
+                cond_embeds = cond_embeds.reshape(-1, cond_channels, height, width)
+                cond_embeds = self.cond_proj(cond_embeds)  # [B*F, embed_dim, H/P, W/P]
+                cond_embeds = cond_embeds.view(batch_size, num_frames, *cond_embeds.shape[1:])
+                cond_embeds = cond_embeds.flatten(3).transpose(2, 3).flatten(1, 2)
+
+                # Normalize + Gate
+                # GroupNorm expects [batch, channels, ...] but we have [batch, seq_len, channels]
+                # Reshape to [batch, channels, seq_len] for GroupNorm
+                batch_size, seq_len, channels = cond_embeds.shape
+                cond_embeds = cond_embeds.transpose(1, 2)  # [batch, channels, seq_len]
+                cond_embeds = self.cond_norm(cond_embeds)
+                cond_embeds = cond_embeds.transpose(1, 2)  # [batch, seq_len, channels]
+                image_embeds = image_embeds + self.cond_gate * cond_embeds
+
+        else:
+            # 3D patchify for CogVideoX 1.5
+            p = self.patch_size
+            p_t = self.patch_size_t
+
+            if ref_image_embeds is not None:
+                combined_embeds = torch.cat([image_embeds, ref_image_embeds], dim=0)
+            else:
+                combined_embeds = image_embeds
+
+            combined_embeds = combined_embeds.permute(0, 1, 3, 4, 2)
+            combined_embeds = combined_embeds.reshape(
+                -1, num_frames // p_t, p_t, height // p, p, width // p, p, channels
+            )
+            combined_embeds = combined_embeds.permute(0, 1, 3, 5, 7, 2, 4, 6).flatten(4, 7).flatten(1, 3)
+            combined_embeds = self.proj(combined_embeds)
+
+            if ref_image_embeds is not None:
+                image_embeds, ref_image_embeds = torch.chunk(combined_embeds, 2, dim=0)
+            else:
+                image_embeds = combined_embeds
+
+            if cond_embeds is not None:
+                cond_channels = cond_embeds.shape[2]
+                cond_embeds = cond_embeds.permute(0, 1, 3, 4, 2)
+                cond_embeds = cond_embeds.reshape(
+                    batch_size, num_frames // p_t, p_t, height // p, p, width // p, p, cond_channels
+                )
+                cond_embeds = cond_embeds.permute(0, 1, 3, 5, 7, 2, 4, 6).flatten(4, 7).flatten(1, 3)
+                cond_embeds = self.cond_proj(cond_embeds)
+
+                # Normalize + Gate
+                # GroupNorm expects [batch, channels, ...] but we have [batch, seq_len, channels]
+                # Reshape to [batch, channels, seq_len] for GroupNorm
+                batch_size, seq_len, channels = cond_embeds.shape
+                cond_embeds = cond_embeds.transpose(1, 2)  # [batch, channels, seq_len]
+                cond_embeds = self.cond_norm(cond_embeds)
+                cond_embeds = cond_embeds.transpose(1, 2)  # [batch, seq_len, channels]
+                image_embeds = image_embeds + self.cond_gate * cond_embeds
+
+        # ---- Merge text & image tokens ----
+        embeds = torch.cat([text_embeds, image_embeds], dim=1).contiguous()
+
+        # ---- Positional embeddings ----
+        if self.use_positional_embeddings or self.use_learned_positional_embeddings:
+            pre_time_compression_frames = (num_frames - 1) * self.temporal_compression_ratio + 1
+            if (
+                self.sample_height != height
+                or self.sample_width != width
+                or self.sample_frames != pre_time_compression_frames
+            ):
+                pos_embedding = self._get_positional_embeddings(
+                    height, width, pre_time_compression_frames, device=embeds.device
+                )
+            else:
+                pos_embedding = self.pos_embedding
+
+            pos_embedding = pos_embedding.to(dtype=embeds.dtype)
+            embeds = embeds + pos_embedding
+
+        return embeds, ref_image_embeds
             
 class CogVideoXFunTransformer3DModelWithAdapter(CogVideoXFunTransformer3DModel):
     """
@@ -713,31 +914,44 @@ class CogVideoXFunTransformer3DModelWithAdapter(CogVideoXFunTransformer3DModel):
     3. Uses CogVideoXPatchEmbedWithAdapter for conditional processing
     """
     
-    def __init__(self, *args, condition_channels: int = 0, **kwargs):
+    def __init__(self, *args, condition_channels: int = 0, adapter_version: str = "v1", **kwargs):
         self.add_noise_in_inpaint_model = kwargs.pop("add_noise_in_inpaint_model", False)
+        self.adapter_version = adapter_version
         
         super().__init__(*args, **kwargs)
         
         # Replace patch_embed with adapter version if condition_channels > 0
         if condition_channels > 0:
-            self._setup_adapter_patch_embed(condition_channels)
+            self._setup_adapter_patch_embed(condition_channels, adapter_version)
             self.condition_channels = condition_channels
         else:
             self.condition_channels = 0
     
-    def _setup_adapter_patch_embed(self, condition_channels: int):
-        """Replace patch_embed with CogVideoXPatchEmbedWithAdapter.
+    def _setup_adapter_patch_embed(self, condition_channels: int, adapter_version: str = "v1"):
+        """Replace patch_embed with CogVideoXPatchEmbedWithAdapter or CogVideoXPatchEmbedWithAdapterV2.
         
         This creates a new adapter-based patch embed that processes conditions
         separately from the main image embeddings.
+        
+        Args:
+            condition_channels: Number of condition channels
+            adapter_version: Version of adapter to use ("v1" or "v2")
         """
-        print(f"Setting up adapter-based patch embed for {condition_channels} condition channels")
+        print(f"Setting up adapter-based patch embed (version {adapter_version}) for {condition_channels} condition channels")
         
         # Get current patch_embed config
         current_patch_embed = self.patch_embed
         
+        # Choose adapter class based on version
+        if adapter_version == "v2":
+            adapter_class = CogVideoXPatchEmbedWithAdapterV2
+            print("  Using CogVideoXPatchEmbedWithAdapterV2 (with GroupNorm and gating)")
+        else:
+            adapter_class = CogVideoXPatchEmbedWithAdapter
+            print("  Using CogVideoXPatchEmbedWithAdapter (standard version)")
+        
         # Create new adapter patch embed with same config
-        adapter_patch_embed = CogVideoXPatchEmbedWithAdapter(
+        adapter_patch_embed = adapter_class(
             condition_channels=condition_channels,
             in_channels=current_patch_embed.proj.in_channels,
             patch_size=getattr(current_patch_embed, 'patch_size', 16),
@@ -775,12 +989,16 @@ class CogVideoXFunTransformer3DModelWithAdapter(CogVideoXFunTransformer3DModel):
         self.register_to_config(
             condition_channels=condition_channels,
             use_adapter_patch_embed=True,
+            adapter_version=adapter_version,
         )
         
-        print(f"✅ Successfully replaced patch_embed with adapter version")
+        print(f"✅ Successfully replaced patch_embed with adapter version {adapter_version}")
         print(f"  Main projection: {adapter_patch_embed.proj}")
         print(f"  Condition projection: {adapter_patch_embed.cond_proj}")
         print(f"  Text projection: {adapter_patch_embed.text_proj}")
+        if adapter_version == "v2":
+            print(f"  Condition norm: {adapter_patch_embed.cond_norm}")
+            print(f"  Condition gate: {adapter_patch_embed.cond_gate}")
     
     @classmethod
     def from_pretrained(
@@ -789,15 +1007,17 @@ class CogVideoXFunTransformer3DModelWithAdapter(CogVideoXFunTransformer3DModel):
         base_model_name_or_path="alibaba-pai/CogVideoX-Fun-V1.1-5b-InP",
         subfolder="transformer",
         condition_channels: Optional[int] = None,
+        adapter_version: str = "v1",
         **kwargs
     ):
         """
-        Load a CogVideoXFunTransformer3DModelWithConcat from a pretrained model.
+        Load a CogVideoXFunTransformer3DModelWithAdapter from a pretrained model.
 
         Args:
             pretrained_model_name_or_path (str): Fine-tuned checkpoint path
             base_model_name_or_path (str): Base CogVideoX-Fun model path
             condition_channels (int): Number of extra condition channels to add
+            adapter_version (str): Version of adapter to use ("v1" or "v2")
         """
         if pretrained_model_name_or_path is not None:
             # === Load fine-tuned checkpoint ===
@@ -814,21 +1034,32 @@ class CogVideoXFunTransformer3DModelWithAdapter(CogVideoXFunTransformer3DModel):
                 # Use base config
                 if condition_channels is None:
                     condition_channels = 16  # default
-                model = cls(condition_channels=condition_channels)
+                model = cls(condition_channels=condition_channels, adapter_version=adapter_version)
 
             # 2) Load checkpoint state_dict directly
-            state_dict_path = os.path.join(pretrained_model_name_or_path, subfolder, "diffusion_pytorch_model.safetensors")
-            if not os.path.exists(state_dict_path):
-                # Try alternative paths
-                state_dict_path = os.path.join(pretrained_model_name_or_path, subfolder, "pytorch_model.bin")
-                if not os.path.exists(state_dict_path):
-                    raise FileNotFoundError(f"No model file found in {pretrained_model_name_or_path}")
-            
-            if state_dict_path.endswith(".safetensors"):
-                from safetensors.torch import load_file
-                state_dict = load_file(state_dict_path)
+            # Try to find all safetensors files first
+            safetensors_files = glob.glob(os.path.join(pretrained_model_name_or_path, subfolder, "*.safetensors"))
+            if safetensors_files:
+                print(f"🔧 Loading weights from {len(safetensors_files)} safetensors files")
+                # Load and merge all safetensors files
+                state_dict = {}
+                for file_path in safetensors_files:
+                    print(f"   Loading: {os.path.basename(file_path)}")
+                    file_state_dict = load_file(file_path)
+                    state_dict.update(file_state_dict)
             else:
-                state_dict = torch.load(state_dict_path, map_location="cpu")
+                # Fallback to single file approach
+                state_dict_path = os.path.join(pretrained_model_name_or_path, subfolder, "diffusion_pytorch_model.safetensors")
+                if not os.path.exists(state_dict_path):
+                    # Try alternative paths
+                    state_dict_path = os.path.join(pretrained_model_name_or_path, subfolder, "pytorch_model.bin")
+                    if not os.path.exists(state_dict_path):
+                        raise FileNotFoundError(f"No model file found in {pretrained_model_name_or_path}")
+                
+                if state_dict_path.endswith(".safetensors"):
+                    state_dict = load_file(state_dict_path)
+                else:
+                    state_dict = torch.load(state_dict_path, map_location="cpu")
 
             # 3) Load with strict=False for flexibility
             missing, unexpected = model.load_state_dict(state_dict, strict=False)
@@ -861,7 +1092,7 @@ class CogVideoXFunTransformer3DModelWithAdapter(CogVideoXFunTransformer3DModel):
                 condition_channels = getattr(base_model.config, "condition_channels", 16)
 
             # Create extended model
-            model = cls(**base_model.config, condition_channels=condition_channels)
+            model = cls(**base_model.config, condition_channels=condition_channels, adapter_version=adapter_version)
 
             # Load base weights into extended model
             missing, unexpected = model.load_state_dict(base_model.state_dict(), strict=False)
@@ -875,9 +1106,10 @@ class CogVideoXFunTransformer3DModelWithAdapter(CogVideoXFunTransformer3DModel):
     def get_condition_info(self) -> Dict[str, Any]:
         """Get information about the conditional setup."""
         info = {
-            "approach": "concat",
+            "approach": "adapter",
             "has_conditions": hasattr(self, 'condition_channels') and self.condition_channels > 0,
             "condition_channels": getattr(self, 'condition_channels', 0),
+            "adapter_version": getattr(self, 'adapter_version', 'v1'),
             "total_input_channels": self.patch_embed.proj.in_channels,
             "base_channels": getattr(self, 'original_in_channels', self.patch_embed.proj.in_channels),
         }
@@ -1054,6 +1286,7 @@ class CrossTransformer3DModelWithAdapter(CogVideoXFunTransformer3DModelWithAdapt
         base_model_name_or_path="alibaba-pai/CogVideoX-Fun-V1.1-5b-InP",
         subfolder="transformer",
         condition_channels: Optional[int] = None,
+        adapter_version: str = "v1",
         is_train_cross: bool = True,
         cross_attn_interval: int = 2,
         cross_attn_dim_head: int = 128,
@@ -1062,12 +1295,13 @@ class CrossTransformer3DModelWithAdapter(CogVideoXFunTransformer3DModelWithAdapt
         **kwargs
     ):
         """
-        Load a CogVideoXFunTransformer3DModelWithConcat from a pretrained model.
+        Load a CrossTransformer3DModelWithAdapter from a pretrained model.
 
         Args:
             pretrained_model_name_or_path (str): Fine-tuned checkpoint path
             base_model_name_or_path (str): Base CogVideoX-Fun model path
             condition_channels (int): Number of extra condition channels to add
+            adapter_version (str): Version of adapter to use ("v1" or "v2")
             is_train_cross (bool): Whether to train cross attention
             cross_attn_interval (int): Interval for cross attention
             cross_attn_dim_head (int): Dimension of head for cross attention
@@ -1090,6 +1324,7 @@ class CrossTransformer3DModelWithAdapter(CogVideoXFunTransformer3DModelWithAdapt
                 if condition_channels is None:
                     condition_channels = 16  # default
                 model = cls(condition_channels=condition_channels,
+                            adapter_version=adapter_version,
                             is_train_cross=is_train_cross,
                             cross_attn_interval=cross_attn_interval,
                             cross_attn_dim_head=cross_attn_dim_head,
@@ -1097,18 +1332,29 @@ class CrossTransformer3DModelWithAdapter(CogVideoXFunTransformer3DModelWithAdapt
                             cross_attn_kv_dim=cross_attn_kv_dim)
 
             # 2) Load checkpoint state_dict directly
-            state_dict_path = os.path.join(pretrained_model_name_or_path, subfolder, "diffusion_pytorch_model.safetensors")
-            if not os.path.exists(state_dict_path):
-                # Try alternative paths
-                state_dict_path = os.path.join(pretrained_model_name_or_path, subfolder, "pytorch_model.bin")
-                if not os.path.exists(state_dict_path):
-                    raise FileNotFoundError(f"No model file found in {pretrained_model_name_or_path}")
-            
-            if state_dict_path.endswith(".safetensors"):
-                from safetensors.torch import load_file
-                state_dict = load_file(state_dict_path)
+            # Try to find all safetensors files first
+            safetensors_files = glob.glob(os.path.join(pretrained_model_name_or_path, subfolder, "*.safetensors"))
+            if safetensors_files:
+                print(f"🔧 Loading weights from {len(safetensors_files)} safetensors files")
+                # Load and merge all safetensors files
+                state_dict = {}
+                for file_path in safetensors_files:
+                    print(f"   Loading: {os.path.basename(file_path)}")
+                    file_state_dict = load_file(file_path)
+                    state_dict.update(file_state_dict)
             else:
-                state_dict = torch.load(state_dict_path, map_location="cpu")
+                # Fallback to single file approach
+                state_dict_path = os.path.join(pretrained_model_name_or_path, subfolder, "diffusion_pytorch_model.safetensors")
+                if not os.path.exists(state_dict_path):
+                    # Try alternative paths
+                    state_dict_path = os.path.join(pretrained_model_name_or_path, subfolder, "pytorch_model.bin")
+                    if not os.path.exists(state_dict_path):
+                        raise FileNotFoundError(f"No model file found in {pretrained_model_name_or_path}")
+                
+                if state_dict_path.endswith(".safetensors"):
+                    state_dict = load_file(state_dict_path)
+                else:
+                    state_dict = torch.load(state_dict_path, map_location="cpu")
 
             # 3) Load with strict=False for flexibility
             missing, unexpected = model.load_state_dict(state_dict, strict=False)
@@ -1143,6 +1389,7 @@ class CrossTransformer3DModelWithAdapter(CogVideoXFunTransformer3DModelWithAdapt
             # Create extended model
             model = cls(**base_model.config, 
                         condition_channels=condition_channels,
+                        adapter_version=adapter_version,
                         is_train_cross=is_train_cross,
                         cross_attn_interval=cross_attn_interval,
                         cross_attn_dim_head=cross_attn_dim_head,

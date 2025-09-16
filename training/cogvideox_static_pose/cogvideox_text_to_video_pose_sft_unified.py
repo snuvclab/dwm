@@ -53,7 +53,8 @@ from training.cogvideox_static_pose.cogvideox_transformer_with_conditions import
 from training.cogvideox_static_pose.cogvideox_fun_transformer_with_conditions import (
     CogVideoXFunTransformer3DModel,
     CogVideoXFunTransformer3DModelWithConcat,
-    CrossTransformer3DModelWithAdapter
+    CrossTransformer3DModelWithAdapter,
+    CogVideoXFunTransformer3DModelWithAdapter
 )
 from training.cogvideox_static_pose.cogvideox_pose_concat_pipeline import CogVideoXPoseConcatPipeline
 from training.cogvideox_static_pose.cogvideox_pose_adapter_pipeline import CogVideoXPoseAdapterPipeline
@@ -355,7 +356,7 @@ def run_validation(
         # Setup basic CogVideoX I2V Pipeline for validation
         from diffusers import CogVideoXImageToVideoPipeline
         pipe = CogVideoXImageToVideoPipeline.from_pretrained(
-            base_model_name_or_path=model_config_dict["pretrained_model_name_or_path"],
+            base_model_name_or_path=model_config_dict["base_model_name_or_path"],
             transformer=unwrap_model(accelerator, transformer),
             scheduler=scheduler,
             revision=model_config_dict.get("revision"),
@@ -365,7 +366,7 @@ def run_validation(
         
     elif pipeline_config["type"] == "cogvideox_pose_concat":
         pipe = CogVideoXPoseConcatPipeline.from_pretrained(
-            base_model_name_or_path=model_config_dict["pretrained_model_name_or_path"],
+            base_model_name_or_path=model_config_dict["base_model_name_or_path"],
             transformer=unwrap_model(accelerator, transformer),
             scheduler=scheduler,
             revision=model_config_dict.get("revision"),
@@ -375,7 +376,7 @@ def run_validation(
     elif pipeline_config["type"] == "cogvideox_pose_adapter":
         adapter_config = config.get("adapter", {})
         pipe = CogVideoXPoseAdapterPipeline.from_pretrained(
-            base_model_name_or_path=model_config_dict["pretrained_model_name_or_path"],
+            base_model_name_or_path=model_config_dict["base_model_name_or_path"],
             transformer=unwrap_model(accelerator, transformer),
             scheduler=scheduler,
             revision=model_config_dict.get("revision"),
@@ -392,7 +393,7 @@ def run_validation(
         smpl_embed_dim = adaln_config.get("smpl_embed_dim", 512)
         
         pipe = CogVideoXPoseAdaLNPipeline.from_pretrained(
-            base_model_name_or_path=model_config_dict["pretrained_model_name_or_path"],
+            base_model_name_or_path=model_config_dict["base_model_name_or_path"],
             transformer=unwrap_model(accelerator, transformer),
             scheduler=scheduler,
             revision=model_config_dict.get("revision"),
@@ -407,7 +408,7 @@ def run_validation(
         smpl_embed_dim = adaln_perframe_config.get("smpl_embed_dim", 512)
         
         pipe = CogVideoXPoseAdaLNPerFramePipeline.from_pretrained(
-            base_model_name_or_path=model_config_dict["pretrained_model_name_or_path"],
+            base_model_name_or_path=model_config_dict["base_model_name_or_path"],
             transformer=unwrap_model(accelerator, transformer),
             scheduler=scheduler,
             revision=model_config_dict.get("revision"),
@@ -418,7 +419,7 @@ def run_validation(
         )
     elif pipeline_config["type"] == "cogvideox_static_to_video":
         pipe = CogVideoXStaticToVideoPipeline.from_pretrained(
-            base_model_name_or_path=model_config_dict["pretrained_model_name_or_path"],
+            base_model_name_or_path=model_config_dict["base_model_name_or_path"],
             transformer=unwrap_model(accelerator, transformer),
             scheduler=scheduler,
             revision=model_config_dict.get("revision"),
@@ -427,7 +428,7 @@ def run_validation(
         )
     elif pipeline_config["type"] == "cogvideox_static_to_video_pose_concat":
         pipe = CogVideoXStaticToVideoPoseConcatPipeline.from_pretrained(
-            base_model_name_or_path=model_config_dict["pretrained_model_name_or_path"],
+            base_model_name_or_path=model_config_dict["base_model_name_or_path"],
             transformer=unwrap_model(accelerator, transformer),
             scheduler=scheduler,
             revision=model_config_dict.get("revision"),
@@ -436,7 +437,7 @@ def run_validation(
         )
     elif pipeline_config["type"] == "cogvideox_fun_static_to_video":
         pipe = CogVideoXFunStaticToVideoPipeline.from_pretrained(
-            base_model_name_or_path=model_config_dict["pretrained_model_name_or_path"],
+            base_model_name_or_path=model_config_dict["base_model_name_or_path"],
             transformer=unwrap_model(accelerator, transformer),
             scheduler=scheduler,
             revision=model_config_dict.get("revision"),
@@ -448,13 +449,14 @@ def run_validation(
         condition_channels = pipeline_config.get("condition_channels", 16)
         
         pipe = CogVideoXFunStaticToVideoPipeline.from_pretrained(
-            base_model_name_or_path=model_config_dict["pretrained_model_name_or_path"],
+            base_model_name_or_path=model_config_dict["base_model_name_or_path"],
             transformer=unwrap_model(accelerator, transformer),
             scheduler=scheduler,
             revision=model_config_dict.get("revision"),
             variant=model_config_dict.get("variant"),
             torch_dtype=weight_dtype,
             condition_channels=condition_channels,
+            use_adapter=False,
         )
     elif pipeline_config["type"] == "cogvideox_fun_static_to_video_cross":
         # Get cross-attention parameters from pipeline config
@@ -463,9 +465,10 @@ def run_validation(
         cross_attn_num_heads = pipeline_config.get("cross_attn_num_heads", 16)
         cross_attn_kv_dim = pipeline_config.get("cross_attn_kv_dim", None)
         is_train_cross = pipeline_config.get("is_train_cross", True)
+        adapter_version = pipeline_config.get("adapter_version", "v1")
         
         pipe = CogVideoXFunStaticToVideoCrossPipeline.from_pretrained(
-            base_model_name_or_path=model_config_dict["pretrained_model_name_or_path"],
+            base_model_name_or_path=model_config_dict["base_model_name_or_path"],
             transformer=unwrap_model(accelerator, transformer),
             scheduler=scheduler,
             revision=model_config_dict.get("revision"),
@@ -476,6 +479,7 @@ def run_validation(
             cross_attn_dim_head=cross_attn_dim_head,
             cross_attn_num_heads=cross_attn_num_heads,
             cross_attn_kv_dim=cross_attn_kv_dim,
+            adapter_version=adapter_version,
         )
     elif pipeline_config["type"] == "cogvideox_fun_static_to_video_cross_pose_adapter":
         # Get cross-attention parameters from pipeline config
@@ -485,9 +489,10 @@ def run_validation(
         cross_attn_kv_dim = pipeline_config.get("cross_attn_kv_dim", None)
         is_train_cross = pipeline_config.get("is_train_cross", True)
         condition_channels = pipeline_config.get("condition_channels", 16)
+        adapter_version = pipeline_config.get("adapter_version", "v1")
         
         pipe = CogVideoXFunStaticToVideoCrossPipeline.from_pretrained(
-            base_model_name_or_path=model_config_dict["pretrained_model_name_or_path"],
+            base_model_name_or_path=model_config_dict["base_model_name_or_path"],
             transformer=unwrap_model(accelerator, transformer),
             scheduler=scheduler,
             revision=model_config_dict.get("revision"),
@@ -499,14 +504,16 @@ def run_validation(
             cross_attn_num_heads=cross_attn_num_heads,
             cross_attn_kv_dim=cross_attn_kv_dim,
             condition_channels=condition_channels,
+            adapter_version=adapter_version,
         )
     elif pipeline_config["type"] == "cogvideox_fun_static_to_video_pose_adapter":
         # Get condition_channels and use_adapter from pipeline config
         condition_channels = pipeline_config.get("condition_channels", 16)
         use_adapter = pipeline_config.get("use_adapter", True)
+        adapter_version = pipeline_config.get("adapter_version", "v1")
         
         pipe = CogVideoXFunStaticToVideoPipeline.from_pretrained(
-            base_model_name_or_path=model_config_dict["pretrained_model_name_or_path"],
+            base_model_name_or_path=model_config_dict["base_model_name_or_path"],
             transformer=unwrap_model(accelerator, transformer),
             scheduler=scheduler,
             revision=model_config_dict.get("revision"),
@@ -514,6 +521,7 @@ def run_validation(
             torch_dtype=weight_dtype,
             condition_channels=condition_channels,
             use_adapter=use_adapter,
+            adapter_version=adapter_version,
         )
     else:
         raise ValueError(f"Unsupported pipeline type: {pipeline_config['type']}")
@@ -818,7 +826,7 @@ def setup_pipeline_from_config(config: Dict[str, Any]):
     
     # Determine load dtype based on model size
     model_config = config["model"]
-    model_path = model_config["pretrained_model_name_or_path"]
+    model_path = model_config["base_model_name_or_path"]
     load_dtype = torch.bfloat16 if "5b" in model_path.lower() else torch.float16
     
     if pipeline_type == "cogvideox_i2v":
@@ -926,6 +934,7 @@ def setup_pipeline_from_config(config: Dict[str, Any]):
             torch_dtype=load_dtype,
             revision=model_config.get("revision"),
             variant=model_config.get("variant"),
+            use_adapter=False,
         )
         
     elif pipeline_type == "cogvideox_fun_static_to_video_pose_concat":
@@ -942,6 +951,7 @@ def setup_pipeline_from_config(config: Dict[str, Any]):
             revision=model_config.get("revision"),
             variant=model_config.get("variant"),
             condition_channels=condition_channels,
+            use_adapter=False,
         )
         
     elif pipeline_type == "cogvideox_fun_static_to_video_cross":
@@ -953,6 +963,7 @@ def setup_pipeline_from_config(config: Dict[str, Any]):
         cross_attn_dim_head = pipeline_config.get("cross_attn_dim_head", 128)
         cross_attn_num_heads = pipeline_config.get("cross_attn_num_heads", 16)
         cross_attn_kv_dim = pipeline_config.get("cross_attn_kv_dim", None)
+        adapter_version = pipeline_config.get("adapter_version", "v1")
         
         pipeline = CogVideoXFunStaticToVideoCrossPipeline.from_pretrained(
             pretrained_model_name_or_path=None,  # Always start from base model
@@ -965,6 +976,7 @@ def setup_pipeline_from_config(config: Dict[str, Any]):
             cross_attn_dim_head=cross_attn_dim_head,
             cross_attn_num_heads=cross_attn_num_heads,
             cross_attn_kv_dim=cross_attn_kv_dim,
+            adapter_version=adapter_version,
         )
         
     elif pipeline_type == "cogvideox_fun_static_to_video_cross_pose_adapter":
@@ -977,6 +989,7 @@ def setup_pipeline_from_config(config: Dict[str, Any]):
         cross_attn_num_heads = pipeline_config.get("cross_attn_num_heads", 16)
         cross_attn_kv_dim = pipeline_config.get("cross_attn_kv_dim", None)
         condition_channels = pipeline_config.get("condition_channels", 16)
+        adapter_version = pipeline_config.get("adapter_version", "v1")
         
         pipeline = CogVideoXFunStaticToVideoCrossPipeline.from_pretrained(
             pretrained_model_name_or_path=None,  # Always start from base model
@@ -990,6 +1003,7 @@ def setup_pipeline_from_config(config: Dict[str, Any]):
             cross_attn_num_heads=cross_attn_num_heads,
             cross_attn_kv_dim=cross_attn_kv_dim,
             condition_channels=condition_channels,
+            adapter_version=adapter_version,
         )
         
     elif pipeline_type == "cogvideox_fun_static_to_video_pose_adapter":
@@ -999,6 +1013,7 @@ def setup_pipeline_from_config(config: Dict[str, Any]):
         # Get condition_channels and use_adapter from pipeline config
         condition_channels = pipeline_config.get("condition_channels", 16)
         use_adapter = pipeline_config.get("use_adapter", True)
+        adapter_version = pipeline_config.get("adapter_version", "v1")
         
         pipeline = CogVideoXFunStaticToVideoPipeline.from_pretrained(
             pretrained_model_name_or_path=None,  # Always start from base model
@@ -1008,6 +1023,7 @@ def setup_pipeline_from_config(config: Dict[str, Any]):
             variant=model_config.get("variant"),
             condition_channels=condition_channels,
             use_adapter=use_adapter,
+            adapter_version=adapter_version,
         )
         
     else:
@@ -1198,11 +1214,29 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
                         
                         # Save projection layer weights if applicable
                         projection_state_dict = None
-                        if hasattr(model, 'patch_embed') and hasattr(model.patch_embed, 'proj'):
-                            projection_state_dict = {
-                                "transformer.patch_embed.proj.weight": model.patch_embed.proj.weight.data,
-                                "transformer.patch_embed.proj.bias": model.patch_embed.proj.bias.data if model.patch_embed.proj.bias is not None else None,
-                            }
+                        if "concat" in pipeline_type:
+                            # Concat models: save proj weights (modified existing proj)
+                            if hasattr(model, 'patch_embed') and hasattr(model.patch_embed, 'proj'):
+                                projection_state_dict = {
+                                    "transformer.patch_embed.proj.weight": model.patch_embed.proj.weight.data,
+                                    "transformer.patch_embed.proj.bias": model.patch_embed.proj.bias.data if model.patch_embed.proj.bias is not None else None,
+                                }
+                        elif "adapter" in pipeline_type:
+                            # Adapter models: save cond_proj weights (newly added cond_proj)
+                            if hasattr(model, 'patch_embed') and hasattr(model.patch_embed, 'cond_proj'):
+                                projection_state_dict = {
+                                    "transformer.patch_embed.cond_proj.weight": model.patch_embed.cond_proj.weight.data,
+                                    "transformer.patch_embed.cond_proj.bias": model.patch_embed.cond_proj.bias.data if model.patch_embed.cond_proj.bias is not None else None,
+                                }
+                                
+                                # Save cond_norm weights for CogVideoXPatchEmbedWithAdapterV2
+                                if hasattr(model.patch_embed, 'cond_norm'):
+                                    projection_state_dict["transformer.patch_embed.cond_norm.weight"] = model.patch_embed.cond_norm.weight.data
+                                    projection_state_dict["transformer.patch_embed.cond_norm.bias"] = model.patch_embed.cond_norm.bias.data
+                                
+                                # Save cond_gate for CogVideoXPatchEmbedWithAdapterV2
+                                if hasattr(model.patch_embed, 'cond_gate'):
+                                    projection_state_dict["transformer.patch_embed.cond_gate"] = model.patch_embed.cond_gate.data
                         
                         # Save LoRA weights
                         if pipeline_type == "cogvideox_i2v":
@@ -1265,7 +1299,15 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
                         
                         # Save projection layer weights separately
                         if projection_state_dict:
-                            torch.save(projection_state_dict, os.path.join(output_dir, "projection_layer_weights.pt"))
+                            saved_keys = list(projection_state_dict.keys())
+                            if "concat" in pipeline_type:
+                                # Concat models: save as projection_layer_weights.pt
+                                torch.save(projection_state_dict, os.path.join(output_dir, "projection_layer_weights.pt"))
+                                print(f"✅ Saved concat projection weights: {saved_keys}")
+                            elif "adapter" in pipeline_type:
+                                # Adapter models: save as cond_proj_weights.pt
+                                torch.save(projection_state_dict, os.path.join(output_dir, "cond_proj_weights.pt"))
+                                print(f"✅ Saved adapter projection weights: {saved_keys}")
                     else:
                         # Save full model
                         model.save_pretrained(
@@ -1281,129 +1323,162 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
     def load_model_hook(models, input_dir):
         transformer_ = None
         
-        # Get configurations for all pipeline types (needed for both DeepSpeed and non-DeepSpeed paths)
+        # Get configurations for all pipeline types
         concat_config = config.get("concat", {})
         adapter_config = config.get("adapter", {})
         adaln_config = config.get("adaln", {})
         
+        # First, load the base transformer model based on pipeline type
+        # This is the same logic regardless of DeepSpeed or training mode
+        if pipeline_type == "cogvideox_i2v":
+            # Get basic CogVideoX transformer for I2V
+            from diffusers import CogVideoXTransformer3DModel
+            transformer_ = CogVideoXTransformer3DModel.from_pretrained(
+                config["model"]["base_model_name_or_path"],
+                subfolder="transformer",
+            )
+        elif pipeline_type == "cogvideox_pose_concat":
+            # Get configuration for concat approach
+            transformer_ = CogVideoXTransformer3DModelWithConcat.from_pretrained(
+                pretrained_model_name_or_path=None,  # Always start from base model
+                base_model_name_or_path=config["model"]["base_model_name_or_path"],
+                condition_channels=concat_config.get("condition_channels", 0),
+            )
+        elif pipeline_type == "cogvideox_pose_adapter":
+            # Get adapter configuration from pipeline config
+            transformer_ = CogVideoXTransformer3DModelWithAdapter.from_pretrained(
+                pretrained_model_name_or_path=None,  # Always start from base model
+                base_model_name_or_path=config["model"]["base_model_name_or_path"],
+                adapter_norm=adapter_config.get("norm", "group"),
+                adapter_groups=adapter_config.get("groups", 32),
+            )
+        elif pipeline_type == "cogvideox_pose_adaln":
+            # Get AdaLN configuration from pipeline config
+            smpl_pose_dim = adaln_config.get("smpl_pose_dim", 63)
+            smpl_embed_dim = adaln_config.get("smpl_embed_dim", 512)
+            transformer_ = CogVideoXTransformer3DModelWithAdaLNPose.from_pretrained(
+                pretrained_model_name_or_path=None,  # Always start from base model
+                base_model_name_or_path=config["model"]["base_model_name_or_path"],
+                smpl_pose_dim=smpl_pose_dim,
+                smpl_embed_dim=smpl_embed_dim,
+            )
+        elif pipeline_type == "cogvideox_pose_adaln_perframe":
+            # Get AdaLN per-frame configuration from pipeline config
+            adaln_perframe_config = config.get("adaln_perframe", {})
+            smpl_pose_dim = adaln_perframe_config.get("smpl_pose_dim", 63)
+            smpl_embed_dim = adaln_perframe_config.get("smpl_embed_dim", 512)
+            transformer_ = CogVideoXTransformer3DModelWithAdaLNPosePerFrame.from_pretrained(
+                pretrained_model_name_or_path=None,  # Always start from base model
+                base_model_name_or_path=config["model"]["base_model_name_or_path"],
+                smpl_pose_dim=smpl_pose_dim,
+                smpl_embed_dim=smpl_embed_dim,
+            )
+        elif pipeline_type == "cogvideox_fun_static_to_video":
+            # For VideoX-Fun static-to-video, use VideoX-Fun transformer
+            from training.cogvideox_static_pose.cogvideox_fun_transformer_with_conditions import CogVideoXFunTransformer3DModel
+            transformer_ = CogVideoXFunTransformer3DModel.from_pretrained(
+                pretrained_model_name_or_path=None,  # Always start from base model
+                base_model_name_or_path=config["model"]["base_model_name_or_path"],
+                subfolder="transformer",
+            )
+        elif pipeline_type == "cogvideox_fun_static_to_video_pose_concat":
+            # For VideoX-Fun static-to-video pose concat, use concat transformer
+            from training.cogvideox_static_pose.cogvideox_fun_transformer_with_conditions import CogVideoXFunTransformer3DModelWithConcat
+            condition_channels = config["pipeline"].get("condition_channels", 16)
+            transformer_ = CogVideoXFunTransformer3DModelWithConcat.from_pretrained(
+                pretrained_model_name_or_path=None,  # Always start from base model
+                base_model_name_or_path=config["model"]["base_model_name_or_path"],
+                condition_channels=condition_channels,
+                subfolder="transformer",
+            )
+        elif pipeline_type == "cogvideox_fun_static_to_video_cross":
+            # For VideoX-Fun CrossPipeline, use cross-attention transformer
+            cross_attn_interval = config["pipeline"].get("cross_attn_interval", 2)
+            cross_attn_dim_head = config["pipeline"].get("cross_attn_dim_head", 128)
+            cross_attn_num_heads = config["pipeline"].get("cross_attn_num_heads", 16)
+            cross_attn_kv_dim = config["pipeline"].get("cross_attn_kv_dim", None)
+            adapter_version = config["pipeline"].get("adapter_version", "v1")
+            transformer_ = CrossTransformer3DModelWithAdapter.from_pretrained(
+                pretrained_model_name_or_path=None,  # Always start from base model
+                base_model_name_or_path=config["model"]["base_model_name_or_path"],
+                is_train_cross=True,
+                cross_attn_interval=cross_attn_interval,
+                cross_attn_dim_head=cross_attn_dim_head,
+                cross_attn_num_heads=cross_attn_num_heads,
+                cross_attn_kv_dim=cross_attn_kv_dim,
+                adapter_version=adapter_version,
+                subfolder="transformer",
+            )
+        elif pipeline_type == "cogvideox_fun_static_to_video_cross_pose_adapter":
+            # For VideoX-Fun CrossPipeline with pose adapter, use cross-attention transformer
+            cross_attn_interval = config["pipeline"].get("cross_attn_interval", 2)
+            cross_attn_dim_head = config["pipeline"].get("cross_attn_dim_head", 128)
+            cross_attn_num_heads = config["pipeline"].get("cross_attn_num_heads", 16)
+            cross_attn_kv_dim = config["pipeline"].get("cross_attn_kv_dim", None)
+            condition_channels = config["pipeline"].get("condition_channels", 16)
+            adapter_version = config["pipeline"].get("adapter_version", "v1")
+            transformer_ = CrossTransformer3DModelWithAdapter.from_pretrained(
+                pretrained_model_name_or_path=None,  # Always start from base model
+                base_model_name_or_path=config["model"]["base_model_name_or_path"],
+                is_train_cross=True,
+                cross_attn_interval=cross_attn_interval,
+                cross_attn_dim_head=cross_attn_dim_head,
+                cross_attn_num_heads=cross_attn_num_heads,
+                cross_attn_kv_dim=cross_attn_kv_dim,
+                condition_channels=condition_channels,
+                adapter_version=adapter_version,
+                subfolder="transformer",
+            )
+        elif pipeline_type == "cogvideox_fun_static_to_video_pose_adapter":
+            # For VideoX-Fun Pipeline with pose adapter, use adapter transformer
+            from training.cogvideox_static_pose.cogvideox_fun_transformer_with_conditions import CogVideoXFunTransformer3DModelWithAdapter
+            condition_channels = config["pipeline"].get("condition_channels", 16)
+            use_adapter = config["pipeline"].get("use_adapter", True)
+            adapter_version = config["pipeline"].get("adapter_version", "v1")
+            transformer_ = CogVideoXFunTransformer3DModelWithAdapter.from_pretrained(
+                pretrained_model_name_or_path=None,  # Always start from base model
+                base_model_name_or_path=config["model"]["base_model_name_or_path"],
+                condition_channels=condition_channels,
+                use_adapter=use_adapter,
+                adapter_version=adapter_version,
+                subfolder="transformer",
+            )
+        elif pipeline_type == "cogvideox_static_to_video_pose_concat":
+            # For static-to-video pose concat, use concat transformer
+            condition_channels = concat_config.get("condition_channels", 16)
+            transformer_ = CogVideoXTransformer3DModelWithConcat.from_pretrained(
+                pretrained_model_name_or_path=None,  # Always start from base model
+                base_model_name_or_path=config["model"]["base_model_name_or_path"],
+                condition_channels=condition_channels,
+            )
+        else:
+            raise ValueError(f"Unknown pipeline type: {pipeline_type}")
+        
+        # For non-DeepSpeed, replace the model in the models list
         if not accelerator.distributed_type == DistributedType.DEEPSPEED:
             while len(models) > 0:
                 model = models.pop()
                 if isinstance(unwrap_model(accelerator, model), type(unwrap_model(accelerator, transformer))):
+                    # Replace the model with our loaded transformer
+                    model.load_state_dict(transformer_.state_dict())
                     transformer_ = unwrap_model(accelerator, model)
-        else:
-            if pipeline_type == "cogvideox_i2v":
-                # Get basic CogVideoX transformer for I2V
-                from diffusers import CogVideoXTransformer3DModel
-                transformer_ = CogVideoXTransformer3DModel.from_pretrained(
-                    config["model"]["pretrained_model_name_or_path"],
-                    subfolder="transformer",
-                )
-            elif pipeline_type == "cogvideox_pose_concat":
-                # Get configuration for concat approach
-                transformer_ = CogVideoXTransformer3DModelWithConcat.from_pretrained(
-                    pretrained_model_name_or_path=os.path.join(input_dir, "transformer"),
-                    base_model_name_or_path=config["model"]["pretrained_model_name_or_path"],
-                    condition_channels=concat_config.get("condition_channels", 0),
-                )
-            elif pipeline_type == "cogvideox_pose_adapter":
-                # Get adapter configuration from pipeline config
-                transformer_ = CogVideoXTransformer3DModelWithAdapter.from_pretrained(
-                    pretrained_model_name_or_path=os.path.join(input_dir, "transformer"),
-                    base_model_name_or_path=config["model"]["pretrained_model_name_or_path"],
-                    adapter_norm=adapter_config.get("norm", "group"),
-                    adapter_groups=adapter_config.get("groups", 32),
-                )
-            elif pipeline_type == "cogvideox_pose_adaln":
-                # Get AdaLN configuration from pipeline config
-                smpl_pose_dim = adaln_config.get("smpl_pose_dim", 63)
-                smpl_embed_dim = adaln_config.get("smpl_embed_dim", 512)
-                transformer_ = CogVideoXTransformer3DModelWithAdaLNPose.from_pretrained(
-                    pretrained_model_name_or_path=os.path.join(input_dir, "transformer"),
-                    base_model_name_or_path=config["model"]["pretrained_model_name_or_path"],
-                    smpl_pose_dim=smpl_pose_dim,
-                    smpl_embed_dim=smpl_embed_dim,
-                )
-            elif pipeline_type == "cogvideox_pose_adaln_perframe":
-                # Get AdaLN per-frame configuration from pipeline config
-                adaln_perframe_config = config.get("adaln_perframe", {})
-                smpl_pose_dim = adaln_perframe_config.get("smpl_pose_dim", 63)
-                smpl_embed_dim = adaln_perframe_config.get("smpl_embed_dim", 512)
-                transformer_ = CogVideoXTransformer3DModelWithAdaLNPosePerFrame.from_pretrained(
-                    pretrained_model_name_or_path=os.path.join(input_dir, "transformer"),
-                    base_model_name_or_path=config["model"]["pretrained_model_name_or_path"],
-                    smpl_pose_dim=smpl_pose_dim,
-                    smpl_embed_dim=smpl_embed_dim,
-                )
-            elif pipeline_type == "cogvideox_fun_static_to_video":
-                # For VideoX-Fun static-to-video, use VideoX-Fun transformer
-                from training.cogvideox_static_pose.cogvideox_fun_transformer_with_conditions import CogVideoXFunTransformer3DModel
-                transformer_ = CogVideoXFunTransformer3DModel.from_pretrained(
-                    pretrained_model_name_or_path=os.path.join(input_dir, "transformer"),
-                    base_model_name_or_path=config["model"]["pretrained_model_name_or_path"],
-                )
-            elif pipeline_type == "cogvideox_fun_static_to_video_pose_concat":
-                # For VideoX-Fun static-to-video pose concat, use concat transformer
-                from training.cogvideox_static_pose.cogvideox_fun_transformer_with_conditions import CogVideoXFunTransformer3DModelWithConcat
-                condition_channels = config["pipeline"].get("condition_channels", 16)
-                transformer_ = CogVideoXFunTransformer3DModelWithConcat.from_pretrained(
-                    pretrained_model_name_or_path=os.path.join(input_dir, "transformer"),
-                    base_model_name_or_path=config["model"]["pretrained_model_name_or_path"],
-                    condition_channels=condition_channels,
-                )
-            elif pipeline_type == "cogvideox_fun_static_to_video_cross":
-                # For VideoX-Fun CrossPipeline, use cross-attention transformer
-                cross_attn_interval = config["pipeline"].get("cross_attn_interval", 2)
-                cross_attn_dim_head = config["pipeline"].get("cross_attn_dim_head", 128)
-                cross_attn_num_heads = config["pipeline"].get("cross_attn_num_heads", 16)
-                cross_attn_kv_dim = config["pipeline"].get("cross_attn_kv_dim", None)
-                transformer_ = CrossTransformer3DModelWithAdapter.from_pretrained(
-                    pretrained_model_name_or_path=os.path.join(input_dir, "transformer"),
-                    base_model_name_or_path=config["model"]["pretrained_model_name_or_path"],
-                    is_train_cross=True,
-                    cross_attn_interval=cross_attn_interval,
-                    cross_attn_dim_head=cross_attn_dim_head,
-                    cross_attn_num_heads=cross_attn_num_heads,
-                    cross_attn_kv_dim=cross_attn_kv_dim,
-                )
-            elif pipeline_type == "cogvideox_fun_static_to_video_cross_pose_adapter":
-                # For VideoX-Fun CrossPipeline with pose adapter, use cross-attention transformer
-                cross_attn_interval = config["pipeline"].get("cross_attn_interval", 2)
-                cross_attn_dim_head = config["pipeline"].get("cross_attn_dim_head", 128)
-                cross_attn_num_heads = config["pipeline"].get("cross_attn_num_heads", 16)
-                cross_attn_kv_dim = config["pipeline"].get("cross_attn_kv_dim", None)
-                condition_channels = config["pipeline"].get("condition_channels", 16)
-                transformer_ = CrossTransformer3DModelWithAdapter.from_pretrained(
-                    pretrained_model_name_or_path=os.path.join(input_dir, "transformer"),
-                    base_model_name_or_path=config["model"]["pretrained_model_name_or_path"],
-                    is_train_cross=True,
-                    cross_attn_interval=cross_attn_interval,
-                    cross_attn_dim_head=cross_attn_dim_head,
-                    cross_attn_num_heads=cross_attn_num_heads,
-                    cross_attn_kv_dim=cross_attn_kv_dim,
-                    condition_channels=condition_channels,
-                )
-            elif pipeline_type == "cogvideox_fun_static_to_video_pose_adapter":
-                # For VideoX-Fun Pipeline with pose adapter, use adapter transformer
-                from training.cogvideox_static_pose.cogvideox_fun_transformer_with_conditions import CogVideoXFunTransformer3DModelWithAdapter
-                condition_channels = config["pipeline"].get("condition_channels", 16)
-                use_adapter = config["pipeline"].get("use_adapter", True)
-                transformer_ = CogVideoXFunTransformer3DModelWithAdapter.from_pretrained(
-                    pretrained_model_name_or_path=os.path.join(input_dir, "transformer"),
-                    base_model_name_or_path=config["model"]["pretrained_model_name_or_path"],
-                    condition_channels=condition_channels,
-                    use_adapter=use_adapter,
-                )
-            elif pipeline_type == "cogvideox_static_to_video_pose_concat":
-                # For static-to-video pose concat, use concat transformer
-                condition_channels = concat_config.get("condition_channels", 16)
-                transformer_ = CogVideoXTransformer3DModelWithConcat.from_pretrained(
-                    pretrained_model_name_or_path=os.path.join(input_dir, "transformer"),
-                    base_model_name_or_path=config["model"]["pretrained_model_name_or_path"],
-                    condition_channels=condition_channels,
-                )
+                    break
         
+        # Now apply training mode specific loading (LoRA or full model)
         if training_mode == "lora":
+            # First, add PEFT adapter to transformer if it doesn't have one
+            if not hasattr(transformer_, 'peft_config'):
+                # Get LoRA parameters from config
+                lora_rank = config["training"].get("lora_rank", 64)
+                lora_alpha = config["training"].get("lora_alpha", 64)
+                
+                lora_config = LoraConfig(
+                    r=lora_rank,
+                    lora_alpha=lora_alpha,
+                    target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+                )
+                transformer_.add_adapter(lora_config)
+            
             # Load LoRA weights
             if pipeline_type == "cogvideox_i2v":
                 # For basic I2V pipeline, use standard CogVideoXImageToVideoPipeline
@@ -1437,16 +1512,61 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
             set_peft_model_state_dict(transformer_, transformer_state_dict, adapter_name="default")
             
             # Load projection layer weights if they exist
-            projection_file = os.path.join(input_dir, "projection_layer_weights.pt")
-            if os.path.exists(projection_file):
-                projection_state_dict = torch.load(projection_file, map_location="cpu")
-                if hasattr(transformer_, 'patch_embed') and hasattr(transformer_.patch_embed, 'proj'):
-                    if "transformer.patch_embed.proj.weight" in projection_state_dict:
-                        transformer_.patch_embed.proj.weight.data.copy_(projection_state_dict["transformer.patch_embed.proj.weight"])
-                    if "transformer.patch_embed.proj.bias" in projection_state_dict and projection_state_dict["transformer.patch_embed.proj.bias"] is not None:
-                        transformer_.patch_embed.proj.bias.data.copy_(projection_state_dict["transformer.patch_embed.proj.bias"])
+            if "concat" in pipeline_type:
+                # Concat models: load proj weights
+                projection_file = os.path.join(input_dir, "projection_layer_weights.pt")
+                if os.path.exists(projection_file):
+                    projection_state_dict = torch.load(projection_file, map_location="cpu")
+                    if hasattr(transformer_, 'patch_embed') and hasattr(transformer_.patch_embed, 'proj'):
+                        loaded_keys = []
+                        if "transformer.patch_embed.proj.weight" in projection_state_dict:
+                            transformer_.patch_embed.proj.weight.data.copy_(projection_state_dict["transformer.patch_embed.proj.weight"])
+                            loaded_keys.append("proj.weight")
+                        if "transformer.patch_embed.proj.bias" in projection_state_dict and projection_state_dict["transformer.patch_embed.proj.bias"] is not None:
+                            transformer_.patch_embed.proj.bias.data.copy_(projection_state_dict["transformer.patch_embed.proj.bias"])
+                            loaded_keys.append("proj.bias")
+                        print(f"✅ Loaded concat projection weights: {loaded_keys}")
+                    else:
+                        print("⚠️ No patch_embed.proj found for concat model")
+                else:
+                    print("⚠️ No projection_layer_weights.pt found for concat model")
+            elif "adapter" in pipeline_type:
+                # Adapter models: load cond_proj weights (including cond_norm and cond_gate for v2)
+                cond_proj_file = os.path.join(input_dir, "cond_proj_weights.pt")
+                if os.path.exists(cond_proj_file):
+                    cond_proj_state_dict = torch.load(cond_proj_file, map_location="cpu")
+                    if hasattr(transformer_, 'patch_embed') and hasattr(transformer_.patch_embed, 'cond_proj'):
+                        loaded_keys = []
+                        if "transformer.patch_embed.cond_proj.weight" in cond_proj_state_dict:
+                            transformer_.patch_embed.cond_proj.weight.data.copy_(cond_proj_state_dict["transformer.patch_embed.cond_proj.weight"])
+                            loaded_keys.append("cond_proj.weight")
+                        if "transformer.patch_embed.cond_proj.bias" in cond_proj_state_dict and cond_proj_state_dict["transformer.patch_embed.cond_proj.bias"] is not None:
+                            transformer_.patch_embed.cond_proj.bias.data.copy_(cond_proj_state_dict["transformer.patch_embed.cond_proj.bias"])
+                            loaded_keys.append("cond_proj.bias")
+                        
+                        # Load cond_norm weights for CogVideoXPatchEmbedWithAdapterV2
+                        if hasattr(transformer_.patch_embed, 'cond_norm'):
+                            if "transformer.patch_embed.cond_norm.weight" in cond_proj_state_dict:
+                                transformer_.patch_embed.cond_norm.weight.data.copy_(cond_proj_state_dict["transformer.patch_embed.cond_norm.weight"])
+                                loaded_keys.append("cond_norm.weight")
+                            if "transformer.patch_embed.cond_norm.bias" in cond_proj_state_dict:
+                                transformer_.patch_embed.cond_norm.bias.data.copy_(cond_proj_state_dict["transformer.patch_embed.cond_norm.bias"])
+                                loaded_keys.append("cond_norm.bias")
+                        
+                        # Load cond_gate for CogVideoXPatchEmbedWithAdapterV2
+                        if hasattr(transformer_.patch_embed, 'cond_gate'):
+                            if "transformer.patch_embed.cond_gate" in cond_proj_state_dict:
+                                transformer_.patch_embed.cond_gate.data.copy_(cond_proj_state_dict["transformer.patch_embed.cond_gate"])
+                                loaded_keys.append("cond_gate")
+                        
+                        print(f"✅ Loaded adapter projection weights: {loaded_keys}")
+                    else:
+                        print("⚠️ No patch_embed.cond_proj found for adapter model")
+                else:
+                    print("⚠️ No cond_proj_weights.pt found for adapter model")
         else:
-            # Load full model based on pipeline type
+            # Load full model weights from checkpoint
+            load_model = None
             if pipeline_type == "cogvideox_i2v":
                 # For basic I2V pipeline, use standard CogVideoXTransformer3DModel
                 from diffusers import CogVideoXTransformer3DModel
@@ -1454,20 +1574,20 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
             elif pipeline_type == "cogvideox_pose_concat":
                 load_model = CogVideoXTransformer3DModelWithConcat.from_pretrained(
                     pretrained_model_name_or_path=os.path.join(input_dir, "transformer"),
-                    base_model_name_or_path=config["model"]["pretrained_model_name_or_path"],
+                    base_model_name_or_path=config["model"]["base_model_name_or_path"],
                     condition_channels=concat_config.get("condition_channels", None)
                 )
             elif pipeline_type == "cogvideox_pose_adapter":
                 load_model = CogVideoXTransformer3DModelWithAdapter.from_pretrained(
                     pretrained_model_name_or_path=os.path.join(input_dir, "transformer"),
-                    base_model_name_or_path=config["model"]["pretrained_model_name_or_path"]
+                    base_model_name_or_path=config["model"]["base_model_name_or_path"]
                 )
             elif pipeline_type == "cogvideox_pose_adaln":
                 smpl_pose_dim = adaln_config.get("smpl_pose_dim", 63)
                 smpl_embed_dim = adaln_config.get("smpl_embed_dim", 512)
                 load_model = CogVideoXTransformer3DModelWithAdaLNPose.from_pretrained(
                     pretrained_model_name_or_path=os.path.join(input_dir, "transformer"),
-                    base_model_name_or_path=config["model"]["pretrained_model_name_or_path"],
+                    base_model_name_or_path=config["model"]["base_model_name_or_path"],
                     smpl_pose_dim=smpl_pose_dim,
                     smpl_embed_dim=smpl_embed_dim,
                 )
@@ -1477,7 +1597,7 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
                 smpl_embed_dim = adaln_perframe_config.get("smpl_embed_dim", 512)
                 load_model = CogVideoXTransformer3DModelWithAdaLNPosePerFrame.from_pretrained(
                     pretrained_model_name_or_path=os.path.join(input_dir, "transformer"),
-                    base_model_name_or_path=config["model"]["pretrained_model_name_or_path"],
+                    base_model_name_or_path=config["model"]["base_model_name_or_path"],
                     smpl_pose_dim=smpl_pose_dim,
                     smpl_embed_dim=smpl_embed_dim,
                 )
@@ -1491,7 +1611,7 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
                 condition_channels = config["pipeline"].get("condition_channels", 16)
                 load_model = CogVideoXFunTransformer3DModelWithConcat.from_pretrained(
                     pretrained_model_name_or_path=os.path.join(input_dir, "transformer"),
-                    base_model_name_or_path=config["model"]["pretrained_model_name_or_path"],
+                    base_model_name_or_path=config["model"]["base_model_name_or_path"],
                     condition_channels=condition_channels
                 )
             elif pipeline_type == "cogvideox_fun_static_to_video_cross":
@@ -1502,7 +1622,7 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
                 cross_attn_kv_dim = config["pipeline"].get("cross_attn_kv_dim", None)
                 load_model = CrossTransformer3DModelWithAdapter.from_pretrained(
                     pretrained_model_name_or_path=os.path.join(input_dir, "transformer"),
-                    base_model_name_or_path=config["model"]["pretrained_model_name_or_path"],
+                    base_model_name_or_path=config["model"]["base_model_name_or_path"],
                     is_train_cross=True,
                     cross_attn_interval=cross_attn_interval,
                     cross_attn_dim_head=cross_attn_dim_head,
@@ -1518,7 +1638,7 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
                 condition_channels = config["pipeline"].get("condition_channels", 16)
                 load_model = CrossTransformer3DModelWithAdapter.from_pretrained(
                     pretrained_model_name_or_path=os.path.join(input_dir, "transformer"),
-                    base_model_name_or_path=config["model"]["pretrained_model_name_or_path"],
+                    base_model_name_or_path=config["model"]["base_model_name_or_path"],
                     is_train_cross=True,
                     cross_attn_interval=cross_attn_interval,
                     cross_attn_dim_head=cross_attn_dim_head,
@@ -1533,16 +1653,26 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
                 use_adapter = config["pipeline"].get("use_adapter", True)
                 load_model = CogVideoXFunTransformer3DModelWithAdapter.from_pretrained(
                     pretrained_model_name_or_path=os.path.join(input_dir, "transformer"),
-                    base_model_name_or_path=config["model"]["pretrained_model_name_or_path"],
+                    base_model_name_or_path=config["model"]["base_model_name_or_path"],
                     condition_channels=condition_channels,
                     use_adapter=use_adapter,
+                )
+            elif pipeline_type == "cogvideox_static_to_video_pose_concat":
+                # For static-to-video pose concat, use concat transformer
+                condition_channels = concat_config.get("condition_channels", 16)
+                load_model = CogVideoXTransformer3DModelWithConcat.from_pretrained(
+                    pretrained_model_name_or_path=os.path.join(input_dir, "transformer"),
+                    base_model_name_or_path=config["model"]["base_model_name_or_path"],
+                    condition_channels=condition_channels,
                 )
             else:
                 raise ValueError(f"Unknown pipeline type: {pipeline_type}")
             
-            transformer_.register_to_config(**load_model.config)
-            transformer_.load_state_dict(load_model.state_dict())
-            del load_model
+            # Load the trained weights into our base transformer
+            if load_model is not None:
+                transformer_.register_to_config(**load_model.config)
+                transformer_.load_state_dict(load_model.state_dict())
+                del load_model
         
         # Cast training parameters if needed
         if config["training"].get("custom_settings", {}).get("mixed_precision") in ["fp16", "bf16"]:
@@ -1568,6 +1698,11 @@ def main():
     # Load configuration
     print("🚀 Loading experiment configuration...")
     config = load_experiment_config(args.experiment_config, args.override)
+    
+    # Check for resume configuration
+    resume_from_checkpoint = config.get("training", {}).get("resume_from_checkpoint")
+    if resume_from_checkpoint:
+        print(f"🔄 Resume mode enabled: resume_from_checkpoint = {resume_from_checkpoint}")
     
     # Extract configuration sections
     experiment_config = config["experiment"]
@@ -1599,20 +1734,41 @@ def main():
         experiment_config["output_dir"] = f"{base_output_dir}_debug"
         print(f"🔧 Debug mode: Output directory set to {experiment_config['output_dir']}")
     elif args.mode == "slurm_test":
+        # For test mode, use test default (no resume logic)
         experiment_config["output_dir"] = f"{base_output_dir}_slurm_test"
         print(f"🧪 SLURM test mode: Output directory set to {experiment_config['output_dir']}")
     elif args.mode == "slurm":
-        # Get SLURM job ID from environment variable
-        slurm_job_id = os.environ.get("SLURM_JOB_ID", "unknown")
+        # Check if this is a resume situation
+        if resume_from_checkpoint:
+            # Resume mode: get SLURM job ID from config
+            slurm_job_id = training_config.get("slurm_job_id")
+            if slurm_job_id:
+                print(f"🔄 Resume mode: Using SLURM Job ID from config: {slurm_job_id}")
+            else:
+                slurm_job_id = os.environ.get("SLURM_JOB_ID", "unknown")
+                print(f"🔄 Resume mode: Using current SLURM Job ID: {slurm_job_id}")
+        else:
+            # New training: always use current environment job ID
+            slurm_job_id = os.environ.get("SLURM_JOB_ID", "unknown")
+            print(f"🚀 New training: Using current SLURM Job ID: {slurm_job_id}")
+        
         experiment_config["output_dir"] = f"{base_output_dir}_slurm_{slurm_job_id}"
-        print(f"🚀 SLURM mode: Output directory set to {experiment_config['output_dir']}")
-        print(f"   SLURM Job ID: {slurm_job_id}")
+        print(f"📁 SLURM mode: Output directory set to {experiment_config['output_dir']}")
     
     print(f"📁 Final output directory: {experiment_config['output_dir']}")
     print(f"   - Base: {base_output_dir}")
     print(f"   - Experiment: {exp_name}")
     print(f"   - Date: {exp_date} -> {date_suffix}")
     print(f"   - Mode: {args.mode}")
+    
+    # Create output directory and copy experiment config
+    os.makedirs(experiment_config["output_dir"], exist_ok=True)
+    
+    # Copy experiment config YAML to output directory
+    config_filename = os.path.basename(args.experiment_config)
+    output_config_path = os.path.join(experiment_config["output_dir"], config_filename)
+    shutil.copy2(args.experiment_config, output_config_path)
+    print(f"📋 Copied experiment config to: {output_config_path}")
     
     # Setup accelerator
     logging_dir = Path(experiment_config["output_dir"], "logs")
@@ -1631,6 +1787,14 @@ def main():
         project_config=accelerator_project_config,
         kwargs_handlers=[ddp_kwargs, init_process_group_kwargs],
     )
+    
+    # Update DeepSpeed gradient_accumulation_steps from YAML config if using DeepSpeed
+    if accelerator.state.deepspeed_plugin is not None:
+        yaml_gradient_accumulation_steps = training_config["gradient_accumulation_steps"]
+        current_deepspeed_steps = accelerator.state.deepspeed_plugin.deepspeed_config.get("gradient_accumulation_steps")
+        if current_deepspeed_steps != yaml_gradient_accumulation_steps:
+            print(f"🔧 Updating DeepSpeed gradient_accumulation_steps: {current_deepspeed_steps} → {yaml_gradient_accumulation_steps}")
+            accelerator.state.deepspeed_plugin.deepspeed_config["gradient_accumulation_steps"] = yaml_gradient_accumulation_steps
     
     # Setup logging
     logging.basicConfig(
@@ -1695,8 +1859,29 @@ def main():
             
             print(f"🔧 LoRA learning rate: {base_lr}")
             print(f"🔧 Non-LoRA learning rate: {non_lora_lr} (scale: {non_lora_lr_scale})")
-            print(f"🔧 LoRA parameters: {lora_params}")
-            print(f"🔧 Non-LoRA parameters: {non_lora_params}")
+            print(f"🔧 LoRA parameters: {len(lora_params)} parameters")
+            print(f"🔧 Non-LoRA parameters: {len(non_lora_params)} parameters")
+            
+            # Print parameter names for debugging
+            if len(lora_params) > 0:
+                print("🔧 LoRA parameter names:")
+                for param in lora_params[:5]:  # Show first 5 parameter names
+                    for name, p in transformer.named_parameters():
+                        if p is param:
+                            print(f"   - {name}")
+                            break
+                if len(lora_params) > 5:
+                    print(f"   ... and {len(lora_params) - 5} more")
+            
+            if len(non_lora_params) > 0:
+                print("🔧 Non-LoRA parameter names:")
+                for param in non_lora_params[:5]:  # Show first 5 parameter names
+                    for name, p in transformer.named_parameters():
+                        if p is param:
+                            print(f"   - {name}")
+                            break
+                if len(non_lora_params) > 5:
+                    print(f"   ... and {len(non_lora_params) - 5} more")
         else:
             # Use same learning rate for all parameters
             params_to_optimize = [{"params": list(filter(lambda p: p.requires_grad, transformer.parameters()))}]
@@ -1894,7 +2079,7 @@ def main():
                 "data_root": data_config.get("data_root")
             },
             "model": {
-                "pretrained_model_name_or_path": model_config.get("pretrained_model_name_or_path"),
+                "base_model_name_or_path": model_config.get("base_model_name_or_path"),
                 "num_trainable_parameters": num_trainable_parameters
             },
             "system": {
@@ -2104,12 +2289,12 @@ def main():
             scheduler=scheduler,
             model_config=transformer_config,
             weight_dtype=weight_dtype,
-            step=0,
+            step=initial_global_step,
             should_run_max_validation=False
         )
 
     # Training loop - epoch based (like original CogVideoX)
-        transformer.train()
+    transformer.train()
 
     for epoch in range(first_epoch, num_epochs):
         for step, batch in enumerate(train_dataloader):
@@ -2606,14 +2791,11 @@ def main():
 
                 # Save checkpoint
                 checkpointing_steps = training_config.get("custom_settings", {}).get("checkpointing_steps", 500)
-                optimizer_checkpointing_steps = training_config.get("custom_settings", {}).get("optimizer_checkpointing_steps", checkpointing_steps * 2)
                 validation_steps = data_config.get("validation_steps", 500)
                 init_validation_steps = data_config.get("init_validation_steps", 100)
                 max_validation_steps = data_config.get("max_validation_steps", validation_steps * 2)
                 if global_step % checkpointing_steps == 0:
                     if accelerator.is_main_process or accelerator.distributed_type == DistributedType.DEEPSPEED:
-                        # Determine if we should save optimizer state
-                        save_optimizer = global_step % optimizer_checkpointing_steps == 0
                         
                         # Check if we need to remove old checkpoints
                         if training_config.get("custom_settings", {}).get("checkpoints_total_limit") is not None:
@@ -2638,21 +2820,9 @@ def main():
                         
                         # Save checkpoint with memory optimization
                         try:
-                            if save_optimizer:
-                                logger.info(f"💾 Saving full checkpoint (including optimizer) to {save_path}")
-                                accelerator.save_state(save_path)
-                            else:
-                                logger.info(f"💾 Saving model-only checkpoint (no optimizer) to {save_path}")
-                                # For DeepSpeed, we need to handle model-only saving differently
-                                if hasattr(accelerator.state, 'deepspeed_plugin') and accelerator.state.deepspeed_plugin is not None:
-                                    # DeepSpeed doesn't support save_optimizer parameter
-                                    # Save only the model weights
-                                    unwrapped_model = accelerator.unwrap_model(transformer)
-                                    unwrapped_model.save_pretrained(save_path)
-                                    logger.info(f"💾 Saved model weights only (DeepSpeed compatible) to {save_path}")
-                                else:
-                                    # For non-DeepSpeed, use the original method
-                                    accelerator.save_state(save_path, save_optimizer=False)
+                            logger.info(f"💾 Saving checkpoint to {save_path}")
+                            # Use save_state for full checkpoint saving (save_model_hook handles LoRA vs full model logic)
+                            accelerator.save_state(save_path)
                             logger.info(f"✅ Saved state to {save_path}")
                         except RuntimeError as e:
                             if "out of memory" in str(e).lower():
@@ -2663,10 +2833,7 @@ def main():
                                 torch.cuda.synchronize(accelerator.device)
                                 
                                 # Try saving again
-                                if save_optimizer:
-                                    accelerator.save_state(save_path)
-                                else:
-                                    accelerator.save_state(save_path, save_optimizer=False)
+                                accelerator.save_state(save_path)
                                 logger.info(f"✅ Saved state to {save_path} (after retry)")
                             else:
                                 raise e
@@ -2678,7 +2845,7 @@ def main():
 
                 # Validation during training steps
                 should_run_validation = data_config.get("validation_set") is not None and (
-                    (global_step % init_validation_steps == 0 and global_step < optimizer_checkpointing_steps) 
+                    (global_step % init_validation_steps == 0 and global_step < checkpointing_steps) 
                     or
                     global_step % validation_steps == 0
                 )

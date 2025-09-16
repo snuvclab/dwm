@@ -1039,6 +1039,7 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
                         transformer=None, 
                         condition_channels=None, 
                         use_adapter=True,
+                        adapter_version="v1",
                         *args, **kwargs):
         """
         Load a CogVideoXFunStaticToVideoPipeline from a saved directory or base model.
@@ -1051,6 +1052,8 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
             base_model_name_or_path: Optional base model path for creating pose-conditioned pipeline
             transformer: Optional transformer to use (for validation with trained transformer)
             condition_channels: Number of condition channels (0 or None for base model, >0 for concat model)
+            use_adapter: Whether to use adapter-based transformer
+            adapter_version: Version of adapter to use ("v1" or "v2")
         """
         # Check if this is a base model path (for creating pose-conditioned pipeline)
         if base_model_name_or_path is not None:
@@ -1066,12 +1069,13 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
             # Create or load appropriate transformer based on condition_channels and use_adapter
             if condition_channels > 0:
                 if use_adapter:
-                    print(f"🔧 Creating/loading VideoX-Fun adapter transformer with {condition_channels} condition channels")
+                    print(f"🔧 Creating/loading VideoX-Fun adapter transformer with {condition_channels} condition channels (adapter_version={adapter_version})")
                     transformer = CogVideoXFunTransformer3DModelWithAdapter.from_pretrained(
                         pretrained_model_name_or_path=pretrained_model_name_or_path,
                         base_model_name_or_path=base_model_name_or_path,
                         subfolder="transformer",
                         condition_channels=condition_channels,
+                        adapter_version=adapter_version,
                         torch_dtype=kwargs.get("torch_dtype", torch.bfloat16),
                         revision=kwargs.get("revision", None),
                         variant=kwargs.get("variant", None),
@@ -1956,6 +1960,7 @@ class CogVideoXFunStaticToVideoCrossPipeline(CogVideoXFunInpaintPipeline):
                         transformer=None, 
                         condition_channels=None, 
                         use_adapter=False,
+                        adapter_version="v1",
                         is_train_cross: bool = True,
                         cross_attn_interval: int = 2,
                         cross_attn_dim_head: int = 128,
@@ -1963,7 +1968,7 @@ class CogVideoXFunStaticToVideoCrossPipeline(CogVideoXFunInpaintPipeline):
                         cross_attn_kv_dim: int = None,
                         *args, **kwargs):
         """
-        Load a CogVideoXFunStaticToVideoPipeline from a saved directory or base model.
+        Load a CogVideoXFunStaticToVideoCrossPipeline from a saved directory or base model.
         
         This method loads all components (tokenizer, text_encoder, vae, transformer, scheduler)
         from the specified directory, or uses provided components if specified.
@@ -1973,6 +1978,13 @@ class CogVideoXFunStaticToVideoCrossPipeline(CogVideoXFunInpaintPipeline):
             base_model_name_or_path: Optional base model path for creating pose-conditioned pipeline
             transformer: Optional transformer to use (for validation with trained transformer)
             condition_channels: Number of condition channels (0 or None for base model, >0 for concat model)
+            use_adapter: Whether to use adapter-based transformer
+            adapter_version: Version of adapter to use ("v1" or "v2")
+            is_train_cross: Whether to train cross attention
+            cross_attn_interval: Interval for cross attention
+            cross_attn_dim_head: Dimension of head for cross attention
+            cross_attn_num_heads: Number of heads for cross attention
+            cross_attn_kv_dim: Dimension of key/value for cross attention
         """
         # Check if this is a base model path (for creating pose-conditioned pipeline)
         if base_model_name_or_path is not None:
@@ -1987,12 +1999,13 @@ class CogVideoXFunStaticToVideoCrossPipeline(CogVideoXFunInpaintPipeline):
             
             # Create or load appropriate transformer based on condition_channels
             if condition_channels > 0:
-                print(f"🔧 Creating/loading VideoX-Fun concat transformer with {condition_channels} condition channels")
+                print(f"🔧 Creating/loading VideoX-Fun cross transformer with {condition_channels} condition channels (adapter_version={adapter_version})")
                 transformer = CrossTransformer3DModelWithAdapter.from_pretrained(
                     pretrained_model_name_or_path=pretrained_model_name_or_path,
                     base_model_name_or_path=base_model_name_or_path,
                     subfolder="transformer",
                     condition_channels=condition_channels,
+                    adapter_version=adapter_version,
                     is_train_cross=is_train_cross,
                     cross_attn_interval=cross_attn_interval,
                     cross_attn_dim_head=cross_attn_dim_head,
@@ -2106,26 +2119,28 @@ class CogVideoXFunStaticToVideoCrossPipeline(CogVideoXFunInpaintPipeline):
 
         if latents is None:
             noise = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
-            # if strength is 1. then initialise the latents to noise, else initial to image + noise
-            if static_videos is not None and not is_strength_max:
-                # Use static_videos as the reference for strength-based initialization
-                static_videos = static_videos.to(device=device, dtype=self.vae.dtype)
-                bs = 1
-                new_static_videos = []
-                for i in range(0, static_videos.shape[0], bs):
-                    static_videos_bs = static_videos[i : i + bs]
-                    static_videos_bs = self.vae.encode(static_videos_bs)[0]
-                    static_videos_bs = static_videos_bs.sample()
-                    new_static_videos.append(static_videos_bs)
-                video_latents = torch.cat(new_static_videos, dim=0)
-                video_latents = video_latents * self.vae.config.scaling_factor
-                video_latents = video_latents.repeat(batch_size // video_latents.shape[0], 1, 1, 1, 1)
-                video_latents = video_latents.to(device=device, dtype=dtype)
-                video_latents = rearrange(video_latents, "b c f h w -> b f c h w")
-                latents = self.scheduler.add_noise(video_latents, noise, timestep)
-            else:
-                latents = noise
-            # if pure noise then scale the initial latents by the Scheduler's init sigma
+            # # if strength is 1. then initialise the latents to noise, else initial to image + noise
+            # if static_videos is not None and not is_strength_max:
+            #     # Use static_videos as the reference for strength-based initialization
+            #     static_videos = static_videos.to(device=device, dtype=self.vae.dtype)
+            #     bs = 1
+            #     new_static_videos = []
+            #     for i in range(0, static_videos.shape[0], bs):
+            #         static_videos_bs = static_videos[i : i + bs]
+            #         static_videos_bs = self.vae.encode(static_videos_bs)[0]
+            #         static_videos_bs = static_videos_bs.sample()
+            #         new_static_videos.append(static_videos_bs)
+            #     video_latents = torch.cat(new_static_videos, dim=0)
+            #     video_latents = video_latents * self.vae.config.scaling_factor
+            #     video_latents = video_latents.repeat(batch_size // video_latents.shape[0], 1, 1, 1, 1)
+            #     video_latents = video_latents.to(device=device, dtype=dtype)
+            #     video_latents = rearrange(video_latents, "b c f h w -> b f c h w")
+            #     latents = self.scheduler.add_noise(video_latents, noise, timestep)
+            # else:
+            #     latents = noise
+            # # if pure noise then scale the initial latents by the Scheduler's init sigma
+            # latents = latents * self.scheduler.init_noise_sigma if is_strength_max else latents
+            latents = noise
             latents = latents * self.scheduler.init_noise_sigma if is_strength_max else latents
         else:
             noise = latents.to(device)
@@ -2173,10 +2188,7 @@ class CogVideoXFunStaticToVideoCrossPipeline(CogVideoXFunInpaintPipeline):
         if return_noise:
             outputs += (noise,)
             
-        if return_video_latents:
-            outputs += (static_videos_latents,)
-        else:
-            outputs += (static_videos_latents, hand_videos_latents)
+        outputs += (static_videos_latents, hand_videos_latents)
             
         return outputs
 
@@ -2529,7 +2541,7 @@ class CogVideoXFunStaticToVideoCrossPipeline(CogVideoXFunInpaintPipeline):
             num_frames -= additional_frames * self.vae_scale_factor_temporal
         if num_frames <= 0:
             num_frames = 1
-        if video_length > num_frames:
+        if video is not None and video_length > num_frames:
             logger.warning("The length of condition video is not right, the latent frames should be clipped to make it divisible by patch_size_t. ")
             video_length = num_frames
             video = video[:, :, :video_length]
@@ -2538,7 +2550,6 @@ class CogVideoXFunStaticToVideoCrossPipeline(CogVideoXFunInpaintPipeline):
 
         num_channels_latents = self.vae.config.latent_channels
         num_channels_transformer = self.transformer.config.in_channels
-        return_image_latents = num_channels_transformer == num_channels_latents
 
         latents_outputs = self.prepare_latents(
             batch_size=batch_size * num_videos_per_prompt,
@@ -2550,62 +2561,28 @@ class CogVideoXFunStaticToVideoCrossPipeline(CogVideoXFunInpaintPipeline):
             device=device,
             generator=generator,
             latents=latents,
-            static_videos=init_video,
+            static_videos=static_videos,
+            hand_videos=hand_videos,
             timestep=latent_timestep,
             is_strength_max=is_strength_max,
             return_noise=True,
-            return_video_latents=return_image_latents,
         )
-        if return_image_latents:
-            latents, noise, static_videos_latents = latents_outputs
-        else:
-            latents, noise, static_videos_latents, _ = latents_outputs
+
+        latents, noise, static_videos_latents, hand_videos_latents = latents_outputs
+        
         if comfyui_progressbar and pbar is not None:
             pbar.update(1)
         
-        # Process hand_videos for control_latents if provided
-        control_latents = None
-        if hand_videos is not None:
-            hand_videos = self.preprocess_hand_conditions(hand_videos, height, width, num_frames)
-            # Convert hand_videos to control_latents
-            hand_videos = hand_videos.to(device=device, dtype=self.vae.dtype)
-            bs = 1
-            new_hand_videos = []
-            for i in range(0, hand_videos.shape[0], bs):
-                hand_videos_bs = hand_videos[i : i + bs]
-                hand_videos_bs = self.vae.encode(hand_videos_bs)[0]
-                hand_videos_bs = hand_videos_bs.sample()
-                new_hand_videos.append(hand_videos_bs)
-            control_latents = torch.cat(new_hand_videos, dim=0)
-            control_latents = control_latents * self.vae.config.scaling_factor
-            control_latents = control_latents.repeat(batch_size // control_latents.shape[0], 1, 1, 1, 1)
-            control_latents = control_latents.to(device=device, dtype=latents.dtype)
-            control_latents = rearrange(control_latents, "b c f h w -> b f c h w")
-            control_latents = (
-                torch.cat([control_latents] * 2) if do_classifier_free_guidance else control_latents
-            )
+        # Use preprocessed latents from prepare_latents (no need to re-encode)
+        control_latents = hand_videos_latents
+        ref_latents = static_videos_latents
         
-        # Process static_videos for ref_latents if provided (for CrossTransformer3DModelWithAdapter)
-        ref_latents = None
-        if static_videos is not None:
-            static_videos = self.preprocess_static_conditions(static_videos, height, width, num_frames)
-            # Convert static_videos to ref_latents
-            static_videos = static_videos.to(device=device, dtype=self.vae.dtype)
-            bs = 1
-            new_static_videos = []
-            for i in range(0, static_videos.shape[0], bs):
-                static_videos_bs = static_videos[i : i + bs]
-                static_videos_bs = self.vae.encode(static_videos_bs)[0]
-                static_videos_bs = static_videos_bs.sample()
-                new_static_videos.append(static_videos_bs)
-            ref_latents = torch.cat(new_static_videos, dim=0)
-            ref_latents = ref_latents * self.vae.config.scaling_factor
-            ref_latents = ref_latents.repeat(batch_size // ref_latents.shape[0], 1, 1, 1, 1)
-            ref_latents = ref_latents.to(device=device, dtype=latents.dtype)
-            ref_latents = rearrange(ref_latents, "b c f h w -> b f c h w")
-            ref_latents = (
-                torch.cat([ref_latents] * 2) if do_classifier_free_guidance else ref_latents
-            )
+        # Apply classifier-free guidance if needed
+        if do_classifier_free_guidance:
+            if control_latents is not None:
+                control_latents = torch.cat([control_latents] * 2)
+            if ref_latents is not None:
+                ref_latents = torch.cat([ref_latents] * 2)
         
         if mask_video is not None:
             if (mask_video == 255).all():  # redraw all frames
