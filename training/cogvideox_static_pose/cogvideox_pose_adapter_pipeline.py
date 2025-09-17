@@ -23,9 +23,6 @@ from diffusers.utils.torch_utils import randn_tensor
 from einops import rearrange
 from transformers import AutoTokenizer, T5EncoderModel, T5Tokenizer
 
-# Import output class from pose pipeline
-from .cogvideox_pose_pipeline import CogVideoXPosePipelineOutput
-
 logger = logging.get_logger(__name__)
 
 def crop(img, start_h, start_w, crop_h, crop_w):
@@ -158,213 +155,8 @@ def retrieve_latents(
     else:
         raise AttributeError("Could not access latents of provided encoder_output")
 
-class LatentCondAdapter3D(nn.Module):
-    """
-    Residual conditioning adapter for DiT/CogVideoX latents.
-    - Expects latents and condition tensors in [B, T, C, H, W].
-    - Uses 1x1x1 Conv3d per condition (zero-init) + learnable gates (zero-init).
-    - Returns either the fused latents (latents + residual) or the residual only.
-    - Supports selective freezing of hand/static branches.
-    """
-    def __init__(
-        self,
-        channels: int,
-        *,
-        shared: bool = False,
-        dropout_p: float = 0.0,
-        norm: str = "none",          # "none" | "group"
-        groups: int = 32,            # used if norm="group"
-        return_residual: bool = False,
-        freeze_hand: bool = False,   # Freeze hand branch parameters
-        freeze_static: bool = False, # Freeze static branch parameters
-    ):
-        super().__init__()
-        self.channels = channels
-        self.shared = shared
-        self.dropout_p = float(dropout_p)
-        self.return_residual = return_residual
-        self.freeze_hand = freeze_hand
-        self.freeze_static = freeze_static
-
-        def make_path():
-            conv = nn.Conv3d(channels, channels, kernel_size=1, bias=False)
-            nn.init.zeros_(conv.weight)
-            return conv
-
-        if shared:
-            self.shared_conv = make_path()
-            self.hand_conv = None
-            self.static_conv = None
-        else:
-            self.shared_conv = None
-            self.hand_conv = make_path()
-            self.static_conv = make_path()
-
-        # learnable scalar gates (start at 0 → preserves base behavior)
-        self.scale_hand = nn.Parameter(torch.zeros(1))
-        self.scale_static = nn.Parameter(torch.zeros(1))
-
-        if norm == "group":
-            g = min(groups, channels)
-            self.norm = nn.GroupNorm(g, channels, affine=True)
-        else:
-            self.norm = nn.Identity()
-
-        self.dropout = nn.Dropout3d(p=self.dropout_p) if self.dropout_p > 0 else nn.Identity()
-        
-        # Apply freezing after initialization
-        self._apply_freezing()
-
-    def _apply_freezing(self):
-        """Apply freezing to specified branches."""
-        if self.freeze_hand:
-            self._freeze_branch("hand")
-        if self.freeze_static:
-            self._freeze_branch("static")
-    
-    def _freeze_branch(self, branch: str):
-        """Freeze parameters for a specific branch."""
-        if branch == "hand":
-            if self.hand_conv is not None:
-                for param in self.hand_conv.parameters():
-                    param.requires_grad = False
-            self.scale_hand.requires_grad = False
-            print(f"🔒 Frozen hand branch parameters")
-        elif branch == "static":
-            if self.static_conv is not None:
-                for param in self.static_conv.parameters():
-                    param.requires_grad = False
-            self.scale_static.requires_grad = False
-            print(f"🔒 Frozen static branch parameters")
-        else:
-            raise ValueError(f"Unknown branch: {branch}")
-    
-    def _unfreeze_branch(self, branch: str):
-        """Unfreeze parameters for a specific branch."""
-        if branch == "hand":
-            if self.hand_conv is not None:
-                for param in self.hand_conv.parameters():
-                    param.requires_grad = True
-            self.scale_hand.requires_grad = True
-            print(f"🔓 Unfrozen hand branch parameters")
-        elif branch == "static":
-            if self.static_conv is not None:
-                for param in self.static_conv.parameters():
-                    param.requires_grad = True
-            self.scale_static.requires_grad = True
-            print(f"🔓 Unfrozen static branch parameters")
-        else:
-            raise ValueError(f"Unknown branch: {branch}")
-    
-    def freeze_hand_branch(self):
-        """Freeze hand branch parameters."""
-        self.freeze_hand = True
-        self._freeze_branch("hand")
-    
-    def freeze_static_branch(self):
-        """Freeze static branch parameters."""
-        self.freeze_static = True
-        self._freeze_branch("static")
-    
-    def unfreeze_hand_branch(self):
-        """Unfreeze hand branch parameters."""
-        self.freeze_hand = False
-        self._unfreeze_branch("hand")
-    
-    def unfreeze_static_branch(self):
-        """Unfreeze static branch parameters."""
-        self.freeze_static = False
-        self._unfreeze_branch("static")
-    
-    def get_freeze_status(self) -> Dict[str, bool]:
-        """Get current freeze status of branches."""
-        return {
-            "hand": self.freeze_hand,
-            "static": self.freeze_static
-        }
-
-    @staticmethod
-    def _to_c3d(x: torch.Tensor) -> torch.Tensor:
-        # [B,T,C,H,W] → [B,C,T,H,W]
-        return x.permute(0, 2, 1, 3, 4)
-
-    @staticmethod
-    def _to_tfirst(x: torch.Tensor) -> torch.Tensor:
-        # [B,C,T,H,W] → [B,T,C,H,W]
-        return x.permute(0, 2, 1, 3, 4)
-
-    def _apply_path(self, x_c3d: torch.Tensor, which: str) -> torch.Tensor:
-        if self.shared_conv is not None:
-            out = self.shared_conv(x_c3d)
-        else:
-            conv = self.hand_conv if which == "hand" else self.static_conv
-            if conv is None:
-                raise RuntimeError("Invalid conv path")
-            out = conv(x_c3d)
-        return out
-
-    def forward(
-        self,
-        latents: torch.Tensor,               # [B,T,C,H,W]
-        hand: torch.Tensor = None,           # [B,T,C,H,W] or None
-        static: torch.Tensor = None,         # [B,T,C,H,W] or None
-        hand_mask: torch.Tensor = None,      # [B,T,1|C,H,W] in [0,1], optional
-        static_mask: torch.Tensor = None,    # [B,T,1|C,H,W] in [0,1], optional
-        return_residual: bool = None
-    ) -> torch.Tensor:
-        """
-        If return_residual is True → returns residual; else returns fused latents = latents + residual.
-        """
-        assert latents.dim() == 5, "latents must be [B,T,C,H,W]"
-        B, T, C, H, W = latents.shape
-        device = latents.device
-        dtype = latents.dtype
-
-        residual = torch.zeros_like(latents)
-
-        if hand is not None:
-            assert hand.shape == (B, T, C, H, W), "hand shape mismatch"
-            h = self._to_c3d(hand)
-            h = self._apply_path(h, "hand")
-            h = self.dropout(h)
-            h = self._to_tfirst(h)
-            if hand_mask is not None:
-                # broadcast to [B,T,C,H,W]
-                if hand_mask.dim() == 5 and hand_mask.shape[2] in (1, C):
-                    pass
-                elif hand_mask.dim() == 4:
-                    hand_mask = hand_mask.unsqueeze(2)
-                else:
-                    raise ValueError("hand_mask must be [B,T,1|C,H,W] or [B,T,H,W]")
-                hand_mask = hand_mask.to(device=device, dtype=dtype)
-                h = h * hand_mask
-            residual = residual + self.scale_hand * h
-
-        if static is not None:
-            assert static.shape == (B, T, C, H, W), "static shape mismatch"
-            s = self._to_c3d(static)
-            s = self._apply_path(s, "static")
-            s = self.dropout(s)
-            s = self._to_tfirst(s)
-            if static_mask is not None:
-                if static_mask.dim() == 5 and static_mask.shape[2] in (1, C):
-                    pass
-                elif static_mask.dim() == 4:
-                    static_mask = static_mask.unsqueeze(2)
-                else:
-                    raise ValueError("static_mask must be [B,T,1|C,H,W] or [B,T,H,W]")
-                static_mask = static_mask.to(device=device, dtype=dtype)
-                s = s * static_mask
-            residual = residual + self.scale_static * s
-
-        # light normalization of residual to roughly match latent scale (optional but stabilizing)
-        residual = self._to_c3d(residual)
-        residual = self.norm(residual)
-        residual = self._to_tfirst(residual)
-
-        if return_residual if return_residual is not None else self.return_residual:
-            return residual
-        return latents + residual
+# Import the refactored transformer with integrated adapter
+from cogvideox_transformer_with_conditions import CogVideoXTransformer3DModelWithAdapter
 
 
 @dataclass
@@ -390,12 +182,13 @@ class CogVideoXPoseAdapterPipeline(CogVideoXPipeline):
         tokenizer: T5Tokenizer,
         text_encoder: T5EncoderModel,
         vae: AutoencoderKLCogVideoX,
-        transformer: CogVideoXTransformer3DModel,
+        transformer: CogVideoXTransformer3DModelWithAdapter,
         scheduler: Union[CogVideoXDDIMScheduler, CogVideoXDPMScheduler],
         freeze_hand_branch: bool = False,
         freeze_static_branch: bool = False,
         adapter_norm: str = "group",
         adapter_groups: int = 32,
+        torch_dtype: torch.dtype = None,
     ):
         super().__init__(
             tokenizer=tokenizer,
@@ -415,14 +208,11 @@ class CogVideoXPoseAdapterPipeline(CogVideoXPipeline):
         )
         self.empty_prompt_embeds = self.empty_prompt_embeds.to(dtype=torch.bfloat16)
         
-        # Initialize conditional adapter with freeze options
-        self.cond_adapter = LatentCondAdapter3D(
-            self.vae.config.latent_channels, 
-            norm=adapter_norm, 
-            groups=adapter_groups,
-            freeze_hand=freeze_hand_branch,
-            freeze_static=freeze_static_branch
-        )
+        # Apply freezing if requested (now handled by transformer)
+        if freeze_hand_branch:
+            self.transformer.freeze_adapter_hand_branch()
+        if freeze_static_branch:
+            self.transformer.freeze_adapter_static_branch()
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path=None, 
@@ -478,39 +268,26 @@ class CogVideoXPoseAdapterPipeline(CogVideoXPipeline):
             subfolder="scheduler"
         )
         
+        # Determine load dtype based on model size (define early for all cases)
+        load_dtype = torch.bfloat16 if "5b" in base_model_name_or_path.lower() else torch.float16
+        # Override with provided torch_dtype if specified
+        if "torch_dtype" in kwargs:
+            load_dtype = kwargs["torch_dtype"]
+        
         # Load transformer
         if transformer is None:
-            if pretrained_model_name_or_path is not None:
-                # Load trained transformer from checkpoint
-                print(f"📥 Loading trained transformer from: {pretrained_model_name_or_path}")
-                # Determine load dtype based on model size
-                load_dtype = torch.bfloat16 if "5b" in base_model_name_or_path.lower() else torch.float16
-                # Override with provided torch_dtype if specified
-                if "torch_dtype" in kwargs:
-                    load_dtype = kwargs["torch_dtype"]
-                
-                transformer = CogVideoXTransformer3DModel.from_pretrained(
-                    pretrained_model_name_or_path,
-                    subfolder="transformer",
-                    torch_dtype=load_dtype,
-                    revision=kwargs.get("revision", None),
-                    variant=kwargs.get("variant", None),
-                )
-            else:
-                # Load base transformer from base model
-                print(f"📥 Loading base transformer from: {base_model_name_or_path}")
-                load_dtype = torch.bfloat16 if "5b" in base_model_name_or_path.lower() else torch.float16
-                # Override with provided torch_dtype if specified
-                if "torch_dtype" in kwargs:
-                    load_dtype = kwargs["torch_dtype"]
-                
-                transformer = CogVideoXTransformer3DModel.from_pretrained(
-                    base_model_name_or_path,
-                    subfolder="transformer",
-                    torch_dtype=load_dtype,
-                    revision=kwargs.get("revision", None),
-                    variant=kwargs.get("variant", None),
-                )
+            # Create or load adapter transformer
+            print(f"🔧 Creating/loading adapter transformer with norm={adapter_norm}, groups={adapter_groups}")
+            transformer = CogVideoXTransformer3DModelWithAdapter.from_pretrained(
+                pretrained_model_name_or_path=pretrained_model_name_or_path,
+                base_model_name_or_path=base_model_name_or_path,
+                subfolder="transformer",
+                adapter_norm=adapter_norm,
+                adapter_groups=adapter_groups,
+                torch_dtype=load_dtype,
+                revision=kwargs.get("revision", None),
+                variant=kwargs.get("variant", None),
+            )
 
         # Create our custom pipeline with base components + trained transformer
         pipeline = cls(
@@ -523,6 +300,7 @@ class CogVideoXPoseAdapterPipeline(CogVideoXPipeline):
             freeze_static_branch=freeze_static_branch,
             adapter_norm=adapter_norm,
             adapter_groups=adapter_groups,
+            torch_dtype=load_dtype,
         )
         
         return pipeline
@@ -543,30 +321,27 @@ class CogVideoXPoseAdapterPipeline(CogVideoXPipeline):
 
     def get_adapter_freeze_status(self) -> Dict[str, bool]:
         """Get current freeze status of adapter branches."""
-        return self.cond_adapter.get_freeze_status()
+        return self.transformer.get_adapter_freeze_status()
     
     def freeze_adapter_hand_branch(self):
         """Freeze hand branch parameters in the adapter."""
-        self.cond_adapter.freeze_hand_branch()
+        self.transformer.freeze_adapter_hand_branch()
     
     def freeze_adapter_static_branch(self):
         """Freeze static branch parameters in the adapter."""
-        self.cond_adapter.freeze_static_branch()
+        self.transformer.freeze_adapter_static_branch()
     
     def unfreeze_adapter_hand_branch(self):
         """Unfreeze hand branch parameters in the adapter."""
-        self.cond_adapter.unfreeze_hand_branch()
+        self.transformer.unfreeze_adapter_hand_branch()
     
     def unfreeze_adapter_static_branch(self):
         """Unfreeze static branch parameters in the adapter."""
-        self.cond_adapter.unfreeze_static_branch()
+        self.transformer.unfreeze_adapter_static_branch()
     
     def print_adapter_freeze_status(self):
         """Print current freeze status of adapter branches."""
-        status = self.get_adapter_freeze_status()
-        print("🔒 Adapter Freeze Status:")
-        print(f"  Hand branch: {'Frozen' if status['hand'] else 'Unfrozen'}")
-        print(f"  Static branch: {'Frozen' if status['static'] else 'Unfrozen'}")
+        self.transformer.print_adapter_freeze_status()
 
     def save_pretrained(self, save_directory: str, **kwargs):
         """
@@ -909,7 +684,7 @@ class CogVideoXPoseAdapterPipeline(CogVideoXPipeline):
         ] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 226,
-    ) -> Union[CogVideoXPosePipelineOutput, Tuple]:
+    ) -> Union[CogVideoXPoseAdapterPipelineOutput, Tuple]:
         """
         Function invoked when calling the pipeline for generation.
 
@@ -962,7 +737,7 @@ class CogVideoXPoseAdapterPipeline(CogVideoXPipeline):
                 Maximum sequence length in encoded prompt.
 
         Returns:
-            [`CogVideoXPosePipelineOutput`] or `tuple`:
+            [`CogVideoXPoseAdapterPipelineOutput`] or `tuple`:
             [`CogVideoXPosePipelineOutput`] if `return_dict` is True, otherwise a tuple.
         """
         height = height or self.transformer.config.sample_height * self.vae_scale_factor_spatial
@@ -1078,7 +853,7 @@ class CogVideoXPoseAdapterPipeline(CogVideoXPipeline):
                     
                     # Apply adapter to conditional branch
                     if hand_videos_latents is not None or static_videos_latents is not None:
-                        cond_latents = self.cond_adapter(
+                        cond_latents = self.transformer.cond_adapter(
                             cond_latents, 
                             hand=hand_videos_latents, 
                             static=static_videos_latents
@@ -1089,7 +864,7 @@ class CogVideoXPoseAdapterPipeline(CogVideoXPipeline):
                 else:
                     # Single branch - apply adapter directly
                     if hand_videos_latents is not None or static_videos_latents is not None:
-                        latent_model_input = self.cond_adapter(
+                        latent_model_input = self.transformer.cond_adapter(
                             latent_model_input, 
                             hand=hand_videos_latents, 
                             static=static_videos_latents
@@ -1163,4 +938,4 @@ class CogVideoXPoseAdapterPipeline(CogVideoXPipeline):
         if not return_dict:
             return (video,)
 
-        return CogVideoXPosePipelineOutput(frames=video)
+        return CogVideoXPoseAdapterPipelineOutput(frames=video)
