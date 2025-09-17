@@ -22,7 +22,7 @@ from einops import rearrange
 from transformers import T5EncoderModel, T5Tokenizer
 
 # Import our custom transformer with condition support
-from .cogvideox_transformer_with_conditions import CogVideoXTransformer3DModelWithConditions
+from cogvideox_transformer_with_conditions import CogVideoXTransformer3DModelWithConcat
 
 logger = logging.get_logger(__name__)
 
@@ -158,11 +158,11 @@ def retrieve_latents(
 
 
 @dataclass
-class CogVideoXPosePipelineOutput(BaseOutput):
+class CogVideoXPoseConcatPipelineOutput(BaseOutput):
     frames: Union[List[PIL.Image.Image], np.ndarray]
 
 
-class CogVideoXPosePipeline(CogVideoXPipeline):
+class CogVideoXPoseConcatPipeline(CogVideoXPipeline):
     """
     Pipeline for text-to-video generation using CogVideoX with egocentric hand mesh and static scene conditions.
     
@@ -171,7 +171,7 @@ class CogVideoXPosePipeline(CogVideoXPipeline):
     2. Static scene frames
     
     The conditions are encoded by 3D VAE and concatenated channel-wise with noisy latents.
-    The transformer (CogVideoXTransformer3DModelWithConditions) handles the conditional inputs
+    The transformer (CogVideoXTransformer3DModelWithConcat) handles the conditional inputs
     by extending its input projection layer to accept additional channels.
     """
 
@@ -180,7 +180,7 @@ class CogVideoXPosePipeline(CogVideoXPipeline):
         tokenizer: T5Tokenizer,
         text_encoder: T5EncoderModel,
         vae: AutoencoderKLCogVideoX,
-        transformer: CogVideoXTransformer3DModelWithConditions,
+        transformer: CogVideoXTransformer3DModelWithConcat,
         scheduler: Union[CogVideoXDDIMScheduler, CogVideoXDPMScheduler],
     ):
         super().__init__(
@@ -204,18 +204,16 @@ class CogVideoXPosePipeline(CogVideoXPipeline):
         # Verify that the transformer has condition support
         if not hasattr(self.transformer, 'condition_channels'):
             raise ValueError(
-                "Transformer must be an instance of CogVideoXTransformer3DModelWithConditions "
+                "Transformer must be an instance of CogVideoXTransformer3DModelWithConcat "
                 "to support conditional inputs"
             )
-
-
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path=None, 
                         base_model_name_or_path="THUDM/CogVideoX-5b", 
-                        transformer=None, *args, **kwargs):
+                        transformer=None, condition_channels=None, *args, **kwargs):
         """
-        Load a CogVideoXPosePipeline from a saved directory or base model.
+        Load a CogVideoXPoseConcatPipeline from a saved directory or base model.
         
         This method loads all components (tokenizer, text_encoder, vae, transformer, scheduler)
         from the specified directory, or uses provided components if specified.
@@ -232,11 +230,13 @@ class CogVideoXPosePipeline(CogVideoXPipeline):
             original_pipeline = CogVideoXPipeline.from_pretrained(base_model_name_or_path, *args, **kwargs)
             
         if transformer is None:
-            # Create conditioned transformer from base transformer
-            condition_channels = original_pipeline.vae.config.latent_channels * 2  # 2 types of conditions
-            print(f"🔧 Creating conditioned transformer with {condition_channels} condition channels")
-            transformer = CogVideoXTransformer3DModelWithConditions.from_pretrained(
-                base_model_name_or_path,
+            # Create or load conditioned transformer
+            if condition_channels is None:
+                condition_channels = original_pipeline.vae.config.latent_channels * 2  # 2 types of conditions
+            print(f"🔧 Creating/loading conditioned transformer with {condition_channels} condition channels")
+            transformer = CogVideoXTransformer3DModelWithConcat.from_pretrained(
+                pretrained_model_name_or_path=pretrained_model_name_or_path,
+                base_model_name_or_path=base_model_name_or_path,
                 subfolder="transformer",
                 condition_channels=condition_channels,
                 torch_dtype=kwargs.get("torch_dtype", torch.bfloat16),
@@ -249,7 +249,7 @@ class CogVideoXPosePipeline(CogVideoXPipeline):
             if "torch_dtype" in kwargs:
                 load_dtype = kwargs["torch_dtype"]
             print(f"🔧 Loading pose-conditioned pipeline from {pretrained_model_name_or_path}")
-            transformer = CogVideoXTransformer3DModelWithConditions.from_pretrained(
+            transformer = CogVideoXTransformer3DModelWithConcat.from_pretrained(
                 pretrained_model_name_or_path,
                 subfolder="transformer",
                 torch_dtype=load_dtype,
@@ -294,7 +294,7 @@ class CogVideoXPosePipeline(CogVideoXPipeline):
         
         # Save pipeline config
         pipeline_config = {
-            "pipeline_class": "CogVideoXPosePipeline",
+            "pipeline_class": "CogVideoXPoseConcatPipeline",
             "version": "1.0.0",
         }
         with open(os.path.join(save_directory, "pipeline_config.json"), "w") as f:
@@ -631,7 +631,7 @@ class CogVideoXPosePipeline(CogVideoXPipeline):
         latents: Optional[torch.FloatTensor] = None,
         prompt_embeds: Optional[torch.FloatTensor] = None,
         negative_prompt_embeds: Optional[torch.FloatTensor] = None,
-        output_type: str = "pil",
+        output_type: str = "np",
         return_dict: bool = True,
         attention_kwargs: Optional[Dict[str, Any]] = None,
         callback_on_step_end: Optional[
@@ -639,7 +639,7 @@ class CogVideoXPosePipeline(CogVideoXPipeline):
         ] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 226,
-    ) -> Union[CogVideoXPosePipelineOutput, Tuple]:
+    ) -> Union[CogVideoXPoseConcatPipelineOutput, Tuple]:
         """
         Function invoked when calling the pipeline for generation.
 
@@ -692,7 +692,7 @@ class CogVideoXPosePipeline(CogVideoXPipeline):
                 Maximum sequence length in encoded prompt.
 
         Returns:
-            [`CogVideoXPosePipelineOutput`] or `tuple`:
+            [`CogVideoXPoseConcatPipelineOutput`] or `tuple`:
             [`CogVideoXPosePipelineOutput`] if `return_dict` is True, otherwise a tuple.
         """
         height = height or self.transformer.config.sample_height * self.vae_scale_factor_spatial
@@ -749,10 +749,10 @@ class CogVideoXPosePipeline(CogVideoXPipeline):
         if guidance_scale > 1.0:
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
 
-        # 4. Preprocess conditions
+        # # 4. Preprocess conditions
         hand_videos, static_videos = self.preprocess_conditions(
-            hand_videos,
-            static_videos,
+            rearrange(hand_videos, "b c f h w -> b f h w c"),
+            rearrange(static_videos, "b c f h w -> b f h w c"),
             height,
             width,
             num_frames,
@@ -809,7 +809,7 @@ class CogVideoXPosePipeline(CogVideoXPipeline):
                 else:
                     condition_input = condition_latents
 
-                # Concatenate channel-wise
+                # Concatenate condition latents with noisy latents
                 latent_model_input = torch.cat([latent_model_input, condition_input], dim=2)
 
                 # broadcast to batch dimension
@@ -880,4 +880,4 @@ class CogVideoXPosePipeline(CogVideoXPipeline):
         if not return_dict:
             return (video,)
 
-        return CogVideoXPosePipelineOutput(frames=video)
+        return CogVideoXPoseConcatPipelineOutput(frames=video)

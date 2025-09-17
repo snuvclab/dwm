@@ -1,13 +1,110 @@
 import torch
 import torch.nn as nn
 import os
+import glob
+import math
 from diffusers import CogVideoXTransformer3DModel
+from diffusers.models.embeddings import CogVideoXPatchEmbed
 from diffusers.models.attention_processor import AttnProcessor2_0, CogVideoXAttnProcessor2_0
 from diffusers.models.attention import Attention, FeedForward
 from diffusers.models.normalization import CogVideoXLayerNormZero
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
+from diffusers.utils import USE_PEFT_BACKEND, scale_lora_layers, unscale_lora_layers, logging
+from safetensors.torch import load_file
 from typing import Optional, Dict, Any, Tuple, Union
 import numpy as np
+
+logger = logging.get_logger(__name__)
+
+def reshape_tensor(tensor, num_heads):
+    """Reshape tensor for multi-head attention."""
+    batch_size, seq_len, dim = tensor.shape
+    head_dim = dim // num_heads
+    return tensor.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
+
+# copied from TrajectoryCrafter/models/crosstransformer3d.py
+class PerceiverCrossAttention(nn.Module):
+    """
+
+    Args:
+        dim (int): Dimension of the input latent and output. Default is 3072.
+        dim_head (int): Dimension of each attention head. Default is 128.
+        heads (int): Number of attention heads. Default is 16.
+        kv_dim (int): Dimension of the key/value input, allowing flexible cross-attention. Default is 2048.
+
+    Attributes:
+        scale (float): Scaling factor used in dot-product attention for numerical stability.
+        norm1 (nn.LayerNorm): Layer normalization applied to the input image features.
+        norm2 (nn.LayerNorm): Layer normalization applied to the latent features.
+        to_q (nn.Linear): Linear layer for projecting the latent features into queries.
+        to_kv (nn.Linear): Linear layer for projecting the input features into keys and values.
+        to_out (nn.Linear): Linear layer for outputting the final result after attention.
+
+    """
+
+    def __init__(self, *, dim=3072, dim_head=128, heads=16, kv_dim=2048):
+        super().__init__()
+        self.scale = dim_head**-0.5
+        self.dim_head = dim_head
+        self.heads = heads
+        inner_dim = dim_head * heads
+
+        # Layer normalization to stabilize training
+        self.norm1 = nn.LayerNorm(dim if kv_dim is None else kv_dim)
+        self.norm2 = nn.LayerNorm(dim)
+
+        # Linear transformations to produce queries, keys, and values
+        self.to_q = nn.Linear(dim, inner_dim, bias=False)
+        self.to_kv = nn.Linear(
+            dim if kv_dim is None else kv_dim, inner_dim * 2, bias=False
+        )
+        self.to_out = nn.Linear(inner_dim, dim, bias=False)
+
+    def forward(self, x, latents):
+        """
+
+        Args:
+            x (torch.Tensor): Input image features with shape (batch_size, n1, D), where:
+                - batch_size (b): Number of samples in the batch.
+                - n1: Sequence length (e.g., number of patches or tokens).
+                - D: Feature dimension.
+
+            latents (torch.Tensor): Latent feature representations with shape (batch_size, n2, D), where:
+                - n2: Number of latent elements.
+
+        Returns:
+            torch.Tensor: Attention-modulated features with shape (batch_size, n2, D).
+
+        """
+        # Apply layer normalization to the input image and latent features
+        x = self.norm1(x)
+        latents = self.norm2(latents)
+
+        b, seq_len, _ = latents.shape
+
+        # Compute queries, keys, and values
+        q = self.to_q(latents)
+        k, v = self.to_kv(x).chunk(2, dim=-1)
+
+        # Reshape tensors to split into attention heads
+        q = reshape_tensor(q, self.heads)
+        k = reshape_tensor(k, self.heads)
+        v = reshape_tensor(v, self.heads)
+
+        # Compute attention weights
+        scale = 1 / math.sqrt(math.sqrt(self.dim_head))
+        weight = (q * scale) @ (k * scale).transpose(
+            -2, -1
+        )  # More stable scaling than post-division
+        weight = torch.softmax(weight.float(), dim=-1).type(weight.dtype)
+
+        # Compute the output via weighted combination of values
+        out = weight @ v
+
+        # Reshape and permute to prepare for final linear transformation
+        out = out.permute(0, 2, 1, 3).reshape(b, seq_len, -1)
+
+        return self.to_out(out)
 
 
 class LatentCondAdapter3D(nn.Module):
@@ -307,66 +404,252 @@ class CogVideoXTransformer3DModelWithConcat(CogVideoXTransformer3DModel):
             return_dict=return_dict
         )
 
-
-class CogVideoXTransformer3DModelWithAdapter(CogVideoXTransformer3DModel):
-    """CogVideoXTransformer3DModel with residual adapter-based conditioning.
+class CogVideoXPatchEmbedWithAdapter(CogVideoXPatchEmbed):
+    """
+    VideoX-Fun Patch Embed with conditional input support via adapter.
     
-    This approach uses a residual adapter to condition the latents without
-    modifying the transformer's input channels.
+    This class extends CogVideoXPatchEmbed to support conditional inputs
+    by using adapter.
     """
     
-    def __init__(self, *args, adapter_norm: str = "group", adapter_groups: int = 32, **kwargs):
+    def __init__(self, *args, **kwargs):
+        # Extract condition_channels from kwargs before passing to parent
+        condition_channels = kwargs.pop("condition_channels", None)
+        use_zero_proj = kwargs.pop("use_zero_proj", False)
+        use_ref_proj = kwargs.pop("use_ref_proj", False)
+        super().__init__(*args, **kwargs)
+        in_channels = kwargs.get("in_channels", 16)
+        condition_channels = kwargs.get("condition_channels", 16)
+        ref_channels = kwargs.get("ref_channels", 16)
+        patch_size = kwargs.get("patch_size", 16)
+        patch_size_t = kwargs.get("patch_size_t", None)
+        embed_dim = kwargs.get("embed_dim", 16)
+        bias = kwargs.get("bias", True)
+
+        # Setup adapter
+        if patch_size_t is None:
+            # CogVideoX 1.0 checkpoints
+            self.cond_proj = nn.Conv2d(
+                condition_channels, embed_dim, kernel_size=(patch_size, patch_size), stride=patch_size, bias=bias
+            )
+        else:
+            # CogVideoX 1.5 checkpoints
+            self.cond_proj = nn.Linear(condition_channels * patch_size * patch_size * patch_size_t, embed_dim)
+        
+        self.cond_zero_proj = None
+        if use_zero_proj:
+            from diffusers.models.controlnet import zero_module
+            # with cond_zero_proj, the cond_proj is not zero initialized
+            self.cond_zero_proj = zero_module(nn.Linear(embed_dim, embed_dim))
+        else:
+            # Zero initialize cond_proj weights for stable training
+            with torch.no_grad():
+                self.cond_proj.weight.zero_()
+                if hasattr(self.cond_proj, 'bias') and self.cond_proj.bias is not None:
+                    self.cond_proj.bias.zero_()
+
+        if use_ref_proj:
+            self.ref_proj = nn.Conv2d(
+                ref_channels, embed_dim, kernel_size=(patch_size, patch_size), stride=patch_size, bias=bias
+            )
+        else:
+            self.ref_proj = None
+
+    def forward(self, text_embeds: torch.Tensor, image_embeds: torch.Tensor, 
+                ref_image_embeds: torch.Tensor = None, cond_embeds: torch.Tensor = None):
+        r"""
+        Args:
+            text_embeds (`torch.Tensor`):
+                Input text embeddings. Expected shape: (batch_size, seq_length, embedding_dim).
+            image_embeds (`torch.Tensor`):
+                Input image embeddings. Expected shape: (batch_size, num_frames, channels, height, width).
+            ref_image_embeds (`torch.Tensor`, optional):
+                Input reference image embeddings. Expected shape: (batch_size, num_frames, channels, height, width).
+            cond_embeds (`torch.Tensor`, optional):
+                Input condition embeddings. Expected shape: (batch_size, num_frames, channels, height, width).
+        """
+        text_embeds = self.text_proj(text_embeds)
+
+        batch_size, num_frames, channels, height, width = image_embeds.shape
+        
+        if self.patch_size_t is None:
+            # Process image embeds
+            image_embeds = image_embeds.reshape(-1, channels, height, width)
+            image_embeds = self.proj(image_embeds)
+            image_embeds = image_embeds.view(batch_size, num_frames, *image_embeds.shape[1:])
+            image_embeds = image_embeds.flatten(3).transpose(2, 3)  # [batch, num_frames, height x width, channels]
+            image_embeds = image_embeds.flatten(1, 2)  # [batch, num_frames x height x width, channels]
+            
+            # Process ref image embeds separately if ref_proj exists
+            if ref_image_embeds is not None:
+                ref_channels = ref_image_embeds.shape[2]
+                if self.ref_proj is not None:
+                    # Use ref_proj for ref_image_embeds
+                    ref_image_embeds = ref_image_embeds.reshape(-1, ref_channels, height, width)
+                    ref_image_embeds = self.ref_proj(ref_image_embeds)
+                    ref_image_embeds = ref_image_embeds.view(batch_size, num_frames, *ref_image_embeds.shape[1:])
+                else:
+                    # Use same proj as image_embeds (original behavior)
+                    ref_image_embeds = ref_image_embeds.reshape(-1, ref_channels, height, width)
+                    ref_image_embeds = self.proj(ref_image_embeds)
+                    ref_image_embeds = ref_image_embeds.view(batch_size, num_frames, *ref_image_embeds.shape[1:])
+                
+                ref_image_embeds = ref_image_embeds.flatten(3).transpose(2, 3)
+                ref_image_embeds = ref_image_embeds.flatten(1, 2)
+        
+            if cond_embeds is not None:
+                cond_channels = cond_embeds.shape[2]
+                cond_embeds = cond_embeds.reshape(-1, cond_channels, height, width)
+                cond_embeds = self.cond_proj(cond_embeds)
+                cond_embeds = cond_embeds.view(batch_size, num_frames, *cond_embeds.shape[1:])
+                cond_embeds = cond_embeds.flatten(3).transpose(2, 3)  # [batch, num_frames, height x width, channels]
+                cond_embeds = cond_embeds.flatten(1, 2)  # [batch, num_frames x height x width, channels]
+                if self.cond_zero_proj is not None:
+                    cond_embeds = self.cond_zero_proj(cond_embeds)
+                image_embeds = image_embeds + cond_embeds
+        
+        else:
+            p = self.patch_size
+            p_t = self.patch_size_t
+
+            # Process image embeds
+            image_embeds = image_embeds.permute(0, 1, 3, 4, 2)
+            image_embeds = image_embeds.reshape(
+                -1, num_frames // p_t, p_t, height // p, p, width // p, p, channels
+            )
+            image_embeds = image_embeds.permute(0, 1, 3, 5, 7, 2, 4, 6).flatten(4, 7).flatten(1, 3)
+            image_embeds = self.proj(image_embeds)
+            
+            # Process ref image embeds separately if ref_proj exists
+            if ref_image_embeds is not None:
+                if self.ref_proj is not None:
+                    # Use ref_proj for ref_image_embeds
+                    ref_image_embeds = ref_image_embeds.permute(0, 1, 3, 4, 2)
+                    ref_image_embeds = ref_image_embeds.reshape(
+                        -1, num_frames // p_t, p_t, height // p, p, width // p, p, channels
+                    )
+                    ref_image_embeds = ref_image_embeds.permute(0, 1, 3, 5, 7, 2, 4, 6).flatten(4, 7).flatten(1, 3)
+                    ref_image_embeds = self.ref_proj(ref_image_embeds)
+                else:
+                    # Use same proj as image_embeds (original behavior)
+                    ref_image_embeds = ref_image_embeds.permute(0, 1, 3, 4, 2)
+                    ref_image_embeds = ref_image_embeds.reshape(
+                        -1, num_frames // p_t, p_t, height // p, p, width // p, p, channels
+                    )
+                    ref_image_embeds = ref_image_embeds.permute(0, 1, 3, 5, 7, 2, 4, 6).flatten(4, 7).flatten(1, 3)
+                    ref_image_embeds = self.proj(ref_image_embeds)
+
+            if cond_embeds is not None:
+                cond_channels = cond_embeds.shape[2]
+                cond_embeds = cond_embeds.permute(0, 1, 3, 4, 2)
+                cond_embeds = cond_embeds.reshape(
+                    batch_size, num_frames // p_t, p_t, height // p, p, width // p, p, cond_channels
+                )
+                cond_embeds = cond_embeds.permute(0, 1, 3, 5, 7, 2, 4, 6).flatten(4, 7).flatten(1, 3)
+                cond_embeds = self.cond_proj(cond_embeds)
+                image_embeds = image_embeds + cond_embeds
+
+        embeds = torch.cat(
+            [text_embeds, image_embeds], dim=1
+        ).contiguous()  # [batch, seq_length + num_frames x height x width, channels]
+
+        if self.use_positional_embeddings or self.use_learned_positional_embeddings:
+            if self.use_learned_positional_embeddings and (self.sample_width != width or self.sample_height != height):
+                raise ValueError(
+                    "It is currently not possible to generate videos at a different resolution that the defaults. This should only be the case with 'THUDM/CogVideoX-5b-I2V'."
+                    "If you think this is incorrect, please open an issue at https://github.com/huggingface/diffusers/issues."
+                )
+
+            pre_time_compression_frames = (num_frames - 1) * self.temporal_compression_ratio + 1
+
+            if (
+                self.sample_height != height
+                or self.sample_width != width
+                or self.sample_frames != pre_time_compression_frames
+            ):
+                pos_embedding = self._get_positional_embeddings(
+                    height, width, pre_time_compression_frames, device=embeds.device
+                )
+            else:
+                pos_embedding = self.pos_embedding
+
+            pos_embedding = pos_embedding.to(dtype=embeds.dtype)
+            embeds = embeds + pos_embedding
+
+        return embeds, ref_image_embeds
+
+
+class CogVideoXTransformer3DModelWithAdapter(CogVideoXTransformer3DModel):
+    """CogVideoXTransformer3DModel with adapter-based conditioning.
+    
+    This approach uses CogVideoXPatchEmbedWithAdapter to condition the latents
+    by processing condition channels separately and adding them to the main embeddings.
+    """
+    
+    def __init__(self, *args, condition_channels: int = 0, use_zero_proj: bool = False, use_ref_proj: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
         
-        # Setup adapter
-        self.cond_adapter = LatentCondAdapter3D(
-            channels=self.config.in_channels if hasattr(self.config, 'in_channels') else 16,
-            norm=adapter_norm,
-            groups=adapter_groups
-        )
+        # Replace patch_embed with adapter version if condition_channels > 0
+        if condition_channels > 0:
+            self._setup_adapter_patch_embed(condition_channels, use_zero_proj, use_ref_proj)
+            self.condition_channels = condition_channels
+        else:
+            self.condition_channels = 0
     
-    def forward(
-        self,
-        hidden_states: torch.FloatTensor,
-        encoder_hidden_states: Optional[torch.FloatTensor] = None,
-        timestep: Optional[torch.LongTensor] = None,
-        image_rotary_emb: Optional[torch.FloatTensor] = None,
-        attention_kwargs: Optional[Dict[str, Any]] = None,
-        hand_conditions: Optional[torch.FloatTensor] = None,
-        static_conditions: Optional[torch.FloatTensor] = None,
-        hand_mask: Optional[torch.FloatTensor] = None,
-        static_mask: Optional[torch.FloatTensor] = None,
-        return_dict: bool = True,
-    ):
-        """Forward pass with residual adapter conditioning."""
-        # Apply residual conditioning through adapter
-        if hand_conditions is not None or static_conditions is not None:
-            hidden_states = self.cond_adapter(
-                hidden_states,
-                hand=hand_conditions,
-                static=static_conditions,
-                hand_mask=hand_mask,
-                static_mask=static_mask
-            )
+    def _setup_adapter_patch_embed(self, condition_channels: int, 
+                                   use_zero_proj: bool = False, use_ref_proj: bool = False):
+        """Replace patch_embed with CogVideoXPatchEmbedWithAdapter.
         
-        # Process through the parent transformer
-        return super().forward(
-            hidden_states=hidden_states,
-            encoder_hidden_states=encoder_hidden_states,
-            timestep=timestep,
-            image_rotary_emb=image_rotary_emb,
-            attention_kwargs=attention_kwargs,
-            return_dict=return_dict
+        This creates a new adapter-based patch embed that processes conditions
+        separately from the main image embeddings.
+        """
+        print(f"Setting up adapter-based patch embed for {condition_channels} condition channels")
+        
+        # Get current patch_embed config
+        current_patch_embed = self.patch_embed
+        
+        # Create new adapter patch embed with same config
+        adapter_patch_embed = CogVideoXPatchEmbedWithAdapter(
+            condition_channels=condition_channels,
+            in_channels=current_patch_embed.proj.in_channels,
+            patch_size=getattr(current_patch_embed, 'patch_size', 16),
+            patch_size_t=getattr(current_patch_embed, 'patch_size_t', None),
+            embed_dim=current_patch_embed.proj.out_channels,
+            bias=current_patch_embed.proj.bias is not None,
+            use_positional_embeddings=getattr(current_patch_embed, 'use_positional_embeddings', True),
+            use_learned_positional_embeddings=getattr(current_patch_embed, 'use_learned_positional_embeddings', False),
+            sample_height=getattr(current_patch_embed, 'sample_height', None),
+            sample_width=getattr(current_patch_embed, 'sample_width', None),
+            sample_frames=getattr(current_patch_embed, 'sample_frames', None),
+            temporal_compression_ratio=getattr(current_patch_embed, 'temporal_compression_ratio', 1),
+            use_zero_proj=use_zero_proj,
+            use_ref_proj=use_ref_proj,
         )
-    
+        
+        # Replace patch_embed
+        self.patch_embed = adapter_patch_embed
+        
+        # Register config
+        self.register_to_config(
+            condition_channels=condition_channels,
+            use_adapter_patch_embed=True,
+        )
+        
+        print(f"✅ Successfully replaced patch_embed with adapter version")
+        print(f"  Main projection: {adapter_patch_embed.proj}")
+        print(f"  Condition projection: {adapter_patch_embed.cond_proj}")
+        print(f"  Text projection: {adapter_patch_embed.text_proj}")
+
+
     @classmethod
     def from_pretrained(
         cls,
         pretrained_model_name_or_path=None,
         base_model_name_or_path="THUDM/CogVideoX-5b",
         subfolder="transformer",
-        adapter_norm: str = "group",
-        adapter_groups: int = 32,
+        condition_channels: Optional[int] = None,
+        use_zero_proj: bool = False,
+        use_ref_proj: bool = False,
         **kwargs
     ):
         """
@@ -375,8 +658,7 @@ class CogVideoXTransformer3DModelWithAdapter(CogVideoXTransformer3DModel):
         Args:
             pretrained_model_name_or_path (str): Fine-tuned checkpoint path
             base_model_name_or_path (str): Base CogVideoX model path
-            adapter_norm (str): Adapter normalization type
-            adapter_groups (int): Number of adapter groups
+            condition_channels (int): Number of extra condition channels to add
         """
         if pretrained_model_name_or_path is not None:
             # === Load fine-tuned checkpoint ===
@@ -391,7 +673,11 @@ class CogVideoXTransformer3DModelWithAdapter(CogVideoXTransformer3DModel):
                 model = cls(**config)
             else:
                 # Use base config
-                model = cls(adapter_norm=adapter_norm, adapter_groups=adapter_groups)
+                if condition_channels is None:
+                    condition_channels = 16  # default
+                model = cls(condition_channels=condition_channels,
+                            use_zero_proj=use_zero_proj,
+                            use_ref_proj=use_ref_proj)
 
             # 2) Load checkpoint state_dict directly
             state_dict_path = os.path.join(pretrained_model_name_or_path, subfolder, "diffusion_pytorch_model.safetensors")
@@ -427,56 +713,157 @@ class CogVideoXTransformer3DModelWithAdapter(CogVideoXTransformer3DModel):
                 variant=kwargs.get("variant", None),
             )
 
+            # Determine condition_channels
+            if condition_channels is None:
+                condition_channels = getattr(base_model.config, "condition_channels", 16)
+
             # Create extended model
-            model = cls(**base_model.config, adapter_norm=adapter_norm, adapter_groups=adapter_groups)
+            model = cls(**base_model.config, condition_channels=condition_channels,
+                        use_zero_proj=use_zero_proj,
+                        use_ref_proj=use_ref_proj)
 
             # Load base weights into extended model
             missing, unexpected = model.load_state_dict(base_model.state_dict(), strict=False)
+            
+            # Copy pretrained weights for newly added layers only
+            # (existing layers like proj, text_proj, pos_embedding are already copied by load_state_dict)
+            with torch.no_grad():
+                # Get references to patch embeddings
+                current_patch_embed = base_model.patch_embed
+                adapter_patch_embed = model.patch_embed
+                
+                # Only copy ref projection weights (newly added layer)
+                if use_ref_proj:
+                    adapter_patch_embed.ref_proj.weight.data = current_patch_embed.proj.weight.data
+                    if current_patch_embed.proj.bias is not None:
+                        adapter_patch_embed.ref_proj.bias.data = current_patch_embed.proj.bias.data
+                    print(f"✅ Copied ref_proj weights from base model (shape: {adapter_patch_embed.ref_proj.weight.shape})")
+                else:
+                    print("ℹ️ No ref_proj to copy (use_ref_proj=False)")
+                
+                print("✅ Base model weights successfully loaded and copied to adapter model")
+            
             if missing:
-                print(f"⚠️ Missing keys (new adapter layers): {missing}")
+                print(f"⚠️ Missing keys (new condition layers): {missing}")
             if unexpected:
                 print(f"⚠️ Unexpected keys (replaced existing layers): {unexpected}")
 
             return model
     
+    def forward(
+        self,
+        hidden_states: torch.FloatTensor,
+        encoder_hidden_states: Optional[torch.FloatTensor] = None,
+        timestep: Optional[torch.LongTensor] = None,
+        image_rotary_emb: Optional[torch.FloatTensor] = None,
+        attention_kwargs: Optional[Dict[str, Any]] = None,
+        hand_conditions: Optional[torch.FloatTensor] = None,
+        static_conditions: Optional[torch.FloatTensor] = None,
+        hand_mask: Optional[torch.FloatTensor] = None,
+        static_mask: Optional[torch.FloatTensor] = None,
+        return_dict: bool = True,
+    ):
+        """Forward pass with adapter-based conditioning."""
+        if attention_kwargs is not None:
+            attention_kwargs = attention_kwargs.copy()
+            lora_scale = attention_kwargs.pop("scale", 1.0)
+        else:
+            attention_kwargs = {}
+            lora_scale = 1.0
+
+        batch_size, num_frames, channels, height, width = hidden_states.shape
+
+        # 1. Time embedding
+        timesteps = timestep
+        t_emb = self.time_proj(timesteps)
+
+        # timesteps does not contain any weights and will always return f32 tensors
+        # but time_embedding might actually be running in fp16. so we need to cast here.
+        # there might be better ways to encapsulate this.
+        t_emb = t_emb.to(dtype=hidden_states.dtype)
+        emb = self.time_embedding(t_emb)
+
+        if self.ofs_embedding is not None:
+            # Create a default ofs tensor if not provided
+            ofs = torch.ones((batch_size,), device=hidden_states.device, dtype=hidden_states.dtype) * 2.0
+            ofs_emb = self.ofs_proj(ofs)
+            ofs_emb = ofs_emb.to(dtype=ofs_emb.dtype)
+            ofs_emb = self.ofs_embedding(ofs_emb)
+            emb = emb + ofs_emb
+
+        # Handle condition inputs
+        if not hasattr(self.patch_embed, 'cond_proj') and hand_conditions is not None:
+            # concat condition latents if not using adapter
+            hidden_states = torch.concat([hidden_states, hand_conditions], 2)
+
+        # 2. Patch embedding with adapter support
+        patch_embed_input = {'text_embeds': encoder_hidden_states, 
+                             'image_embeds': hidden_states}
+        if hasattr(self.patch_embed, 'cond_proj') and hand_conditions is not None:
+            patch_embed_input['cond_embeds'] = hand_conditions
+
+        # Use adapter patch embed
+        hidden_states, _ = self.patch_embed(**patch_embed_input)
+        
+        hidden_states = self.embedding_dropout(hidden_states)
+
+        text_seq_length = encoder_hidden_states.shape[1]
+        encoder_hidden_states = hidden_states[:, :text_seq_length]
+        hidden_states = hidden_states[:, text_seq_length:]
+
+        # 3. Transformer blocks
+        for i, block in enumerate(self.transformer_blocks):
+            if torch.is_grad_enabled() and self.gradient_checkpointing:
+                hidden_states, encoder_hidden_states = self._gradient_checkpointing_func(
+                    block,
+                    hidden_states,
+                    encoder_hidden_states,
+                    emb,
+                    image_rotary_emb,
+                    attention_kwargs,
+                )
+            else:
+                hidden_states, encoder_hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    temb=emb,
+                    image_rotary_emb=image_rotary_emb,
+                    attention_kwargs=attention_kwargs,
+                )
+
+        hidden_states = self.norm_final(hidden_states)
+
+        # 4. Final block
+        hidden_states = self.norm_out(hidden_states, temb=emb)
+        hidden_states = self.proj_out(hidden_states)
+
+        # 5. Unpatchify
+        p = self.config.patch_size
+        p_t = self.config.patch_size_t
+
+        if p_t is None:
+            output = hidden_states.reshape(batch_size, num_frames, height // p, width // p, -1, p, p)
+            output = output.permute(0, 1, 4, 2, 5, 3, 6).flatten(5, 6).flatten(3, 4)
+        else:
+            output = hidden_states.reshape(
+                batch_size, (num_frames + p_t - 1) // p_t, height // p, width // p, -1, p_t, p, p
+            )
+            output = output.permute(0, 1, 5, 4, 2, 6, 3, 7).flatten(6, 7).flatten(4, 5).flatten(1, 2)
+
+        if not return_dict:
+            return (output,)
+        return Transformer2DModelOutput(sample=output)
     
     def get_condition_info(self) -> Dict[str, Any]:
         """Get information about the conditional setup."""
         info = {
             "approach": "adapter",
-            "has_adapter": True,
-            "adapter_freeze_status": self.cond_adapter.get_freeze_status(),
+            "has_conditions": hasattr(self, 'condition_channels') and self.condition_channels > 0,
+            "condition_channels": getattr(self, 'condition_channels', 0),
             "total_input_channels": self.patch_embed.proj.in_channels,
+            "base_channels": getattr(self, 'original_in_channels', self.patch_embed.proj.in_channels),
         }
         return info
-    
-    # Adapter utility methods
-    def get_adapter_freeze_status(self) -> Dict[str, bool]:
-        """Get current freeze status of adapter branches."""
-        return self.cond_adapter.get_freeze_status()
-    
-    def freeze_adapter_hand_branch(self):
-        """Freeze hand branch parameters in the adapter."""
-        self.cond_adapter.freeze_hand_branch()
-    
-    def freeze_adapter_static_branch(self):
-        """Freeze static branch parameters in the adapter."""
-        self.cond_adapter.freeze_static_branch()
-    
-    def unfreeze_adapter_hand_branch(self):
-        """Unfreeze hand branch parameters in the adapter."""
-        self.cond_adapter.unfreeze_hand_branch()
-    
-    def unfreeze_adapter_static_branch(self):
-        """Unfreeze static branch parameters in the adapter."""
-        self.cond_adapter.unfreeze_static_branch()
-    
-    def print_adapter_freeze_status(self):
-        """Print current freeze status of adapter branches."""
-        status = self.get_adapter_freeze_status()
-        print("🔒 Adapter Freeze Status:")
-        print(f"  Hand branch: {'Frozen' if status['hand'] else 'Unfrozen'}")
-        print(f"  Static branch: {'Frozen' if status['static'] else 'Unfrozen'}")
 
 
 # Legacy class for backward compatibility
@@ -488,23 +875,307 @@ class CogVideoXTransformer3DModelWithConditions(CogVideoXTransformer3DModelWithA
     explicitly based on your needs.
     """
     
-    def __init__(self, *args, condition_channels: int = 0, use_adapter: bool = True, 
-                 adapter_norm: str = "group", adapter_groups: int = 32, **kwargs):
-        if not use_adapter:
-            raise ValueError(
-                "CogVideoXTransformer3DModelWithConditions now defaults to adapter approach. "
-                "For concat approach, use CogVideoXTransformer3DModelWithConcat instead."
-            )
-        
-        # Remove condition_channels from kwargs as it's not used in adapter approach
-        kwargs.pop('condition_channels', None)
-        
+    def __init__(self, *args, condition_channels: int = 0, **kwargs):
         super().__init__(
             *args, 
-            adapter_norm=adapter_norm,
-            adapter_groups=adapter_groups,
+            condition_channels=condition_channels,
             **kwargs
         )
+
+class CrossTransformer3DModelWithAdapter(CogVideoXTransformer3DModelWithAdapter):
+    def __init__(self, *args, 
+                is_train_cross: bool = True, 
+                cross_attn_interval: int = 2,
+                cross_attn_dim_head: int = 128,
+                cross_attn_num_heads: int = 16,
+                cross_attn_kv_dim: int = None,
+                **kwargs):
+        super().__init__(*args, use_ref_proj=True, **kwargs)
+        num_attention_heads = kwargs.get("num_attention_heads", 30)
+        attention_head_dim = kwargs.get("attention_head_dim", 64)
+        self.inner_dim = num_attention_heads * attention_head_dim
+        self.is_train_cross = is_train_cross
+        self.cross_attn_interval = cross_attn_interval
+        self.num_cross_attn = self.config.num_layers // self.cross_attn_interval
+        self.cross_attn_dim_head = cross_attn_dim_head
+        self.cross_attn_num_heads = cross_attn_num_heads
+        self.cross_attn_kv_dim = cross_attn_kv_dim
+        if self.is_train_cross:
+            self.perceiver_cross_attention = nn.ModuleList(
+                [
+                    PerceiverCrossAttention(
+                        dim=self.inner_dim,
+                        dim_head=self.cross_attn_dim_head,
+                        heads=self.cross_attn_num_heads,
+                        kv_dim=self.cross_attn_kv_dim,
+                    ).to(self.device, dtype=self.dtype)
+                    for _ in range(self.num_cross_attn)
+                ]
+            )
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path=None,
+        base_model_name_or_path="THUDM/CogVideoX-5b-I2V",
+        subfolder="transformer",
+        condition_channels: Optional[int] = None,
+        use_zero_proj: bool = False,
+        is_train_cross: bool = True,
+        cross_attn_interval: int = 2,
+        cross_attn_dim_head: int = 128,
+        cross_attn_num_heads: int = 16,
+        cross_attn_kv_dim: int = None,
+        **kwargs
+    ):
+        """
+        Load a CrossTransformer3DModelWithAdapter from a pretrained model.
+
+        Args:
+            pretrained_model_name_or_path (str): Fine-tuned checkpoint path
+            base_model_name_or_path (str): Base CogVideoX model path
+            condition_channels (int): Number of extra condition channels to add
+            use_zero_proj (bool): Whether to use zero projection
+            is_train_cross (bool): Whether to train cross attention
+            cross_attn_interval (int): Interval for cross attention
+            cross_attn_dim_head (int): Dimension of head for cross attention
+            cross_attn_num_heads (int): Number of heads for cross attention
+            cross_attn_kv_dim (int): Dimension of key/value for cross attention
+        """
+        if pretrained_model_name_or_path is not None:
+            # === Load fine-tuned checkpoint ===
+            print(f"📥 Loading fine-tuned cross pose-conditioned transformer: {pretrained_model_name_or_path}")
+
+            # 1) Create child class structure first
+            config_path = os.path.join(pretrained_model_name_or_path, subfolder, "config.json")
+            if os.path.exists(config_path):
+                import json
+                with open(config_path, "r") as f:
+                    config = json.load(f)
+                model = cls(**config)
+            else:
+                # Use base config
+                if condition_channels is None:
+                    condition_channels = 16  # default
+                model = cls(condition_channels=condition_channels,
+                            use_zero_proj=use_zero_proj,
+                            is_train_cross=is_train_cross,
+                            cross_attn_interval=cross_attn_interval,
+                            cross_attn_dim_head=cross_attn_dim_head,
+                            cross_attn_num_heads=cross_attn_num_heads,
+                            cross_attn_kv_dim=cross_attn_kv_dim)
+
+            # 2) Load checkpoint state_dict directly
+            # Try to find all safetensors files first
+            safetensors_files = glob.glob(os.path.join(pretrained_model_name_or_path, subfolder, "*.safetensors"))
+            if safetensors_files:
+                print(f"🔧 Loading weights from {len(safetensors_files)} safetensors files")
+                # Load and merge all safetensors files
+                state_dict = {}
+                for file_path in safetensors_files:
+                    print(f"   Loading: {os.path.basename(file_path)}")
+                    file_state_dict = load_file(file_path)
+                    state_dict.update(file_state_dict)
+            else:
+                # Fallback to single file approach
+                state_dict_path = os.path.join(pretrained_model_name_or_path, subfolder, "diffusion_pytorch_model.safetensors")
+                if not os.path.exists(state_dict_path):
+                    # Try alternative paths
+                    state_dict_path = os.path.join(pretrained_model_name_or_path, subfolder, "pytorch_model.bin")
+                    if not os.path.exists(state_dict_path):
+                        raise FileNotFoundError(f"No model file found in {pretrained_model_name_or_path}")
+                
+                if state_dict_path.endswith(".safetensors"):
+                    state_dict = load_file(state_dict_path)
+                else:
+                    state_dict = torch.load(state_dict_path, map_location="cpu")
+
+            # 3) Load with strict=False for flexibility
+            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            if missing:
+                print(f"⚠️ Missing keys (new layers, need initialization during training): {missing}")
+            if unexpected:
+                print(f"⚠️ Unexpected keys (replaced layers, etc.): {unexpected}")
+
+            return model
+
+        else:
+            # === Initialize from base model ===
+            print(f"🔧 Initializing from base model: {base_model_name_or_path}")
+            # First load the base CogVideoX transformer
+            base_model = CogVideoXTransformer3DModel.from_pretrained(
+                base_model_name_or_path,
+                subfolder=subfolder,
+                torch_dtype=kwargs.get("torch_dtype", torch.bfloat16),
+                revision=kwargs.get("revision", None),
+                variant=kwargs.get("variant", None),
+            )
+
+            # Determine condition_channels
+            if condition_channels is None:
+                condition_channels = getattr(base_model.config, "condition_channels", 16)
+
+            # Create extended model
+            model = cls(**base_model.config, 
+                        condition_channels=condition_channels,
+                        use_zero_proj=use_zero_proj,
+                        is_train_cross=is_train_cross,
+                        cross_attn_interval=cross_attn_interval,
+                        cross_attn_dim_head=cross_attn_dim_head,
+                        cross_attn_num_heads=cross_attn_num_heads,
+                        cross_attn_kv_dim=cross_attn_kv_dim)
+
+            # Load base weights into extended model
+            missing, unexpected = model.load_state_dict(base_model.state_dict(), strict=False)
+            if missing:
+                print(f"⚠️ Missing keys (new condition layers): {missing}")
+            if unexpected:
+                print(f"⚠️ Unexpected keys (replaced existing layers): {unexpected}")
+
+            return model
+    
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        timestep: Union[int, float, torch.LongTensor],
+        timestep_cond: Optional[torch.Tensor] = None,
+        control_latents: Optional[torch.Tensor] = None,
+        ref_latents: Optional[torch.Tensor] = None,
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        ref_image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        return_dict: bool = True,
+        **kwargs
+    ):
+        """
+        Forward pass with VideoX-Fun specific inputs and adapter-based conditional processing.
+        
+        Args:
+            hidden_states: Input tensor with shape [batch, frames, channels, height, width]
+            encoder_hidden_states: Text embeddings
+            timestep: Timestep tensor
+            timestep_cond: Timestep condition tensor
+            control_latents: Control latents (VideoX-Fun specific)
+            ref_latents: Reference video latents
+            image_rotary_emb: Rotary embeddings
+            return_dict: Whether to return a dict
+            **kwargs: Additional arguments
+        """
+        if "attention_kwargs" in kwargs:
+            attention_kwargs = kwargs["attention_kwargs"].copy()
+            lora_scale = attention_kwargs.pop("scale", 1.0)
+        else:
+            attention_kwargs = {}
+            lora_scale = 1.0
+
+        if USE_PEFT_BACKEND:
+            # weight the lora layers by setting `lora_scale` for each PEFT layer
+            scale_lora_layers(self, lora_scale)
+        else:
+            if attention_kwargs is not None and attention_kwargs.get("scale", None) is not None:
+                logger.warning(
+                    "Passing `scale` via `attention_kwargs` when not using the PEFT backend is ineffective."
+                )
+
+        batch_size, num_frames, channels, height, width = hidden_states.shape
+
+        # 1. Time embedding
+        timesteps = timestep
+        t_emb = self.time_proj(timesteps)
+
+        # timesteps does not contain any weights and will always return f32 tensors
+        # but time_embedding might actually be running in fp16. so we need to cast here.
+        # there might be better ways to encapsulate this.
+        t_emb = t_emb.to(dtype=hidden_states.dtype)
+        emb = self.time_embedding(t_emb, timestep_cond)
+
+        if self.ofs_embedding is not None and "ofs" in kwargs:
+            ofs = kwargs["ofs"]
+            ofs_emb = self.ofs_proj(ofs)
+            ofs_emb = ofs_emb.to(dtype=hidden_states.dtype)
+            ofs_emb = self.ofs_embedding(ofs_emb)
+            emb = emb + ofs_emb
+
+        if not hasattr(self.patch_embed, 'cond_proj') and control_latents is not None:
+            # concat control latents if not using adapter
+            hidden_states = torch.concat([hidden_states, control_latents], 2)
+
+        # 2. Patch embedding with adapter support
+        patch_embed_input = {'text_embeds': encoder_hidden_states, 
+                             'image_embeds': hidden_states}
+        if hasattr(self.patch_embed, 'cond_proj') and control_latents is not None:
+            patch_embed_input['cond_embeds'] = control_latents
+
+        if ref_latents is not None:
+            patch_embed_input['ref_image_embeds'] = ref_latents
+    
+        # Use adapter patch embed
+        hidden_states, ref_hidden_states = self.patch_embed(**patch_embed_input)
+        
+        hidden_states = self.embedding_dropout(hidden_states)
+
+        text_seq_length = encoder_hidden_states.shape[1]
+        encoder_hidden_states = hidden_states[:, :text_seq_length]
+        hidden_states = hidden_states[:, text_seq_length:]
+
+        # 3. Transformer blocks
+        ca_idx = 0
+        for i, block in enumerate(self.transformer_blocks):
+            if torch.is_grad_enabled() and self.gradient_checkpointing:
+                hidden_states, encoder_hidden_states = self._gradient_checkpointing_func(
+                    block,
+                    hidden_states,
+                    encoder_hidden_states,
+                    emb,
+                    image_rotary_emb,
+                    attention_kwargs,
+                )
+            else:
+                hidden_states, encoder_hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    temb=emb,
+                    image_rotary_emb=image_rotary_emb,
+                    attention_kwargs=attention_kwargs,
+                )
+            if self.is_train_cross and ref_hidden_states is not None:
+                if i % self.cross_attn_interval == 0:
+                    hidden_states = hidden_states + self.perceiver_cross_attention[
+                        ca_idx
+                    ](
+                        ref_hidden_states, hidden_states
+                    )  # torch.Size([2, 32, 2048])  torch.Size([2, 17550, 3072])
+                    ca_idx += 1
+
+        hidden_states = self.norm_final(hidden_states)
+
+        # 4. Final block
+        hidden_states = self.norm_out(hidden_states, temb=emb)
+        hidden_states = self.proj_out(hidden_states)
+
+        # 5. Unpatchify
+        p = self.config.patch_size
+        p_t = self.config.patch_size_t
+
+        if p_t is None:
+            output = hidden_states.reshape(batch_size, num_frames, height // p, width // p, -1, p, p)
+            output = output.permute(0, 1, 4, 2, 5, 3, 6).flatten(5, 6).flatten(3, 4)
+        else:
+            output = hidden_states.reshape(
+                batch_size, (num_frames + p_t - 1) // p_t, height // p, width // p, -1, p_t, p, p
+            )
+            output = output.permute(0, 1, 5, 4, 2, 6, 3, 7).flatten(6, 7).flatten(4, 5).flatten(1, 2)
+
+        if USE_PEFT_BACKEND:
+            # remove `lora_scale` from each PEFT layer
+            unscale_lora_layers(self, lora_scale)
+
+        if not return_dict:
+            return (output,)
+        return Transformer2DModelOutput(sample=output)
+
+
 
 
 # ============================================================================
@@ -1585,9 +2256,7 @@ class CogVideoXTransformer3DModelWithAdaLNPosePerFrame(CogVideoXTransformer3DMod
 def create_conditioned_transformer(
     base_model_path: str,
     approach: str = "adapter",  # "adapter", "concat", "adaln_pose", or "adaln_pose_perframe"
-    condition_channels: int = 0,  # Only used for concat approach
-    adapter_norm: str = "group",
-    adapter_groups: int = 32,
+    condition_channels: int = 0,  # Used for both adapter and concat approaches
     smpl_pose_dim: int = 63,  # Only used for adaln_pose approaches
     smpl_embed_dim: int = 512,  # Only used for adaln_pose approaches
     torch_dtype: Optional[torch.dtype] = None,
@@ -1598,9 +2267,7 @@ def create_conditioned_transformer(
     Args:
         base_model_path: Path to the base model
         approach: Conditioning approach - "adapter", "concat", "adaln_pose", or "adaln_pose_perframe"
-        condition_channels: Number of condition channels (only for concat approach)
-        adapter_norm: Normalization type for adapter
-        adapter_groups: Number of groups for group normalization
+        condition_channels: Number of condition channels (for adapter and concat approaches)
         smpl_pose_dim: SMPL pose parameter dimension (only for adaln_pose approaches)
         smpl_embed_dim: SMPL embedding dimension (only for adaln_pose approaches)
         torch_dtype: Data type for the model
@@ -1610,12 +2277,11 @@ def create_conditioned_transformer(
     print(f"Approach: {approach}")
     
     if approach == "adapter":
-        print(f"Using residual adapter with norm={adapter_norm}, groups={adapter_groups}")
+        print(f"Using adapter approach with {condition_channels} condition channels")
         transformer = CogVideoXTransformer3DModelWithAdapter.from_pretrained(
             base_model_path,
             subfolder="transformer",
-            adapter_norm=adapter_norm,
-            adapter_groups=adapter_groups,
+            condition_channels=condition_channels,
             torch_dtype=torch_dtype,
             **kwargs
         )
