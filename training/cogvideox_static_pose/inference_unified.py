@@ -24,6 +24,10 @@ from diffusers import (
     CogVideoXDPMScheduler,
     CogVideoXTransformer3DModel,
 )
+from training.cogvideox_static_pose.cogvideox_fun_transformer_with_conditions import (
+    CrossTransformer3DModel,
+    CrossTransformer3DModelWithAdapter,
+)
 from diffusers.utils import export_to_video, convert_unet_state_dict_to_peft
 from transformers import AutoTokenizer, T5EncoderModel
 from peft import get_peft_model_state_dict, set_peft_model_state_dict, LoraConfig
