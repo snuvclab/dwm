@@ -39,7 +39,6 @@ from cogvideox_fun_transformer_with_conditions import (
     CogVideoXFunTransformer3DModel, 
     CogVideoXFunTransformer3DModelWithConcat, 
     CogVideoXFunTransformer3DModelWithAdapter,
-    CogVideoXFunTransformer3DModelWithCondToken,
     CrossTransformer3DModelWithAdapter
 )
 
@@ -1041,7 +1040,6 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
                         condition_channels=None, 
                         use_cond_token=False,
                         use_adapter=False,
-                        use_zero_proj=False,
                         adapter_version="v1",
                         *args, **kwargs):
         """
@@ -1069,21 +1067,9 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
             if condition_channels is None:
                 condition_channels = 0  # Default to base model
             
-            # Create or load appropriate transformer based on condition_channels and use_cond_token
+            # Create or load appropriate transformer based on condition_channels and use_adapter
             if condition_channels > 0:
-                if use_cond_token:
-                    print(f"🔧 Creating/loading VideoX-Fun cond token transformer with {condition_channels} condition channels")
-                    transformer = CogVideoXFunTransformer3DModelWithCondToken.from_pretrained(
-                        pretrained_model_name_or_path=pretrained_model_name_or_path,
-                        base_model_name_or_path=base_model_name_or_path,
-                        subfolder="transformer",
-                        condition_channels=condition_channels,
-                        use_zero_proj=use_zero_proj,
-                        torch_dtype=kwargs.get("torch_dtype", torch.bfloat16),
-                        revision=kwargs.get("revision", None),
-                        variant=kwargs.get("variant", None),
-                    )
-                elif use_adapter:
+                if use_adapter:
                     print(f"🔧 Creating/loading VideoX-Fun adapter transformer with {condition_channels} condition channels (adapter_version={adapter_version})")
                     transformer = CogVideoXFunTransformer3DModelWithAdapter.from_pretrained(
                         pretrained_model_name_or_path=pretrained_model_name_or_path,
@@ -1091,7 +1077,6 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
                         subfolder="transformer",
                         condition_channels=condition_channels,
                         adapter_version=adapter_version,
-                        use_zero_proj=use_zero_proj,
                         torch_dtype=kwargs.get("torch_dtype", torch.bfloat16),
                         revision=kwargs.get("revision", None),
                         variant=kwargs.get("variant", None),

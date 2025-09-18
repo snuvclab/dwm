@@ -85,12 +85,6 @@ class ExperimentConfigLoader:
             if section not in config:
                 raise ValueError(f"Missing required section: {section}")
         
-        # Validate training mode
-        training_mode = config["training"]["mode"]
-        supported_modes = config["training_modes"].keys()
-        if training_mode not in supported_modes:
-            raise ValueError(f"Unsupported training mode: {training_mode}")
-        
         # Validate pipeline type
         pipeline_type = config["pipeline"]["type"]
         supported_pipeline_types = [
