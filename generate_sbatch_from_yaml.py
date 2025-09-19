@@ -209,14 +209,24 @@ elif [ "$SLURM_TEST_MODE" = true ]; then
 else
     # SLURM mode - use GPU count from YAML
     NUM_GPUS={slurm.get('gpus', 2)}
-    GPU_IDS=""
-    for i in $(seq 0 $((NUM_GPUS-1))); do
-        if [ $i -eq 0 ]; then
-            GPU_IDS="$i"
-        else
-            GPU_IDS="$GPU_IDS,$i"
-        fi
-    done
+    
+    # Use SLURM allocated GPU IDs
+    if [ -n "$CUDA_VISIBLE_DEVICES" ]; then
+        # Use actual allocated GPUs in SLURM environment
+        GPU_IDS="$CUDA_VISIBLE_DEVICES"
+        echo "🔧 Using SLURM allocated GPUs: $GPU_IDS"
+    else
+        # Fallback: use sequential GPU IDs starting from 0
+        GPU_IDS=""
+        for i in $(seq 0 $((NUM_GPUS-1))); do
+            if [ $i -eq 0 ]; then
+                GPU_IDS="$i"
+            else
+                GPU_IDS="$GPU_IDS,$i"
+            fi
+        done
+        echo "🔧 Using fallback GPU IDs: $GPU_IDS"
+    fi
     
     # Accelerate config based on GPU count
     if [ $NUM_GPUS -eq 1 ]; then
