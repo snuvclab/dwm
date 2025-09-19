@@ -235,6 +235,8 @@ else
         ACCELERATE_CONFIG_FILE="accelerate_configs/deepspeed_2.yaml"
     elif [ $NUM_GPUS -eq 4 ]; then
         ACCELERATE_CONFIG_FILE="accelerate_configs/deepspeed_4.yaml"
+    elif [ $NUM_GPUS -eq 8 ]; then
+        ACCELERATE_CONFIG_FILE="accelerate_configs/deepspeed_8.yaml"
     else
         echo "Warning: Unsupported GPU count: $NUM_GPUS, using default config"
         ACCELERATE_CONFIG_FILE="accelerate_configs/deepspeed_2.yaml"
