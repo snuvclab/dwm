@@ -16,7 +16,7 @@ import os
 from pathlib import Path
 from datetime import datetime
 
-def generate_sbatch_script(yaml_file, output_script=None):
+def generate_sbatch_script(yaml_file, output_script=None, aicomputing=False):
     """Generate SLURM batch script from YAML configuration."""
     
     # Load YAML configuration
@@ -50,6 +50,21 @@ def generate_sbatch_script(yaml_file, output_script=None):
     model = config.get('model', {})
     logging = config.get('logging', {})
     
+    # Override SLURM settings for aicomputing
+    if aicomputing:
+        print("🔧 AICOMPUTING mode: Overriding SLURM settings for aicomputing cluster")
+        slurm.update({
+            'nodes': 1,
+            'gpus_per_node': 4,
+            'cpus_per_task': 48,
+            'mem': '400G',
+            'partition': 'train',
+            'nodelist': 'compute-st-kait-gpu-2'
+        })
+        # Remove gpus field if it exists to avoid conflict
+        if 'gpus' in slurm:
+            del slurm['gpus']
+    
     # Auto-update paths with extracted date and experiment name
     if date_match != "unknown":
         # Get experiment name and date from YAML
@@ -81,13 +96,28 @@ def generate_sbatch_script(yaml_file, output_script=None):
     output_script = yaml_dir / output_script
     
     # Generate flexible script content
-    script_content = f"""#!/bin/bash
+    # Build SLURM directives based on aicomputing mode
+    if aicomputing:
+        slurm_directives = f"""#!/bin/bash
+#SBATCH --job-name={slurm.get('job_name', 'default_job')}
+#SBATCH --nodes={slurm.get('nodes', 1)}
+#SBATCH --gpus-per-node={slurm.get('gpus_per_node', 4)}
+#SBATCH --cpus-per-task={slurm.get('cpus_per_task', 48)}
+#SBATCH --mem={slurm.get('mem', '400G')}
+#SBATCH --partition={slurm.get('partition', 'train')}
+#SBATCH --nodelist={slurm.get('nodelist', 'compute-st-kait-gpu-2')}
+#SBATCH --output={slurm.get('output', 'out/%j_default.out')}
+#SBATCH --error={slurm.get('error', 'out/%j_default.err')}"""
+    else:
+        slurm_directives = f"""#!/bin/bash
 #SBATCH --job-name={slurm.get('job_name', 'default_job')}
 #SBATCH --nodes={slurm.get('nodes', 1)}
 #SBATCH --gpus={slurm.get('gpus', 2)}
 #SBATCH --partition={slurm.get('partition', 'batch')}
 #SBATCH --output={slurm.get('output', 'out/%j_default.out')}
-#SBATCH --error={slurm.get('error', 'out/%j_default.err')}
+#SBATCH --error={slurm.get('error', 'out/%j_default.err')}"""
+    
+    script_content = f"""{slurm_directives}
 
 # Generated from: {yaml_file}
 # Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
@@ -208,7 +238,14 @@ elif [ "$SLURM_TEST_MODE" = true ]; then
     echo "🧪 SLURM test mode: Using 2 GPUs with accelerate"
 else
     # SLURM mode - use GPU count from YAML
-    NUM_GPUS={slurm.get('gpus', 2)}
+    if [ "{aicomputing}" = "True" ]; then
+        # AICOMPUTING mode - use gpus-per-node
+        NUM_GPUS={slurm.get('gpus_per_node', 4)}
+        echo "🔧 AICOMPUTING mode: Using $NUM_GPUS GPUs per node"
+    else
+        # Standard mode - use gpus field
+        NUM_GPUS={slurm.get('gpus', 2)}
+    fi
     
     # Use SLURM allocated GPU IDs
     if [ -n "$CUDA_VISIBLE_DEVICES" ]; then
@@ -375,10 +412,18 @@ echo "   - SLURM error: {slurm.get('error', 'out/%j_default.err')}"
         print(f"📋 Script details:")
         print(f"   - Job Name: {slurm.get('job_name', 'default_job')}")
         print(f"   - Nodes: {slurm.get('nodes', 1)}")
-        print(f"   - GPUs: {slurm.get('gpus', 2)}")
+        if aicomputing:
+            print(f"   - GPUs per node: {slurm.get('gpus_per_node', 4)}")
+            print(f"   - CPUs per task: {slurm.get('cpus_per_task', 48)}")
+            print(f"   - Memory: {slurm.get('mem', '400G')}")
+            print(f"   - Node list: {slurm.get('nodelist', 'compute-st-kait-gpu-2')}")
+        else:
+            print(f"   - GPUs: {slurm.get('gpus', 2)}")
         print(f"   - Partition: {slurm.get('partition', 'batch')}")
         print(f"   - Output: {slurm.get('output', 'out/default_%j.out')}")
         print(f"   - Error: {slurm.get('error', 'out/default_%j.err')}")
+        if aicomputing:
+            print(f"   - Mode: AICOMPUTING cluster")
         print(f"")
         print(f"🚀 Usage modes:")
         print(f"   1. Debug mode:     ./{output_script.name} --debug")
@@ -396,18 +441,28 @@ echo "   - SLURM error: {slurm.get('error', 'out/%j_default.err')}"
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python generate_sbatch_from_yaml.py <yaml_config_file> [output_script_name]")
+        print("Usage: python generate_sbatch_from_yaml.py <yaml_config_file> [output_script_name] [--aicomputing]")
         print("Example: python generate_sbatch_from_yaml.py trumans_concat_static_hand.yaml")
+        print("Example: python generate_sbatch_from_yaml.py trumans_concat_static_hand.yaml my_script.sh --aicomputing")
         sys.exit(1)
     
     yaml_file = sys.argv[1]
-    output_script = sys.argv[2] if len(sys.argv) > 2 else None
+    output_script = None
+    aicomputing = False
+    
+    # Parse arguments
+    for i, arg in enumerate(sys.argv[2:], 2):
+        if arg == "--aicomputing":
+            aicomputing = True
+        elif not arg.startswith("--"):
+            # This is the output script name
+            output_script = arg
     
     if not os.path.exists(yaml_file):
         print(f"Error: YAML file not found: {yaml_file}")
         sys.exit(1)
     
-    success = generate_sbatch_script(yaml_file, output_script)
+    success = generate_sbatch_script(yaml_file, output_script, aicomputing)
     sys.exit(0 if success else 1)
 
 if __name__ == "__main__":
