@@ -28,6 +28,9 @@ parser.add_argument("--skip-existing", action="store_true", default=True, help="
 parser.add_argument("--no-skip-existing", action="store_true", help="Disable skipping existing frames")
 parser.add_argument("--frame-skip", type=int, default=3, help="Render every Nth frame")
 parser.add_argument("--fov", type=float, default=90.0, help="Camera FOV in degrees (perspective)")
+parser.add_argument("--width", type=int, default=720, help="Render width in pixels (default: 720)")
+parser.add_argument("--height", type=int, default=480, help="Render height in pixels (default: 480)")
+parser.add_argument("--no-depth", action="store_true", help="Skip depth rendering (RGB only)")
 args = parser.parse_args(argv)
 if args.no_skip_existing:
     args.skip_existing = False
@@ -127,15 +130,15 @@ def get_camera_intrinsics(camera_obj):
 def get_camera_to_world_matrix(camera_obj):
     return np.array(camera_obj.matrix_world, dtype=np.float32)
 
-def check_frame_exists(frame_num, images_output_path, depth_output_path, cam_params_path):
+def check_frame_exists(frame_num, images_output_path, depth_output_path, cam_params_path, no_depth=False):
     def file_ok(path): return os.path.isfile(path) and os.path.getsize(path) > 0
     image_path = os.path.join(images_output_path, f"{frame_num:04d}.png")
     depth_path = os.path.join(depth_output_path,  f"{frame_num:04d}.exr")
     cam_param_path = os.path.join(cam_params_path, f"cam_{frame_num:04d}.npy")
     rgb_exists = file_ok(image_path)
-    depth_exists = file_ok(depth_path)
+    depth_exists = file_ok(depth_path) if not no_depth else True  # Skip depth check if no_depth
     cam_param_exists = file_ok(cam_param_path)
-    needs_rendering = not rgb_exists or not depth_exists
+    needs_rendering = not rgb_exists or (not depth_exists and not no_depth)
     needs_cam_param = not cam_param_exists
     return rgb_exists, depth_exists, cam_param_exists, needs_rendering, needs_cam_param
 
@@ -193,8 +196,8 @@ except Exception as e:
     print(f"Unexpected GPU setup error: {e}. Using CPU.")
 
 # Resolution & formats
-render.resolution_x = 720
-render.resolution_y = 480
+render.resolution_x = args.width
+render.resolution_y = args.height
 render.resolution_percentage = 100
 render.image_settings.file_format = 'PNG'
 render.image_settings.color_mode = 'RGBA'
@@ -202,22 +205,26 @@ render.image_settings.color_mode = 'RGBA'
 # ---------------------------
 # Make Clean-Depth View Layer (opaque override) BEFORE building nodes
 # ---------------------------
-# Create solid diffuse material
-mat_depth = bpy.data.materials.get("DepthOverride")
-if mat_depth is None:
-    mat_depth = bpy.data.materials.new("DepthOverride")
-mat_depth.use_nodes = True
-nodes = mat_depth.node_tree.nodes
-links = mat_depth.node_tree.links
-for n in list(nodes): nodes.remove(n)
-bsdf = nodes.new("ShaderNodeBsdfDiffuse")
-out  = nodes.new("ShaderNodeOutputMaterial")
-links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+mat_depth = None
+depth_layer = None
 
-# Create / configure depth view layer
-depth_layer = scene.view_layers.get("DepthSolid") or scene.view_layers.new("DepthSolid")
-depth_layer.material_override = mat_depth
-depth_layer.use_pass_z = True
+if not args.no_depth:
+    # Create solid diffuse material
+    mat_depth = bpy.data.materials.get("DepthOverride")
+    if mat_depth is None:
+        mat_depth = bpy.data.materials.new("DepthOverride")
+    mat_depth.use_nodes = True
+    nodes = mat_depth.node_tree.nodes
+    links = mat_depth.node_tree.links
+    for n in list(nodes): nodes.remove(n)
+    bsdf = nodes.new("ShaderNodeBsdfDiffuse")
+    out  = nodes.new("ShaderNodeOutputMaterial")
+    links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+
+    # Create / configure depth view layer
+    depth_layer = scene.view_layers.get("DepthSolid") or scene.view_layers.new("DepthSolid")
+    depth_layer.material_override = mat_depth
+    depth_layer.use_pass_z = True
 
 # ---------------------------
 # Compositor nodes
@@ -241,23 +248,27 @@ rgb_output_node.format.color_mode = 'RGBA'
 rgb_output_node.location = 400, 200
 tree.links.new(rl_rgb.outputs['Image'], rgb_output_node.inputs[0])
 
-# DepthSolid layer for clean Z (meters)
-rl_depth = tree.nodes.new(type='CompositorNodeRLayers')
-rl_depth.location = 0, -200
-rl_depth.layer = depth_layer.name
+# DepthSolid layer for clean Z (meters) - only if depth rendering is enabled
+rl_depth = None
+depth_output_node = None
 
-depth_output_node = tree.nodes.new(type='CompositorNodeOutputFile')
-depth_output_node.label = "Depth Clean (EXR)"
-depth_output_node.base_path = output_folder
-depth_output_node.file_slots[0].path = "####"
-depth_output_node.format.file_format = 'OPEN_EXR'
-depth_output_node.format.color_depth = '32'
-depth_output_node.format.exr_codec = 'ZIP'
-depth_output_node.location = 400, -200
-if 'Depth' in rl_depth.outputs:
-    tree.links.new(rl_depth.outputs['Depth'], depth_output_node.inputs[0])
-else:
-    print("Warning: Depth output not found in DepthSolid layer.")
+if not args.no_depth and depth_layer:
+    rl_depth = tree.nodes.new(type='CompositorNodeRLayers')
+    rl_depth.location = 0, -200
+    rl_depth.layer = depth_layer.name
+
+    depth_output_node = tree.nodes.new(type='CompositorNodeOutputFile')
+    depth_output_node.label = "Depth Clean (EXR)"
+    depth_output_node.base_path = output_folder
+    depth_output_node.file_slots[0].path = "####"
+    depth_output_node.format.file_format = 'OPEN_EXR'
+    depth_output_node.format.color_depth = '32'
+    depth_output_node.format.exr_codec = 'ZIP'
+    depth_output_node.location = 400, -200
+    if 'Depth' in rl_depth.outputs:
+        tree.links.new(rl_depth.outputs['Depth'], depth_output_node.inputs[0])
+    else:
+        print("Warning: Depth output not found in DepthSolid layer.")
 
 # ---------------------------
 # Locate objects & camera setup
@@ -344,19 +355,25 @@ def render_animation_sequence(animation_index, animation_name):
     images_output_path = os.path.join(anim_output_folder, "images")
     depth_output_path  = os.path.join(anim_output_folder, "depth")
     cam_params_path    = os.path.join(anim_output_folder, "cam_params")
-    for p in [images_output_path, depth_output_path, cam_params_path]:
-        os.makedirs(p, exist_ok=True)
+    
+    # Create directories - only create depth folder if depth rendering is enabled
+    os.makedirs(images_output_path, exist_ok=True)
+    os.makedirs(cam_params_path, exist_ok=True)
+    if not args.no_depth:
+        os.makedirs(depth_output_path, exist_ok=True)
 
     print(f"Rendering animation {animation_index}: {animation_name}")
     print(f"  Images: {images_output_path}")
-    print(f"  Depth : {depth_output_path}")
+    if not args.no_depth:
+        print(f"  Depth : {depth_output_path}")
     print(f"  Cam   : {cam_params_path}")
 
     # Set base paths per animation
     rgb_output_node.base_path   = images_output_path
-    depth_output_node.base_path = depth_output_path
     rgb_output_node.file_slots[0].path   = "####"
-    depth_output_node.file_slots[0].path = "####"
+    if not args.no_depth and depth_output_node:
+        depth_output_node.base_path = depth_output_path
+        depth_output_node.file_slots[0].path = "####"
 
     # Save intrinsics (same for all frames in render res)
     intrinsics = get_camera_intrinsics(camera_obj)
@@ -378,7 +395,7 @@ def render_animation_sequence(animation_index, animation_name):
 
     for frame_num in frames_to_render:
         rgb_exists, depth_exists, cam_param_exists, needs_rendering, needs_cam_param = \
-            check_frame_exists(frame_num, images_output_path, depth_output_path, cam_params_path)
+            check_frame_exists(frame_num, images_output_path, depth_output_path, cam_params_path, args.no_depth)
 
         scene.frame_set(frame_num)
 
@@ -393,7 +410,7 @@ def render_animation_sequence(animation_index, animation_name):
             frames_skipped += 1
             status = []
             if rgb_exists: status.append("RGB")
-            if depth_exists: status.append("Depth")
+            if depth_exists and not args.no_depth: status.append("Depth")
             if cam_param_exists: status.append("Cam")
             print(f"[ANIM {animation_index}] Frame {frame_num}: SKIPPED ({', '.join(status)})")
             continue
