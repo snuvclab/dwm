@@ -44,6 +44,7 @@ parser.add_argument("--no-skip-existing", action="store_true", help="Disable ski
 parser.add_argument("--frame-skip", type=int, default=3, help="Render every Nth frame")
 parser.add_argument("--stride", type=int, default=25, help="Stride for video sequences (default: 25)")
 parser.add_argument("--fov", type=float, default=90.0, help="Camera FOV in degrees (perspective)")
+parser.add_argument("--grayscale", action="store_true", help="Render hands in grayscale (black & white)")
 args = parser.parse_args(argv)
 if args.no_skip_existing:
     args.skip_existing = False
@@ -499,9 +500,10 @@ def get_hand_mesh_data(hand_obj):
         eval_obj.to_mesh_clear()
 
 
-def render_hands_pytorch3d(camera_obj, hand_objects, render_shape=(480, 720)):
+def render_hands_pytorch3d(camera_obj, hand_objects, render_shape=(480, 720), grayscale=False):
     """
     Render CC_Hand_L/CC_Hand_R with Soft Phong shading via PyTorch3D.
+    If grayscale=True, render in black & white with enhanced contrast.
     """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -546,14 +548,25 @@ def render_hands_pytorch3d(camera_obj, hand_objects, render_shape=(480, 720)):
     )
     rasterizer = MeshRasterizer(cameras=cameras, raster_settings=raster_settings).to(device)
 
-    # Gentle lighting so it never goes black
-    lights = PointLights(
-        device=device,
-        location=[[0.0, 0.0, 0.0]],           # camera center
-        ambient_color=((0.7, 0.7, 0.7),),
-        diffuse_color=((0.6, 0.6, 0.6),),
-        specular_color=((0.0, 0.0, 0.0),),
-    )
+    # Lighting setup - enhanced for grayscale contrast if needed
+    if grayscale:
+        # Stronger directional lighting for better grayscale contrast
+        lights = DirectionalLights(
+            device=device,
+            direction=[[0.0, 0.0, -1.0]],        # pointing towards camera
+            ambient_color=((0.3, 0.3, 0.3),),     # reduced ambient
+            diffuse_color=((0.8, 0.8, 0.8),),     # stronger diffuse
+            specular_color=((0.2, 0.2, 0.2),),   # some specular for highlights
+        )
+    else:
+        # Gentle lighting so it never goes black (original)
+        lights = PointLights(
+            device=device,
+            location=[[0.0, 0.0, 0.0]],           # camera center
+            ambient_color=((0.7, 0.7, 0.7),),
+            diffuse_color=((0.6, 0.6, 0.6),),
+            specular_color=((0.0, 0.0, 0.0),),
+        )
     shader = SoftPhongShader(device=device, cameras=cameras, lights=lights)
     renderer = MeshRendererWithFragments(rasterizer=rasterizer, shader=shader)
 
@@ -575,11 +588,20 @@ def render_hands_pytorch3d(camera_obj, hand_objects, render_shape=(480, 720)):
         V = Vc.unsqueeze(0)                                        # (1,V,3)
         F = torch.from_numpy(F_np).to(device).unsqueeze(0).long()  # (1,F,3)
 
-        # Per-vertex color (vibrant green=L, deep red=R) - matching the reference image
-        if "CC_Hand_L" in obj.name:
-            col = (0.5, 0.8, 0.5)  # Vibrant green with slight blue tint
+        # Per-vertex color - different for grayscale vs color
+        if grayscale:
+            # For grayscale: use white/light gray for both hands
+            # Left hand slightly brighter to distinguish
+            if "CC_Hand_L" in obj.name:
+                col = (0.9, 0.9, 0.9)  # Slightly brighter for left hand
+            else:
+                col = (0.8, 0.8, 0.8)  # Slightly darker for right hand
         else:
-            col = (0.8, 0.4, 0.4)  # Deep, rich red
+            # Original color scheme for color mode
+            if "CC_Hand_L" in obj.name:
+                col = (0.5, 0.8, 0.5)  # Vibrant green with slight blue tint
+            else:
+                col = (0.8, 0.4, 0.4)  # Deep, rich red
         Cverts = torch.tensor(col, device=device).view(1, 1, 3).expand(1, V.shape[1], 3)
         mesh = Meshes(verts=V, faces=F, textures=TexturesVertex(Cverts))
 
@@ -595,7 +617,17 @@ def render_hands_pytorch3d(camera_obj, hand_objects, render_shape=(480, 720)):
         final_rgb = torch.where(closer3, rgb, final_rgb)
         final_z   = torch.where(closer,  zbuf, final_z)
 
-    out = (final_rgb.clamp(0, 1) * 255.0).byte().cpu().numpy()
+    # Convert to grayscale if needed
+    if grayscale:
+        # Convert RGB to grayscale using luminance weights
+        gray = 0.299 * final_rgb[:, :, 0] + 0.587 * final_rgb[:, :, 1] + 0.114 * final_rgb[:, :, 2]
+        # Enhance contrast for better grayscale appearance
+        gray = torch.clamp((gray - 0.3) * 1.5 + 0.3, 0, 1)
+        # Convert back to RGB format (grayscale)
+        out = (gray.unsqueeze(-1).expand(-1, -1, 3).clamp(0, 1) * 255.0).byte().cpu().numpy()
+    else:
+        out = (final_rgb.clamp(0, 1) * 255.0).byte().cpu().numpy()
+    
     return out, final_z.cpu().numpy()
 
 
@@ -663,10 +695,13 @@ def setup_lighting_for_hands():
 def render_animation_sequence(animation_index, animation_name):
     anim_output_folder = os.path.join(output_folder, f"{animation_name}")
     sequences_folder = os.path.join(anim_output_folder, "sequences")
-    videos_output_path = os.path.join(sequences_folder, "videos_hands")
+    # Use different path for grayscale vs color videos
+    video_folder_suffix = "hands_gray" if args.grayscale else "hands"
+    videos_output_path = os.path.join(sequences_folder, f"videos_{video_folder_suffix}")
     os.makedirs(videos_output_path, exist_ok=True)
 
     print(f"Rendering animation {animation_index}: {animation_name}")
+    print(f"  Mode: {'Grayscale' if args.grayscale else 'Color'}")
     print(f"  Videos: {videos_output_path}")
 
     # Get hand objects
@@ -746,7 +781,7 @@ def render_animation_sequence(animation_index, animation_name):
             print(f"[VIDEO {video_idx + 1}] Rendering frame {frame_num} ({frame_idx + 1}/{len(frames_to_render)})...")
             
             # Render hands using PyTorch3D
-            image, depth = render_hands_pytorch3d(camera_obj, hand_objects, render_shape=(480, 720))
+            image, depth = render_hands_pytorch3d(camera_obj, hand_objects, render_shape=(480, 720), grayscale=args.grayscale)
             
             # Save image to temp directory
             image_path = os.path.join(video_temp_dir, f"{frame_idx:04d}.png")
@@ -846,8 +881,9 @@ if not hand_objects:
 try:
     camera_obj = bpy.context.scene.camera
     if camera_obj and hand_objects:
-        image, depth = render_hands_pytorch3d(camera_obj, hand_objects, render_shape=(480, 720))
-        print("✓ PyTorch3D setup verified - ready for rendering")
+        image, depth = render_hands_pytorch3d(camera_obj, hand_objects, render_shape=(480, 720), grayscale=args.grayscale)
+        mode = "grayscale" if args.grayscale else "color"
+        print(f"✓ PyTorch3D setup verified - ready for {mode} rendering")
     else:
         print("⚠️  Cannot test render - missing camera or hand objects")
 except Exception as e:
@@ -931,7 +967,8 @@ print("Each animation has its own subfolder: {animation_name}/")
 print("Output structure:")
 print("  {animation_name}/")
 print("    └── sequences/")
-print("        └── videos_hands/         # Hand-only video sequences (MP4)")
+print("        └── videos_hands/         # Hand-only video sequences (MP4) - Color mode")
+print("        └── videos_grayscale/     # Hand-only video sequences (MP4) - Grayscale mode")
 if failed_animations:
     print(f"\nFAILED ANIMATIONS ({len(failed_animations)}):")
     for anim_idx, anim_name, error_type in failed_animations:

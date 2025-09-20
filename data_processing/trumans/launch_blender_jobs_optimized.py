@@ -203,7 +203,7 @@ except Exception as e:
         print(f"Exception getting animation names for {os.path.basename(blend_file)}: {e}")
         return []
 
-def check_already_rendered(blend_file, save_path, status_report=None, script_path=None):
+def check_already_rendered(blend_file, save_path, status_report=None, script_path=None, grayscale=False):
     """Check if a scene has already been rendered using status report if available.
     Returns: (is_complete, rendered_animations, missing_animations, all_animations)"""
     directory_name = os.path.basename(os.path.dirname(blend_file))
@@ -323,7 +323,11 @@ def check_already_rendered(blend_file, save_path, status_report=None, script_pat
                     if script_path and 'blender_ego_static.py' in script_path:
                         videos_path = os.path.join(sequences_path, "videos_static")
                     elif script_path and 'blender_ego_hand.py' in script_path:
-                        videos_path = os.path.join(sequences_path, "videos_hands")
+                        # Use different path for grayscale vs color videos
+                        if grayscale:
+                            videos_path = os.path.join(sequences_path, "videos_hands_gray")
+                        else:
+                            videos_path = os.path.join(sequences_path, "videos_hands")
                     else:
                         videos_path = sequences_path
                     
@@ -417,6 +421,10 @@ def main():
     parser.add_argument("--show-rendered", action="store_true", help="Show detailed information about already rendered scenes")
     parser.add_argument("--frame-skip", type=int, default=3, help="Render every Nth frame (default: 1, i.e., all frames)")
     parser.add_argument("--fov", type=float, default=90.0, help="Camera field of view in degrees (default: 90)")
+    parser.add_argument("--width", type=int, default=720, help="Render width in pixels (default: 720)")
+    parser.add_argument("--height", type=int, default=480, help="Render height in pixels (default: 480)")
+    parser.add_argument("--no-depth", action="store_true", help="Skip depth rendering (RGB only) - only applies to blender_ego_rgb_depth_optimized.py")
+    parser.add_argument("--grayscale", action="store_true", help="Render hands in grayscale (black & white) - only applies to blender_ego_hand.py")
     parser.add_argument("--parallel-animations", action="store_true", help="Launch separate jobs for each animation (faster for single scenes, more blend file overhead)")
     parser.add_argument("--scenes", type=str, nargs='+', help="Specific scene names (directory names) to render. If not specified, renders all scenes.")
     parser.add_argument("--scene-pattern", type=str, help="Pattern to match scene names (e.g., 'scene_*' or '*_walk')")
@@ -466,6 +474,11 @@ def main():
     print(f"Script path: {args.script_path}")
     print(f"Frame skip: {args.frame_skip} (rendering every {args.frame_skip}th frame)")
     print(f"Camera FOV: {args.fov} degrees")
+    print(f"Resolution: {args.width}x{args.height} pixels")
+    if args.grayscale and 'blender_ego_hand.py' in args.script_path:
+        print(f"Grayscale mode: Enabled (hands will be rendered in black & white)")
+    if args.no_depth and 'blender_ego_rgb_depth_optimized.py' in args.script_path:
+        print(f"No-depth mode: Enabled (RGB only, no depth rendering)")
     print(f"Found {len(blend_jobs)} .blend files.")
     
     # Apply scene filtering if specified
@@ -580,7 +593,7 @@ def main():
         # Use directory_name as scene key for consistency with status report and actual output folders
         scene_name = directory_name
         display_name = directory_name  # For user-friendly display (same as scene_name in this case)
-        is_rendered, rendered_anims, missing_anims, all_anims = check_already_rendered(blend_file, args.save_path, status_report, args.script_path)
+        is_rendered, rendered_anims, missing_anims, all_anims = check_already_rendered(blend_file, args.save_path, status_report, args.script_path, args.grayscale)
         
         if is_rendered:
             rendered_scenes[scene_name] = rendered_anims
@@ -704,7 +717,7 @@ def main():
                     processed_scenes.add(directory_name)
                     
                     # Check if this scene has animations
-                    _, _, _, all_anims = check_already_rendered(blend_file, args.save_path, status_report)
+                    _, _, _, all_anims = check_already_rendered(blend_file, args.save_path, status_report, args.script_path, args.grayscale)
                     if not all_anims:
                         no_animations += 1
                     else:
@@ -807,7 +820,7 @@ def main():
                 directory_name = os.path.basename(os.path.dirname(blend_file))
                 if directory_name not in rendered_scenes:
                     # Force real-time Blender query instead of using status report for accuracy
-                    _, _, missing_anims, all_anims = check_already_rendered(blend_file, args.save_path, None)  # Pass None to force Blender query
+                    _, _, missing_anims, all_anims = check_already_rendered(blend_file, args.save_path, None, args.script_path, args.grayscale)  # Pass None to force Blender query
                     if all_anims:  # Scene has animations
                         actual_missing_total += len(missing_anims)
                         total_expected += len(all_anims)  # Add all animations (rendered + missing)
@@ -847,7 +860,7 @@ def main():
                 directory_name = os.path.basename(os.path.dirname(blend_file))
                 if directory_name not in rendered_scenes:
                     # Force real-time Blender query for accuracy
-                    _, _, _, all_anims = check_already_rendered(blend_file, args.save_path, None)  # Pass None to force Blender query
+                    _, _, _, all_anims = check_already_rendered(blend_file, args.save_path, None, args.script_path, args.grayscale)  # Pass None to force Blender query
                     if not all_anims:
                         scenes_with_no_anims.append(directory_name)
             
@@ -907,7 +920,7 @@ def main():
                 directory_name = os.path.basename(os.path.dirname(blend_file))
                 if directory_name not in rendered_scenes:
                     # Force real-time Blender query for accuracy
-                    _, _, missing_anims, all_anims = check_already_rendered(blend_file, args.save_path, None)  # Pass None to force Blender query
+                    _, _, missing_anims, all_anims = check_already_rendered(blend_file, args.save_path, None, args.script_path, args.grayscale)  # Pass None to force Blender query
                     if all_anims and missing_anims:  # Scene has animations but some are missing
                         scenes_with_missing_anims += 1
                         missing_animations_total += len(missing_anims)
@@ -1037,8 +1050,18 @@ def main():
             "--",
             "--save-path", args.save_path,
             "--frame-skip", str(args.frame_skip),
-            "--fov", str(args.fov)
+            "--fov", str(args.fov),
+            "--width", str(args.width),
+            "--height", str(args.height)
         ]
+        
+        # Add grayscale option if specified and using blender_ego_hand.py
+        if args.grayscale and 'blender_ego_hand.py' in args.script_path:
+            cmd.append("--grayscale")
+        
+        # Add no-depth option if specified and using blender_ego_rgb_depth_optimized.py
+        if args.no_depth and 'blender_ego_rgb_depth_optimized.py' in args.script_path:
+            cmd.append("--no-depth")
         
         # Add animation index for animation-based jobs
         if job.get('job_type') == 'animation':
