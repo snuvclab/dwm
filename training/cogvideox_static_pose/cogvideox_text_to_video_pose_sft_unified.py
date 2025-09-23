@@ -62,7 +62,7 @@ from training.cogvideox_static_pose.cogvideox_pose_concat_pipeline import CogVid
 from training.cogvideox_static_pose.cogvideox_pose_adapter_pipeline import CogVideoXPoseAdapterPipeline
 from training.cogvideox_static_pose.cogvideox_pose_adaln_pipeline import CogVideoXPoseAdaLNPipeline,CogVideoXPoseAdaLNPerFramePipeline
 from training.cogvideox_static_pose.cogvideox_static_to_video_pose_concat_pipeline import CogVideoXStaticToVideoPipeline, CogVideoXStaticToVideoPoseConcatPipeline, CogVideoXStaticToVideoCrossPoseAdapterPipeline
-from training.cogvideox_static_pose.cogvideox_fun_static_to_video_pose_concat_pipeline import CogVideoXFunStaticToVideoPipeline, CogVideoXFunStaticToVideoCrossPipeline
+from training.cogvideox_static_pose.cogvideox_fun_static_to_video_pose_concat_pipeline import CogVideoXFunStaticToVideoPipeline, CogVideoXFunStaticToVideoCrossPipeline, CogVideoXFunStaticToVideoPoseTokenPipeline
 from training.cogvideox_static_pose.config_loader import load_experiment_config
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from diffusers.optimization import get_scheduler
@@ -562,10 +562,9 @@ def run_validation(
     elif pipeline_config["type"] == "cogvideox_fun_static_to_video_pose_cond_token":
         # Get condition_channels and use_cond_token from pipeline config
         condition_channels = pipeline_config.get("condition_channels", 16)
-        use_cond_token = pipeline_config.get("use_cond_token", True)
         use_zero_proj = pipeline_config.get("use_zero_proj", False)
         
-        pipe = CogVideoXFunStaticToVideoPipeline.from_pretrained(
+        pipe = CogVideoXFunStaticToVideoPoseTokenPipeline.from_pretrained(
             base_model_name_or_path=model_config_dict["base_model_name_or_path"],
             transformer=unwrap_model(accelerator, transformer),
             scheduler=scheduler,
@@ -573,7 +572,6 @@ def run_validation(
             variant=model_config_dict.get("variant"),
             torch_dtype=weight_dtype,
             condition_channels=condition_channels,
-            use_cond_token=use_cond_token,
             use_zero_proj=use_zero_proj,
         )
     else:
@@ -1128,17 +1126,15 @@ def setup_pipeline_from_config(config: Dict[str, Any]):
         
         # Get condition_channels and use_cond_token from pipeline config
         condition_channels = pipeline_config.get("condition_channels", 16)
-        use_cond_token = pipeline_config.get("use_cond_token", True)
         use_zero_proj = pipeline_config.get("use_zero_proj", True)
         
-        pipeline = CogVideoXFunStaticToVideoPipeline.from_pretrained(
+        pipeline = CogVideoXFunStaticToVideoPoseTokenPipeline.from_pretrained(
             pretrained_model_name_or_path=None,  # Always start from base model
             base_model_name_or_path=model_path,
             torch_dtype=load_dtype,
             revision=model_config.get("revision"),
             variant=model_config.get("variant"),
             condition_channels=condition_channels,
-            use_cond_token=use_cond_token,
             use_zero_proj=use_zero_proj,
         )
         
@@ -1222,11 +1218,14 @@ def setup_lora_training(transformer, config: Dict[str, Any]):
         print("⚠️  Gradient checkpointing disabled - this may cause high VRAM usage!")
     
     # Add LoRA to attention layers
+    # Get target modules from config, with default fallback
+    target_modules = config["training"].get("lora_target_modules", ["to_k", "to_q", "to_v", "to_out.0"])
+    
     transformer_lora_config = LoraConfig(
         r=lora_rank,
         lora_alpha=lora_alpha,
         init_lora_weights=True,
-        target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+        target_modules=target_modules,
     )
     transformer.add_adapter(transformer_lora_config)
     
@@ -1445,7 +1444,7 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
                                 transformer_lora_layers=transformer_lora_layers,
                             )
                         elif pipeline_type == "cogvideox_fun_static_to_video_pose_cond_token":
-                            CogVideoXFunStaticToVideoPipeline.save_lora_weights(
+                            CogVideoXFunStaticToVideoPoseTokenPipeline.save_lora_weights(
                                 output_dir,
                                 transformer_lora_layers=transformer_lora_layers,
                             )
@@ -1706,7 +1705,7 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
             elif pipeline_type == "cogvideox_fun_static_to_video_pose_adapter":
                 lora_state_dict = CogVideoXFunStaticToVideoPipeline.lora_state_dict(input_dir)
             elif pipeline_type == "cogvideox_fun_static_to_video_pose_cond_token":
-                lora_state_dict = CogVideoXFunStaticToVideoPipeline.lora_state_dict(input_dir)
+                lora_state_dict = CogVideoXFunStaticToVideoPoseTokenPipeline.lora_state_dict(input_dir)
             elif pipeline_type == "cogvideox_static_to_video_pose_concat":
                 lora_state_dict = CogVideoXStaticToVideoPoseConcatPipeline.lora_state_dict(input_dir)
             elif pipeline_type == "cogvideox_static_to_video_cross_pose_adapter":
@@ -2834,11 +2833,11 @@ def main():
                     # For VideoX-Fun static-to-video pipeline, use static video as condition
                     # Training loop: static_videos are already in latent space
                     static_videos_latents = static_videos.to(device=accelerator.device, dtype=weight_dtype)
-                    static_videos_latents = static_videos_latents * VAE_SCALING_FACTOR
+                    static_videos_latents = static_videos_latents
                     hand_video_latents = None
 
                     # VideoX-Fun always uses mask (zeros for static video conditioning)
-                    mask_input = torch.ones_like(noisy_model_input[:, :, :1]) * VAE_SCALING_FACTOR
+                    mask_input = torch.ones_like(noisy_model_input[:, :, :1])
                     transformer_input = torch.cat([noisy_model_input, mask_input, static_videos_latents], dim=2)
                     condition_latents = None
                     
@@ -2846,9 +2845,9 @@ def main():
                     # For VideoX-Fun static-to-video pose concat pipeline, use both static and hand videos as conditions
                     # Training loop: static_videos and hand_videos are already in latent space
                     static_videos_latents = static_videos.to(device=accelerator.device, dtype=weight_dtype)
-                    static_videos_latents = static_videos_latents * VAE_SCALING_FACTOR
+                    static_videos_latents = static_videos_latents
                     hand_video_latents = hand_videos.to(device=accelerator.device, dtype=weight_dtype)
-                    hand_video_latents = hand_video_latents * VAE_SCALING_FACTOR
+                    hand_video_latents = hand_video_latents
 
                     # VideoX-Fun always uses mask (zeros for static video conditioning)
                     mask_input = torch.ones_like(noisy_model_input[:, :, :1]) * VAE_SCALING_FACTOR
@@ -2859,9 +2858,9 @@ def main():
                     # For VideoX-Fun CrossPipeline, use static_videos as ref_latents and hand_videos as control_latents
                     # Training loop: static_videos and hand_videos are already in latent space
                     static_videos_latents = static_videos.to(device=accelerator.device, dtype=weight_dtype)
-                    static_videos_latents = static_videos_latents * VAE_SCALING_FACTOR
+                    static_videos_latents = static_videos_latents
                     hand_video_latents = hand_videos.to(device=accelerator.device, dtype=weight_dtype)
-                    hand_video_latents = hand_video_latents * VAE_SCALING_FACTOR
+                    hand_video_latents = hand_video_latents
 
                     # VideoX-Fun always uses mask (zeros for static video conditioning)
                     mask_input = torch.ones_like(noisy_model_input[:, :, :1]) * VAE_SCALING_FACTOR
@@ -2876,9 +2875,9 @@ def main():
                     # For VideoX-Fun CrossPipeline with pose adapter, use static_videos as ref_latents and hand_videos as control_latents
                     # Training loop: static_videos and hand_videos are already in latent space
                     static_videos_latents = static_videos.to(device=accelerator.device, dtype=weight_dtype)
-                    static_videos_latents = static_videos_latents * VAE_SCALING_FACTOR
+                    static_videos_latents = static_videos_latents
                     hand_video_latents = hand_videos.to(device=accelerator.device, dtype=weight_dtype)
-                    hand_video_latents = hand_video_latents * VAE_SCALING_FACTOR
+                    hand_video_latents = hand_video_latents
 
                     # VideoX-Fun always uses mask (zeros for static video conditioning)
                     mask_input = torch.ones_like(noisy_model_input[:, :, :1]) * VAE_SCALING_FACTOR
@@ -2893,9 +2892,9 @@ def main():
                     # For VideoX-Fun Pipeline with pose adapter, use static_videos and hand_videos as conditions
                     # Training loop: static_videos and hand_videos are already in latent space
                     static_videos_latents = static_videos.to(device=accelerator.device, dtype=weight_dtype)
-                    static_videos_latents = static_videos_latents * VAE_SCALING_FACTOR
+                    static_videos_latents = static_videos_latents
                     hand_video_latents = hand_videos.to(device=accelerator.device, dtype=weight_dtype)
-                    hand_video_latents = hand_video_latents * VAE_SCALING_FACTOR
+                    hand_video_latents = hand_video_latents
 
                     # VideoX-Fun always uses mask (zeros for static video conditioning)
                     mask_input = torch.ones_like(noisy_model_input[:, :, :1]) * VAE_SCALING_FACTOR
@@ -2906,9 +2905,9 @@ def main():
                     # For VideoX-Fun Pipeline with cond token, use static_videos and hand_videos as conditions
                     # Training loop: static_videos and hand_videos are already in latent space
                     static_videos_latents = static_videos.to(device=accelerator.device, dtype=weight_dtype)
-                    static_videos_latents = static_videos_latents * VAE_SCALING_FACTOR
+                    static_videos_latents = static_videos_latents
                     hand_video_latents = hand_videos.to(device=accelerator.device, dtype=weight_dtype)
-                    hand_video_latents = hand_video_latents * VAE_SCALING_FACTOR
+                    hand_video_latents = hand_video_latents
 
                     # VideoX-Fun always uses mask (zeros for static video conditioning)
                     mask_input = torch.ones_like(noisy_model_input[:, :, :1]) * VAE_SCALING_FACTOR
@@ -3306,7 +3305,7 @@ def main():
             use_cond_token = pipeline_config.get("use_cond_token", True)
             use_zero_proj = pipeline_config.get("use_zero_proj", False)
             
-            pipeline = CogVideoXFunStaticToVideoPipeline(
+            pipeline = CogVideoXFunStaticToVideoHandTokenPipeline(
                 tokenizer=tokenizer,
                 text_encoder=text_encoder,
                 vae=vae,
