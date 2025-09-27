@@ -24,7 +24,7 @@ from diffusers import (
     CogVideoXDPMScheduler,
     CogVideoXTransformer3DModel,
 )
-from training.cogvideox_static_pose.cogvideox_fun_transformer_with_conditions import (
+from cogvideox_fun_transformer_with_conditions import (
     CrossTransformer3DModel,
     CrossTransformer3DModelWithAdapter,
 )
@@ -144,59 +144,71 @@ def load_checkpoint_with_config(pipeline, checkpoint_path: str, config: Dict[str
         transformer_state_dict = convert_unet_state_dict_to_peft(lora_state_dict)
         set_peft_model_state_dict(pipeline.transformer, transformer_state_dict, adapter_name="default")
         
-        # Load projection layer weights if they exist
-        if "concat" in pipeline_type:
-            # Concat models: load proj weights (modify existing proj)
-            projection_file = os.path.join(checkpoint_path, "projection_layer_weights.pt")
-            if os.path.exists(projection_file):
-                projection_state_dict = torch.load(projection_file, map_location="cpu")
-                if hasattr(pipeline.transformer, 'patch_embed') and hasattr(pipeline.transformer.patch_embed, 'proj'):
-                    loaded_keys = []
-                    if "transformer.patch_embed.proj.weight" in projection_state_dict:
-                        pipeline.transformer.patch_embed.proj.weight.data.copy_(projection_state_dict["transformer.patch_embed.proj.weight"])
-                        loaded_keys.append("proj.weight")
-                    if "transformer.patch_embed.proj.bias" in projection_state_dict and projection_state_dict["transformer.patch_embed.proj.bias"] is not None:
-                        pipeline.transformer.patch_embed.proj.bias.data.copy_(projection_state_dict["transformer.patch_embed.proj.bias"])
-                        loaded_keys.append("proj.bias")
-                    logger.info(f"✅ Loaded concat projection weights: {loaded_keys}")
+        # Load non-LoRA weights (trainable parameters) if they exist
+        non_lora_file = os.path.join(checkpoint_path, "non_lora_weights.pt")
+        if os.path.exists(non_lora_file):
+            non_lora_state_dict = torch.load(non_lora_file, map_location="cpu")
+            model_state_dict = pipeline.transformer.state_dict()
+            loaded_keys = []
+            for name, param_data in non_lora_state_dict.items():
+                if name in model_state_dict:
+                    model_state_dict[name].copy_(param_data)
+                    loaded_keys.append(name)
+            logger.info(f"✅ Loaded non-LoRA weights: {loaded_keys}")
+        else:
+            # Legacy support: Load projection layer weights if they exist
+            if "concat" in pipeline_type:
+                # Concat models: load proj weights (modify existing proj)
+                projection_file = os.path.join(checkpoint_path, "projection_layer_weights.pt")
+                if os.path.exists(projection_file):
+                    projection_state_dict = torch.load(projection_file, map_location="cpu")
+                    if hasattr(pipeline.transformer, 'patch_embed') and hasattr(pipeline.transformer.patch_embed, 'proj'):
+                        loaded_keys = []
+                        if "transformer.patch_embed.proj.weight" in projection_state_dict:
+                            pipeline.transformer.patch_embed.proj.weight.data.copy_(projection_state_dict["transformer.patch_embed.proj.weight"])
+                            loaded_keys.append("proj.weight")
+                        if "transformer.patch_embed.proj.bias" in projection_state_dict and projection_state_dict["transformer.patch_embed.proj.bias"] is not None:
+                            pipeline.transformer.patch_embed.proj.bias.data.copy_(projection_state_dict["transformer.patch_embed.proj.bias"])
+                            loaded_keys.append("proj.bias")
+                        logger.info(f"✅ Loaded concat projection weights: {loaded_keys}")
+                    else:
+                        logger.info("⚠️ No patch_embed.proj found for concat model")
                 else:
-                    logger.info("⚠️ No patch_embed.proj found for concat model")
-            else:
-                logger.info("⚠️ No projection_layer_weights.pt found for concat model")
-        elif "adapter" in pipeline_type:
-            # Adapter models: load cond_proj weights (including cond_norm and cond_gate for v2)
-            cond_proj_file = os.path.join(checkpoint_path, "cond_proj_weights.pt")
-            if os.path.exists(cond_proj_file):
-                cond_proj_state_dict = torch.load(cond_proj_file, map_location="cpu")
-                if hasattr(pipeline.transformer.patch_embed, 'cond_proj'):
-                    loaded_keys = []
-                    if "transformer.patch_embed.cond_proj.weight" in cond_proj_state_dict:
-                        pipeline.transformer.patch_embed.cond_proj.weight.data.copy_(cond_proj_state_dict["transformer.patch_embed.cond_proj.weight"])
-                        loaded_keys.append("cond_proj.weight")
-                    if "transformer.patch_embed.cond_proj.bias" in cond_proj_state_dict and cond_proj_state_dict["transformer.patch_embed.cond_proj.bias"] is not None:
-                        pipeline.transformer.patch_embed.cond_proj.bias.data.copy_(cond_proj_state_dict["transformer.patch_embed.cond_proj.bias"])
-                        loaded_keys.append("cond_proj.bias")
-                    
-                    # Load cond_norm weights for CogVideoXPatchEmbedWithAdapterV2
-                    if hasattr(pipeline.transformer.patch_embed, 'cond_norm'):
-                        if "transformer.patch_embed.cond_norm.weight" in cond_proj_state_dict:
-                            pipeline.transformer.patch_embed.cond_norm.weight.data.copy_(cond_proj_state_dict["transformer.patch_embed.cond_norm.weight"])
-                            loaded_keys.append("cond_norm.weight")
-                        if "transformer.patch_embed.cond_norm.bias" in cond_proj_state_dict:
-                            pipeline.transformer.patch_embed.cond_norm.bias.data.copy_(cond_proj_state_dict["transformer.patch_embed.cond_norm.bias"])
-                            loaded_keys.append("cond_norm.bias")
-                    
-                    # Load cond_gate for CogVideoXPatchEmbedWithAdapterV2
-                    if hasattr(pipeline.transformer.patch_embed, 'cond_gate'):
-                        if "transformer.patch_embed.cond_gate" in cond_proj_state_dict:
-                            pipeline.transformer.patch_embed.cond_gate.data.copy_(cond_proj_state_dict["transformer.patch_embed.cond_gate"])
-                            loaded_keys.append("cond_gate")
-                    
-                    logger.info(f"✅ Loaded adapter projection weights: {loaded_keys}")
+                    logger.info("⚠️ No projection_layer_weights.pt found for concat model")
+            elif "adapter" in pipeline_type:
+                # Adapter models: load cond_proj weights (including cond_norm and cond_gate for v2)
+                cond_proj_file = os.path.join(checkpoint_path, "cond_proj_weights.pt")
+                if os.path.exists(cond_proj_file):
+                    cond_proj_state_dict = torch.load(cond_proj_file, map_location="cpu")
+                    if hasattr(pipeline.transformer.patch_embed, 'cond_proj'):
+                        loaded_keys = []
+                        if "transformer.patch_embed.cond_proj.weight" in cond_proj_state_dict:
+                            pipeline.transformer.patch_embed.cond_proj.weight.data.copy_(cond_proj_state_dict["transformer.patch_embed.cond_proj.weight"])
+                            loaded_keys.append("cond_proj.weight")
+                        if "transformer.patch_embed.cond_proj.bias" in cond_proj_state_dict and cond_proj_state_dict["transformer.patch_embed.cond_proj.bias"] is not None:
+                            pipeline.transformer.patch_embed.cond_proj.bias.data.copy_(cond_proj_state_dict["transformer.patch_embed.cond_proj.bias"])
+                            loaded_keys.append("cond_proj.bias")
+                        
+                        # Load cond_norm weights for CogVideoXPatchEmbedWithAdapterV2
+                        if hasattr(pipeline.transformer.patch_embed, 'cond_norm'):
+                            if "transformer.patch_embed.cond_norm.weight" in cond_proj_state_dict:
+                                pipeline.transformer.patch_embed.cond_norm.weight.data.copy_(cond_proj_state_dict["transformer.patch_embed.cond_norm.weight"])
+                                loaded_keys.append("cond_norm.weight")
+                            if "transformer.patch_embed.cond_norm.bias" in cond_proj_state_dict:
+                                pipeline.transformer.patch_embed.cond_norm.bias.data.copy_(cond_proj_state_dict["transformer.patch_embed.cond_norm.bias"])
+                                loaded_keys.append("cond_norm.bias")
+                        
+                        # Load cond_gate for CogVideoXPatchEmbedWithAdapterV2
+                        if hasattr(pipeline.transformer.patch_embed, 'cond_gate'):
+                            if "transformer.patch_embed.cond_gate" in cond_proj_state_dict:
+                                pipeline.transformer.patch_embed.cond_gate.data.copy_(cond_proj_state_dict["transformer.patch_embed.cond_gate"])
+                                loaded_keys.append("cond_gate")
+                        
+                        logger.info(f"✅ Loaded adapter projection weights: {loaded_keys}")
+                    else:
+                        logger.info("⚠️ No patch_embed.cond_proj found for adapter model")
                 else:
-                    logger.info("⚠️ No patch_embed.cond_proj found for adapter model")
-            else:
-                logger.info("⚠️ No cond_proj_weights.pt found for adapter model")
+                    logger.info("⚠️ No cond_proj_weights.pt found for adapter model")
         
         logger.info("✅ LoRA weights loaded successfully")
     else:
@@ -498,12 +510,14 @@ def build_pipeline(args: argparse.Namespace, config: Dict[str, Any]):
     elif pipeline_type == "cogvideox_fun_static_to_video_pose_adapter":
         condition_channels = pipeline_config.get("condition_channels", 16)
         use_adapter = pipeline_config.get("use_adapter", True)
+        adapter_version = pipeline_config.get("adapter_version", "v1")
         pipeline = CogVideoXFunStaticToVideoPipeline.from_pretrained(
             pretrained_model_name_or_path=pretrained_model_path,
             base_model_name_or_path=base_model_path,
             torch_dtype=weight_dtype,
             condition_channels=condition_channels,
             use_adapter=use_adapter,
+            adapter_version=adapter_version,
         )
     else:
         raise ValueError(f"Unknown pipeline type: {pipeline_type}")

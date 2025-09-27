@@ -1178,7 +1178,6 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
         image: Optional[torch.Tensor] = None,  # For I2V fallback
         static_videos: Optional[torch.Tensor] = None,
         hand_videos: Optional[torch.Tensor] = None,
-        return_video_latents: bool = False,
         timestep: Optional[torch.Tensor] = None,
         is_strength_max: bool = True,
         return_noise: bool = False,
@@ -1265,10 +1264,8 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
         if return_noise:
             outputs += (noise,)
             
-        if return_video_latents:
-            outputs += (static_videos_latents,)
-        else:
-            outputs += (static_videos_latents, hand_videos_latents)
+        # Always return both static and hand video latents (can be None)
+        outputs += (static_videos_latents, hand_videos_latents)
             
         return outputs
 
@@ -1634,9 +1631,14 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
             init_video = init_video[:, :, :video_length]
             mask_video = mask_video[:, :, :video_length]
 
+        # Get channel information for later use
         num_channels_latents = self.vae.config.latent_channels
         num_channels_transformer = self.transformer.config.in_channels
-        return_image_latents = num_channels_transformer == num_channels_latents
+
+        # Preprocess hand_videos if provided
+        processed_hand_videos = None
+        if hand_videos is not None:
+            processed_hand_videos = self.preprocess_hand_conditions(hand_videos, height, width, num_frames)
 
         latents_outputs = self.prepare_latents(
             batch_size=batch_size * num_videos_per_prompt,
@@ -1649,36 +1651,20 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
             generator=generator,
             latents=latents,
             static_videos=init_video,
+            hand_videos=processed_hand_videos,
             timestep=latent_timestep,
             is_strength_max=is_strength_max,
             return_noise=True,
-            return_video_latents=return_image_latents,
         )
-        if return_image_latents:
-            latents, noise, static_videos_latents = latents_outputs
-        else:
-            latents, noise, static_videos_latents, _ = latents_outputs
+        # Always get both static and hand video latents
+        latents, noise, static_videos_latents, hand_videos_latents = latents_outputs
         if comfyui_progressbar and pbar is not None:
             pbar.update(1)
         
-        # Process hand_videos for control_latents if provided
+        # Use hand_videos_latents from prepare_latents if available
         control_latents = None
-        if hand_videos is not None:
-            hand_videos = self.preprocess_hand_conditions(hand_videos, height, width, num_frames)
-            # Convert hand_videos to control_latents
-            hand_videos = hand_videos.to(device=device, dtype=self.vae.dtype)
-            bs = 1
-            new_hand_videos = []
-            for i in range(0, hand_videos.shape[0], bs):
-                hand_videos_bs = hand_videos[i : i + bs]
-                hand_videos_bs = self.vae.encode(hand_videos_bs)[0]
-                hand_videos_bs = hand_videos_bs.sample()
-                new_hand_videos.append(hand_videos_bs)
-            control_latents = torch.cat(new_hand_videos, dim=0)
-            control_latents = control_latents * self.vae.config.scaling_factor
-            control_latents = control_latents.repeat(batch_size // control_latents.shape[0], 1, 1, 1, 1)
-            control_latents = control_latents.to(device=device, dtype=latents.dtype)
-            control_latents = rearrange(control_latents, "b c f h w -> b f c h w")
+        if hand_videos_latents is not None:
+            control_latents = hand_videos_latents
             control_latents = (
                 torch.cat([control_latents] * 2) if do_classifier_free_guidance else control_latents
             )
@@ -1961,7 +1947,6 @@ class CogVideoXFunStaticToVideoPoseTokenPipeline(CogVideoXFunInpaintPipeline):
                         base_model_name_or_path="alibaba-pai/CogVideoX-Fun-V1.1-5b-InP", 
                         transformer=None, 
                         condition_channels: Optional[int] = 16,
-                        use_zero_proj: bool = True,
                         *args, **kwargs):
         """
         Load a CogVideoXFunStaticToVideoPipeline from a saved directory or base model.
@@ -1990,7 +1975,6 @@ class CogVideoXFunStaticToVideoPoseTokenPipeline(CogVideoXFunInpaintPipeline):
                 base_model_name_or_path=base_model_name_or_path,
                 subfolder="transformer",
                 condition_channels=condition_channels,
-                use_zero_proj=use_zero_proj,
                 torch_dtype=kwargs.get("torch_dtype", torch.bfloat16),
                 revision=kwargs.get("revision", None),
                 variant=kwargs.get("variant", None),
@@ -2005,7 +1989,6 @@ class CogVideoXFunStaticToVideoPoseTokenPipeline(CogVideoXFunInpaintPipeline):
                 pretrained_model_name_or_path,
                 subfolder="transformer",
                 condition_channels=condition_channels,
-                use_zero_proj=use_zero_proj,
                 torch_dtype=load_dtype,
                 revision=kwargs.get("revision", None),
                 variant=kwargs.get("variant", None),
@@ -2071,7 +2054,6 @@ class CogVideoXFunStaticToVideoPoseTokenPipeline(CogVideoXFunInpaintPipeline):
         image: Optional[torch.Tensor] = None,  # For I2V fallback
         static_videos: Optional[torch.Tensor] = None,
         hand_videos: Optional[torch.Tensor] = None,
-        return_video_latents: bool = False,
         timestep: Optional[torch.Tensor] = None,
         is_strength_max: bool = True,
         return_noise: bool = False,
@@ -2158,10 +2140,8 @@ class CogVideoXFunStaticToVideoPoseTokenPipeline(CogVideoXFunInpaintPipeline):
         if return_noise:
             outputs += (noise,)
             
-        if return_video_latents:
-            outputs += (static_videos_latents,)
-        else:
-            outputs += (static_videos_latents, hand_videos_latents)
+        # Always return both static and hand video latents (can be None)
+        outputs += (static_videos_latents, hand_videos_latents)
             
         return outputs
 
@@ -2527,9 +2507,14 @@ class CogVideoXFunStaticToVideoPoseTokenPipeline(CogVideoXFunInpaintPipeline):
             init_video = init_video[:, :, :video_length]
             mask_video = mask_video[:, :, :video_length]
 
+        # Get channel information for later use
         num_channels_latents = self.vae.config.latent_channels
         num_channels_transformer = self.transformer.config.in_channels
-        return_image_latents = num_channels_transformer == num_channels_latents
+
+        # Preprocess hand_videos if provided
+        processed_hand_videos = None
+        if hand_videos is not None:
+            processed_hand_videos = self.preprocess_hand_conditions(hand_videos, height, width, num_frames)
 
         latents_outputs = self.prepare_latents(
             batch_size=batch_size * num_videos_per_prompt,
@@ -2542,36 +2527,20 @@ class CogVideoXFunStaticToVideoPoseTokenPipeline(CogVideoXFunInpaintPipeline):
             generator=generator,
             latents=latents,
             static_videos=init_video,
+            hand_videos=processed_hand_videos,
             timestep=latent_timestep,
             is_strength_max=is_strength_max,
             return_noise=True,
-            return_video_latents=return_image_latents,
         )
-        if return_image_latents:
-            latents, noise, static_videos_latents = latents_outputs
-        else:
-            latents, noise, static_videos_latents, _ = latents_outputs
+        # Always get both static and hand video latents
+        latents, noise, static_videos_latents, hand_videos_latents = latents_outputs
         if comfyui_progressbar and pbar is not None:
             pbar.update(1)
         
-        # Process hand_videos for control_latents if provided
+        # Use hand_videos_latents from prepare_latents if available
         control_latents = None
-        if hand_videos is not None:
-            hand_videos = self.preprocess_hand_conditions(hand_videos, height, width, num_frames)
-            # Convert hand_videos to control_latents
-            hand_videos = hand_videos.to(device=device, dtype=self.vae.dtype)
-            bs = 1
-            new_hand_videos = []
-            for i in range(0, hand_videos.shape[0], bs):
-                hand_videos_bs = hand_videos[i : i + bs]
-                hand_videos_bs = self.vae.encode(hand_videos_bs)[0]
-                hand_videos_bs = hand_videos_bs.sample()
-                new_hand_videos.append(hand_videos_bs)
-            control_latents = torch.cat(new_hand_videos, dim=0)
-            control_latents = control_latents * self.vae.config.scaling_factor
-            control_latents = control_latents.repeat(batch_size // control_latents.shape[0], 1, 1, 1, 1)
-            control_latents = control_latents.to(device=device, dtype=latents.dtype)
-            control_latents = rearrange(control_latents, "b c f h w -> b f c h w")
+        if hand_videos_latents is not None:
+            control_latents = hand_videos_latents
             control_latents = (
                 torch.cat([control_latents] * 2) if do_classifier_free_guidance else control_latents
             )
@@ -2854,7 +2823,6 @@ class CogVideoXI2VStaticTokenPoseAdapterPipeline(CogVideoXImageToVideoPipeline):
                         base_model_name_or_path="THUDM/CogVideoX-5b-I2V", 
                         transformer=None, 
                         condition_channels=None, 
-                        use_zero_proj: bool = False,
                         *args, **kwargs):
         """
         Load a CogVideoXFunStaticToVideoPipeline from a saved directory or base model.
@@ -2889,7 +2857,6 @@ class CogVideoXI2VStaticTokenPoseAdapterPipeline(CogVideoXImageToVideoPipeline):
                     base_model_name_or_path=base_model_name_or_path,
                     subfolder="transformer",
                     condition_channels=condition_channels,
-                    use_zero_proj=use_zero_proj,
                     torch_dtype=kwargs.get("torch_dtype", torch.bfloat16),
                     revision=kwargs.get("revision", None),
                     variant=kwargs.get("variant", None),
@@ -2978,7 +2945,6 @@ class CogVideoXI2VStaticTokenPoseAdapterPipeline(CogVideoXImageToVideoPipeline):
         image: Optional[torch.Tensor] = None,  # For I2V fallback
         static_videos: Optional[torch.Tensor] = None,
         hand_videos: Optional[torch.Tensor] = None,
-        return_video_latents: bool = False,
         timestep: Optional[torch.Tensor] = None,
         is_strength_max: bool = True,
         return_noise: bool = False,
@@ -3065,10 +3031,8 @@ class CogVideoXI2VStaticTokenPoseAdapterPipeline(CogVideoXImageToVideoPipeline):
         if return_noise:
             outputs += (noise,)
             
-        if return_video_latents:
-            outputs += (static_videos_latents,)
-        else:
-            outputs += (static_videos_latents, hand_videos_latents)
+        # Always return both static and hand video latents (can be None)
+        outputs += (static_videos_latents, hand_videos_latents)
             
         return outputs
 
@@ -3434,9 +3398,14 @@ class CogVideoXI2VStaticTokenPoseAdapterPipeline(CogVideoXImageToVideoPipeline):
             init_video = init_video[:, :, :video_length]
             mask_video = mask_video[:, :, :video_length]
 
+        # Get channel information for later use
         num_channels_latents = self.vae.config.latent_channels
         num_channels_transformer = self.transformer.config.in_channels
-        return_image_latents = num_channels_transformer == num_channels_latents
+
+        # Preprocess hand_videos if provided
+        processed_hand_videos = None
+        if hand_videos is not None:
+            processed_hand_videos = self.preprocess_hand_conditions(hand_videos, height, width, num_frames)
 
         latents_outputs = self.prepare_latents(
             batch_size=batch_size * num_videos_per_prompt,
@@ -3449,36 +3418,20 @@ class CogVideoXI2VStaticTokenPoseAdapterPipeline(CogVideoXImageToVideoPipeline):
             generator=generator,
             latents=latents,
             static_videos=init_video,
+            hand_videos=processed_hand_videos,
             timestep=latent_timestep,
             is_strength_max=is_strength_max,
             return_noise=True,
-            return_video_latents=return_image_latents,
         )
-        if return_image_latents:
-            latents, noise, static_videos_latents = latents_outputs
-        else:
-            latents, noise, static_videos_latents, _ = latents_outputs
+        # Always get both static and hand video latents
+        latents, noise, static_videos_latents, hand_videos_latents = latents_outputs
         if comfyui_progressbar and pbar is not None:
             pbar.update(1)
         
-        # Process hand_videos for control_latents if provided
+        # Use hand_videos_latents from prepare_latents if available
         control_latents = None
-        if hand_videos is not None:
-            hand_videos = self.preprocess_hand_conditions(hand_videos, height, width, num_frames)
-            # Convert hand_videos to control_latents
-            hand_videos = hand_videos.to(device=device, dtype=self.vae.dtype)
-            bs = 1
-            new_hand_videos = []
-            for i in range(0, hand_videos.shape[0], bs):
-                hand_videos_bs = hand_videos[i : i + bs]
-                hand_videos_bs = self.vae.encode(hand_videos_bs)[0]
-                hand_videos_bs = hand_videos_bs.sample()
-                new_hand_videos.append(hand_videos_bs)
-            control_latents = torch.cat(new_hand_videos, dim=0)
-            control_latents = control_latents * self.vae.config.scaling_factor
-            control_latents = control_latents.repeat(batch_size // control_latents.shape[0], 1, 1, 1, 1)
-            control_latents = control_latents.to(device=device, dtype=latents.dtype)
-            control_latents = rearrange(control_latents, "b c f h w -> b f c h w")
+        if hand_videos_latents is not None:
+            control_latents = hand_videos_latents
             control_latents = (
                 torch.cat([control_latents] * 2) if do_classifier_free_guidance else control_latents
             )
@@ -3902,7 +3855,6 @@ class CogVideoXFunStaticToVideoCrossPipeline(CogVideoXFunInpaintPipeline):
         image: Optional[torch.Tensor] = None,  # For I2V fallback
         static_videos: Optional[torch.Tensor] = None,
         hand_videos: Optional[torch.Tensor] = None,
-        return_video_latents: bool = False,
         timestep: Optional[torch.Tensor] = None,
         is_strength_max: bool = True,
         return_noise: bool = False,

@@ -1516,7 +1516,7 @@ class CogVideoXPatchEmbedWithAdapter(CogVideoXPatchEmbed):
             pos_embedding = pos_embedding.to(dtype=embeds.dtype)
             embeds = embeds + pos_embedding
 
-        return embeds, ref_image_embeds
+        return embeds
 
 class CogVideoXPatchEmbedWithCondToken(CogVideoXPatchEmbed):
     """
@@ -1816,7 +1816,147 @@ class CogVideoXPatchEmbedWithAdapterV2(CogVideoXPatchEmbed):
             pos_embedding = pos_embedding.to(dtype=embeds.dtype)
             embeds = embeds + pos_embedding
 
-        return embeds, ref_image_embeds
+        return embeds
+
+class CogVideoXPatchEmbedWithAdapterV3(CogVideoXPatchEmbed):
+    """
+    VideoX-Fun Patch Embed with conditional input support via adapter.
+    Uses Conv3D for temporal processing and zero-initialized projection.
+    """
+
+    def __init__(self, *args, **kwargs):
+        condition_channels = kwargs.pop("condition_channels", None)
+        use_enhanced_processing = kwargs.pop("use_enhanced_processing", False)
+        super().__init__(*args, **kwargs)
+
+        in_channels = kwargs.get("in_channels", 16)
+        patch_size = kwargs.get("patch_size", 16)
+        patch_size_t = kwargs.get("patch_size_t", None)
+        embed_dim = kwargs.get("embed_dim", 16)
+        bias = kwargs.get("bias", True)
+
+        if condition_channels is None:
+            condition_channels = in_channels
+
+        self.condition_channels = condition_channels
+        self.embed_dim = embed_dim
+        self.patch_size = patch_size
+        self.patch_size_t = patch_size_t
+        self.use_enhanced_processing = use_enhanced_processing
+
+        # 3D convolution for condition processing
+        if patch_size_t is None:
+            # CogVideoX 1.0 - Use 2D conv
+            self.add_conv_in = nn.Conv2d(
+                condition_channels, embed_dim,
+                kernel_size=patch_size, stride=patch_size, bias=bias
+            )
+        else:
+            # CogVideoX 1.5 - Use 3D conv
+            self.add_conv_in = nn.Conv3d(
+                condition_channels, embed_dim,
+                kernel_size=(patch_size, patch_size, patch_size_t), 
+                stride=(patch_size, patch_size, patch_size_t), bias=bias
+            )
+
+        # Enhanced processing layers (optional)
+        if use_enhanced_processing:
+            self.add_norm = nn.GroupNorm(32, embed_dim)
+            self.add_act = nn.SiLU()
+            print(f"✅ Enhanced processing enabled: GroupNorm + SiLU")
+        else:
+            self.add_norm = None
+            self.add_act = None
+            print(f"✅ Standard processing: Conv3D + Zero projection only")
+
+        # Zero-initialized projection
+        from diffusers.models.controlnet import zero_module
+        self.add_proj = zero_module(nn.Linear(embed_dim, embed_dim))
+
+    def forward(
+        self,
+        text_embeds: torch.Tensor,
+        image_embeds: torch.Tensor,
+        cond_embeds: torch.Tensor = None,
+    ):
+        """
+        Args:
+            text_embeds (`torch.Tensor`): [B, seq_length, embed_dim]
+            image_embeds (`torch.Tensor`): [B, F, C, H, W]
+            cond_embeds (`torch.Tensor`, optional): [B, F, C, H, W]
+        """
+        text_embeds = self.text_proj(text_embeds)
+        batch_size, num_frames, channels, height, width = image_embeds.shape
+
+        # ---- Process main image ----
+        if self.patch_size_t is None:
+            # CogVideoX 1.0 - 2D processing
+            image_embeds = image_embeds.reshape(-1, channels, height, width)
+            (-1, channels, height, width)
+            image_embeds = self.proj(image_embeds)
+            image_embeds = image_embeds.view(batch_size, num_frames, *image_embeds.shape[1:])
+            image_embeds = image_embeds.flatten(3).transpose(2, 3).flatten(1, 2)  # [B, F*H*W, embed_dim]
+        else:
+            # CogVideoX 1.5 - 3D processing
+            p = self.patch_size
+            p_t = self.patch_size_t
+            image_embeds = image_embeds.permute(0, 1, 3, 4, 2)
+            image_embeds = image_embeds.reshape(
+                -1, num_frames // p_t, p_t, height // p, p, width // p, p, channels
+            )
+            image_embeds = image_embeds.permute(0, 1, 3, 5, 7, 2, 4, 6).flatten(4, 7).flatten(1, 3)
+            image_embeds = self.proj(image_embeds)
+
+        # ---- Process condition ----
+        if cond_embeds is not None:
+            if self.patch_size_t is None:
+                # CogVideoX 1.0 - 2D conv
+                cond_embeds = cond_embeds.reshape(-1, self.condition_channels, height, width)
+                add_cond = self.add_conv_in(cond_embeds)  # [B*F, embed_dim, H/P, W/P]
+                add_cond = add_cond.view(batch_size, num_frames, *add_cond.shape[1:])
+                add_cond = add_cond.flatten(3).transpose(2, 3).flatten(1, 2)  # [B, F*H*W, embed_dim]
+            else:
+                # CogVideoX 1.5 - 3D conv
+                p = self.patch_size
+                p_t = self.patch_size_t
+                cond_embeds = cond_embeds.permute(0, 1, 3, 4, 2)
+                cond_embeds = cond_embeds.reshape(
+                    batch_size, num_frames // p_t, p_t, height // p, p, width // p, p, self.condition_channels
+                )
+                cond_embeds = cond_embeds.permute(0, 1, 3, 5, 7, 2, 4, 6).flatten(4, 7).flatten(1, 3)
+                add_cond = self.add_conv_in(cond_embeds)  # [B, embed_dim, ...]
+                add_cond = add_cond.flatten(2).transpose(1, 2)  # [B, seq_len, embed_dim]
+
+            # Enhanced processing (optional)
+            if self.use_enhanced_processing:
+                # Apply GroupNorm + SiLU
+                add_cond = self.add_norm(add_cond)
+                add_cond = self.add_act(add_cond)
+
+            # Apply zero-initialized projection and add to hidden states
+            image_embeds = image_embeds + self.add_proj(add_cond)
+
+        # ---- Merge text & image tokens ----
+        embeds = torch.cat([text_embeds, image_embeds], dim=1).contiguous()
+
+        # ---- Positional embeddings ----
+        if self.use_positional_embeddings or self.use_learned_positional_embeddings:
+            pre_time_compression_frames = (num_frames - 1) * self.temporal_compression_ratio + 1
+            if (
+                self.sample_height != height
+                or self.sample_width != width
+                or self.sample_frames != pre_time_compression_frames
+            ):
+                pos_embedding = self._get_positional_embeddings(
+                    height, width, pre_time_compression_frames, device=embeds.device
+                )
+            else:
+                pos_embedding = self.pos_embedding
+
+            pos_embedding = pos_embedding.to(dtype=embeds.dtype)
+            embeds = embeds + pos_embedding
+
+        return embeds
             
 class CogVideoXFunTransformer3DModelWithAdapter(CogVideoXFunTransformer3DModel):
     """
@@ -1831,29 +1971,28 @@ class CogVideoXFunTransformer3DModelWithAdapter(CogVideoXFunTransformer3DModel):
     3. Uses CogVideoXPatchEmbedWithAdapter for conditional processing
     """
     
-    def __init__(self, *args, condition_channels: int = 0, adapter_version: str = "v1", 
-                 use_zero_proj: bool = True, **kwargs):
+    def __init__(self, *args, condition_channels: int = 0, adapter_version: str = "v1", use_enhanced_processing: bool = False, **kwargs):
         self.add_noise_in_inpaint_model = kwargs.pop("add_noise_in_inpaint_model", False)
         self.adapter_version = adapter_version
-        use_zero_proj = use_zero_proj
+        self.use_enhanced_processing = use_enhanced_processing
         super().__init__(*args, **kwargs)
         
         # Replace patch_embed with adapter version if condition_channels > 0
         if condition_channels > 0:
-            self._setup_adapter_patch_embed(condition_channels, adapter_version, use_zero_proj)
+            self._setup_adapter_patch_embed(condition_channels, adapter_version)
             self.condition_channels = condition_channels
         else:
             self.condition_channels = 0
     
-    def _setup_adapter_patch_embed(self, condition_channels: int, adapter_version: str = "v1", use_zero_proj: bool = True):
-        """Replace patch_embed with CogVideoXPatchEmbedWithAdapter or CogVideoXPatchEmbedWithAdapterV2.
+    def _setup_adapter_patch_embed(self, condition_channels: int, adapter_version: str = "v1"):
+        """Replace patch_embed with CogVideoXPatchEmbedWithAdapter, V2, or V3.
         
         This creates a new adapter-based patch embed that processes conditions
         separately from the main image embeddings.
         
         Args:
             condition_channels: Number of condition channels
-            adapter_version: Version of adapter to use ("v1" or "v2")
+            adapter_version: Version of adapter to use ("v1", "v2", or "v3")
         """
         print(f"Setting up adapter-based patch embed (version {adapter_version}) for {condition_channels} condition channels")
         
@@ -1864,26 +2003,41 @@ class CogVideoXFunTransformer3DModelWithAdapter(CogVideoXFunTransformer3DModel):
         if adapter_version == "v2":
             adapter_class = CogVideoXPatchEmbedWithAdapterV2
             print("  Using CogVideoXPatchEmbedWithAdapterV2 (with GroupNorm and gating)")
+        elif adapter_version in ["v3", "v4"]:
+            adapter_class = CogVideoXPatchEmbedWithAdapterV3
+            if adapter_version == "v3":
+                print("  Using CogVideoXPatchEmbedWithAdapterV3 (with Conv3D and zero projection)")
+            else:  # v4
+                print("  Using CogVideoXPatchEmbedWithAdapterV3 (with Conv3D, GroupNorm, SiLU by default)")
         else:
             adapter_class = CogVideoXPatchEmbedWithAdapter
             print("  Using CogVideoXPatchEmbedWithAdapter (standard version)")
         
         # Create new adapter patch embed with same config
-        adapter_patch_embed = adapter_class(
-            condition_channels=condition_channels,
-            in_channels=current_patch_embed.proj.in_channels,
-            patch_size=getattr(current_patch_embed, 'patch_size', 16),
-            patch_size_t=getattr(current_patch_embed, 'patch_size_t', None),
-            embed_dim=current_patch_embed.proj.out_channels,
-            bias=current_patch_embed.proj.bias is not None,
-            use_positional_embeddings=getattr(current_patch_embed, 'use_positional_embeddings', True),
-            use_learned_positional_embeddings=getattr(current_patch_embed, 'use_learned_positional_embeddings', False),
-            sample_height=getattr(current_patch_embed, 'sample_height', None),
-            sample_width=getattr(current_patch_embed, 'sample_width', None),
-            sample_frames=getattr(current_patch_embed, 'sample_frames', None),
-            temporal_compression_ratio=getattr(current_patch_embed, 'temporal_compression_ratio', 1),
-            use_zero_proj=use_zero_proj,
-        )
+        adapter_kwargs = {
+            'condition_channels': condition_channels,
+            'in_channels': current_patch_embed.proj.in_channels,
+            'patch_size': getattr(current_patch_embed, 'patch_size', 16),
+            'patch_size_t': getattr(current_patch_embed, 'patch_size_t', None),
+            'embed_dim': current_patch_embed.proj.out_channels,
+            'bias': current_patch_embed.proj.bias is not None,
+            'use_positional_embeddings': getattr(current_patch_embed, 'use_positional_embeddings', True),
+            'use_learned_positional_embeddings': getattr(current_patch_embed, 'use_learned_positional_embeddings', False),
+            'sample_height': getattr(current_patch_embed, 'sample_height', None),
+            'sample_width': getattr(current_patch_embed, 'sample_width', None),
+            'sample_frames': getattr(current_patch_embed, 'sample_frames', None),
+            'temporal_compression_ratio': getattr(current_patch_embed, 'temporal_compression_ratio', 1),
+        }
+        
+        # Add enhanced processing flag for V3 and V4 adapters
+        if adapter_version in ["v3", "v4"]:
+            # V3: use_enhanced_processing=False, V4: use_enhanced_processing=True
+            if adapter_version == "v3":
+                adapter_kwargs['use_enhanced_processing'] = False
+            else:  # v4
+                adapter_kwargs['use_enhanced_processing'] = True
+        
+        adapter_patch_embed = adapter_class(**adapter_kwargs)
         
         # Copy pretrained weights from original patch_embed
         with torch.no_grad():
@@ -1913,11 +2067,22 @@ class CogVideoXFunTransformer3DModelWithAdapter(CogVideoXFunTransformer3DModel):
         
         print(f"✅ Successfully replaced patch_embed with adapter version {adapter_version}")
         print(f"  Main projection: {adapter_patch_embed.proj}")
-        print(f"  Condition projection: {adapter_patch_embed.cond_proj}")
+        if hasattr(adapter_patch_embed, 'cond_proj'):
+            print(f"  Condition projection: {adapter_patch_embed.cond_proj}")
+        if hasattr(adapter_patch_embed, 'add_conv_in'):
+            print(f"  Condition conv: {adapter_patch_embed.add_conv_in}")
         print(f"  Text projection: {adapter_patch_embed.text_proj}")
         if adapter_version == "v2":
             print(f"  Condition norm: {adapter_patch_embed.cond_norm}")
             print(f"  Condition gate: {adapter_patch_embed.cond_gate}")
+        elif adapter_version == "v3":
+            print(f"  Zero projection: {adapter_patch_embed.add_proj}")
+        elif adapter_version == "v4":
+            print(f"  Zero projection: {adapter_patch_embed.add_proj}")
+            if hasattr(adapter_patch_embed, 'add_norm'):
+                print(f"  GroupNorm: {adapter_patch_embed.add_norm}")
+            if hasattr(adapter_patch_embed, 'add_act'):
+                print(f"  SiLU: {adapter_patch_embed.add_act}")
     
     @classmethod
     def from_pretrained(
@@ -1927,6 +2092,7 @@ class CogVideoXFunTransformer3DModelWithAdapter(CogVideoXFunTransformer3DModel):
         subfolder="transformer",
         condition_channels: Optional[int] = None,
         adapter_version: str = "v1",
+        use_enhanced_processing: bool = False,
         **kwargs
     ):
         """
@@ -2011,7 +2177,7 @@ class CogVideoXFunTransformer3DModelWithAdapter(CogVideoXFunTransformer3DModel):
                 condition_channels = getattr(base_model.config, "condition_channels", 16)
 
             # Create extended model
-            model = cls(**base_model.config, condition_channels=condition_channels, adapter_version=adapter_version)
+            model = cls(**base_model.config, condition_channels=condition_channels, adapter_version=adapter_version, use_enhanced_processing=use_enhanced_processing)
 
             # Load base weights into extended model
             missing, unexpected = model.load_state_dict(base_model.state_dict(), strict=False)
@@ -2099,18 +2265,18 @@ class CogVideoXFunTransformer3DModelWithAdapter(CogVideoXFunTransformer3DModel):
         if inpaint_latents is not None:
             hidden_states = torch.concat([hidden_states, inpaint_latents], 2)
         
-        if not hasattr(self.patch_embed, 'cond_proj') and control_latents is not None:
+        if self.adapter_version == "v1" and control_latents is not None:
             # concat control latents if not using adapter
             hidden_states = torch.concat([hidden_states, control_latents], 2)
 
         # 2. Patch embedding with adapter support
         patch_embed_input = {'text_embeds': encoder_hidden_states, 
                              'image_embeds': hidden_states}
-        if hasattr(self.patch_embed, 'cond_proj') and control_latents is not None:
+        if self.adapter_version == "v1" and control_latents is not None:
             patch_embed_input['cond_embeds'] = control_latents
     
         # Use adapter patch embed
-        hidden_states, _ = self.patch_embed(**patch_embed_input)
+        hidden_states = self.patch_embed(**patch_embed_input)
         
         hidden_states = self.embedding_dropout(hidden_states)
 

@@ -545,7 +545,6 @@ def run_validation(
         condition_channels = pipeline_config.get("condition_channels", 16)
         use_adapter = pipeline_config.get("use_adapter", True)
         adapter_version = pipeline_config.get("adapter_version", "v1")
-        use_zero_proj = pipeline_config.get("use_zero_proj", True)
         
         pipe = CogVideoXFunStaticToVideoPipeline.from_pretrained(
             base_model_name_or_path=model_config_dict["base_model_name_or_path"],
@@ -557,12 +556,10 @@ def run_validation(
             condition_channels=condition_channels,
             use_adapter=use_adapter,
             adapter_version=adapter_version,
-            use_zero_proj=use_zero_proj,
         )
     elif pipeline_config["type"] == "cogvideox_fun_static_to_video_pose_cond_token":
         # Get condition_channels and use_cond_token from pipeline config
         condition_channels = pipeline_config.get("condition_channels", 16)
-        use_zero_proj = pipeline_config.get("use_zero_proj", False)
         
         pipe = CogVideoXFunStaticToVideoPoseTokenPipeline.from_pretrained(
             base_model_name_or_path=model_config_dict["base_model_name_or_path"],
@@ -572,7 +569,6 @@ def run_validation(
             variant=model_config_dict.get("variant"),
             torch_dtype=weight_dtype,
             condition_channels=condition_channels,
-            use_zero_proj=use_zero_proj,
         )
     else:
         raise ValueError(f"Unsupported pipeline type: {pipeline_config['type']}")
@@ -1002,7 +998,6 @@ def setup_pipeline_from_config(config: Dict[str, Any]):
         cross_attn_num_heads = pipeline_config.get("cross_attn_num_heads", 16)
         cross_attn_kv_dim = pipeline_config.get("cross_attn_kv_dim", None)
         condition_channels = pipeline_config.get("condition_channels", 16)
-        use_zero_proj = pipeline_config.get("use_zero_proj", False)
         
         pipeline = CogVideoXStaticToVideoCrossPoseAdapterPipeline.from_pretrained(
             pretrained_model_name_or_path=None,  # Always start from base model
@@ -1010,7 +1005,6 @@ def setup_pipeline_from_config(config: Dict[str, Any]):
             torch_dtype=load_dtype,
             revision=model_config.get("revision"),
             variant=model_config.get("variant"),
-            use_zero_proj=use_zero_proj,
             is_train_cross=True,
             cross_attn_interval=cross_attn_interval,
             cross_attn_dim_head=cross_attn_dim_head,
@@ -1107,7 +1101,6 @@ def setup_pipeline_from_config(config: Dict[str, Any]):
         condition_channels = pipeline_config.get("condition_channels", 16)
         use_adapter = pipeline_config.get("use_adapter", True)
         adapter_version = pipeline_config.get("adapter_version", "v1")
-        use_zero_proj = pipeline_config.get("use_zero_proj", True)
         
         pipeline = CogVideoXFunStaticToVideoPipeline.from_pretrained(
             pretrained_model_name_or_path=None,  # Always start from base model
@@ -1118,7 +1111,6 @@ def setup_pipeline_from_config(config: Dict[str, Any]):
             condition_channels=condition_channels,
             use_adapter=use_adapter,
             adapter_version=adapter_version,
-            use_zero_proj=use_zero_proj,
         )
     elif pipeline_type == "cogvideox_fun_static_to_video_pose_cond_token":
         # Setup CogVideoX Fun Static-to-Video Pipeline with cond token
@@ -1126,7 +1118,6 @@ def setup_pipeline_from_config(config: Dict[str, Any]):
         
         # Get condition_channels and use_cond_token from pipeline config
         condition_channels = pipeline_config.get("condition_channels", 16)
-        use_zero_proj = pipeline_config.get("use_zero_proj", True)
         
         pipeline = CogVideoXFunStaticToVideoPoseTokenPipeline.from_pretrained(
             pretrained_model_name_or_path=None,  # Always start from base model
@@ -1135,7 +1126,6 @@ def setup_pipeline_from_config(config: Dict[str, Any]):
             revision=model_config.get("revision"),
             variant=model_config.get("variant"),
             condition_channels=condition_channels,
-            use_zero_proj=use_zero_proj,
         )
         
     else:
@@ -1353,6 +1343,7 @@ def _apply_legacy_parameter_control(transformer, freeze_projection: bool):
 def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
     """Create save and load hooks for the model."""
     pipeline_type = config["pipeline"]["type"]
+    training_config = config["training"]
     training_mode = config["training"]["mode"]
     
     def save_model_hook(models, weights, output_dir):
@@ -1365,31 +1356,61 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
                         # Save LoRA weights
                         transformer_lora_layers = get_peft_model_state_dict(model)
                         
-                        # Save projection layer weights if applicable
+                        # Save trainable parameters (non-LoRA weights) if trainable_parameter_patterns is specified
+                        trainable_state_dict = None
+                        if "trainable_parameter_patterns" in training_config:
+                            import fnmatch
+                            trainable_state_dict = {}
+                            for name, param in model.named_parameters():
+                                # Check if this parameter matches any trainable pattern using fnmatch for wildcard support
+                                for pattern in training_config["trainable_parameter_patterns"]:
+                                    if fnmatch.fnmatch(name, pattern):
+                                        trainable_state_dict[name] = param.data
+                                        break
+                        
+                        # Legacy support: save projection layer weights for specific pipeline types
                         projection_state_dict = None
-                        if "concat" in pipeline_type:
-                            # Concat models: save proj weights (modified existing proj)
-                            if hasattr(model, 'patch_embed') and hasattr(model.patch_embed, 'proj'):
-                                projection_state_dict = {
-                                    "transformer.patch_embed.proj.weight": model.patch_embed.proj.weight.data,
-                                    "transformer.patch_embed.proj.bias": model.patch_embed.proj.bias.data if model.patch_embed.proj.bias is not None else None,
-                                }
-                        elif "adapter" in pipeline_type:
-                            # Adapter models: save cond_proj weights (newly added cond_proj)
-                            if hasattr(model, 'patch_embed') and hasattr(model.patch_embed, 'cond_proj'):
-                                projection_state_dict = {
-                                    "transformer.patch_embed.cond_proj.weight": model.patch_embed.cond_proj.weight.data,
-                                    "transformer.patch_embed.cond_proj.bias": model.patch_embed.cond_proj.bias.data if model.patch_embed.cond_proj.bias is not None else None,
-                                }
-                                
-                                # Save cond_norm weights for CogVideoXPatchEmbedWithAdapterV2
-                                if hasattr(model.patch_embed, 'cond_norm'):
-                                    projection_state_dict["transformer.patch_embed.cond_norm.weight"] = model.patch_embed.cond_norm.weight.data
-                                    projection_state_dict["transformer.patch_embed.cond_norm.bias"] = model.patch_embed.cond_norm.bias.data
-                                
-                                # Save cond_gate for CogVideoXPatchEmbedWithAdapterV2
-                                if hasattr(model.patch_embed, 'cond_gate'):
-                                    projection_state_dict["transformer.patch_embed.cond_gate"] = model.patch_embed.cond_gate.data
+                        if trainable_state_dict is None:  # Only if trainable_parameter_patterns is not used
+                            if "concat" in pipeline_type:
+                                # Concat models: save proj weights (modified existing proj)
+                                if hasattr(model, 'patch_embed') and hasattr(model.patch_embed, 'proj'):
+                                    projection_state_dict = {
+                                        "transformer.patch_embed.proj.weight": model.patch_embed.proj.weight.data,
+                                        "transformer.patch_embed.proj.bias": model.patch_embed.proj.bias.data if model.patch_embed.proj.bias is not None else None,
+                                    }
+                            elif "adapter" in pipeline_type:
+                                # Adapter models: save cond_proj weights (newly added cond_proj)
+                                if hasattr(model, 'patch_embed') and hasattr(model.patch_embed, 'cond_proj'):
+                                    projection_state_dict = {
+                                        "transformer.patch_embed.cond_proj.weight": model.patch_embed.cond_proj.weight.data,
+                                        "transformer.patch_embed.cond_proj.bias": model.patch_embed.cond_proj.bias.data if model.patch_embed.cond_proj.bias is not None else None,
+                                    }
+                                    
+                                    # Save cond_norm weights for CogVideoXPatchEmbedWithAdapterV2
+                                    if hasattr(model.patch_embed, 'cond_norm'):
+                                        projection_state_dict["transformer.patch_embed.cond_norm.weight"] = model.patch_embed.cond_norm.weight.data
+                                        projection_state_dict["transformer.patch_embed.cond_norm.bias"] = model.patch_embed.cond_norm.bias.data
+                                    
+                                    # Save cond_gate for CogVideoXPatchEmbedWithAdapterV2
+                                    if hasattr(model.patch_embed, 'cond_gate'):
+                                        projection_state_dict["transformer.patch_embed.cond_gate"] = model.patch_embed.cond_gate.data
+                                    
+                                    # Save add_conv_in weights for CogVideoXPatchEmbedWithAdapterV3/V4
+                                    if hasattr(model.patch_embed, 'add_conv_in'):
+                                        projection_state_dict["transformer.patch_embed.add_conv_in.weight"] = model.patch_embed.add_conv_in.weight.data
+                                        if hasattr(model.patch_embed.add_conv_in, 'bias') and model.patch_embed.add_conv_in.bias is not None:
+                                            projection_state_dict["transformer.patch_embed.add_conv_in.bias"] = model.patch_embed.add_conv_in.bias.data
+                                    
+                                    # Save add_norm weights for CogVideoXPatchEmbedWithAdapterV4 (enhanced processing)
+                                    if hasattr(model.patch_embed, 'add_norm') and model.patch_embed.add_norm is not None:
+                                        projection_state_dict["transformer.patch_embed.add_norm.weight"] = model.patch_embed.add_norm.weight.data
+                                        projection_state_dict["transformer.patch_embed.add_norm.bias"] = model.patch_embed.add_norm.bias.data
+                                    
+                                    # Save add_zero_proj weights for CogVideoXPatchEmbedWithAdapterV3/V4
+                                    if hasattr(model.patch_embed, 'add_zero_proj') and model.patch_embed.add_zero_proj is not None:
+                                        projection_state_dict["transformer.patch_embed.add_zero_proj.weight"] = model.patch_embed.add_zero_proj.weight.data
+                                        if hasattr(model.patch_embed.add_zero_proj, 'bias') and model.patch_embed.add_zero_proj.bias is not None:
+                                            projection_state_dict["transformer.patch_embed.add_zero_proj.bias"] = model.patch_embed.add_zero_proj.bias.data
                         # Save LoRA weights
                         if pipeline_type == "cogvideox_i2v":
                             # For basic I2V pipeline, use standard CogVideoXImageToVideoPipeline
@@ -1459,8 +1480,14 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
                                 transformer_lora_layers=transformer_lora_layers,
                             )
                         
-                        # Save projection layer weights separately
-                        if projection_state_dict:
+                        # Save trainable parameters (non-LoRA weights)
+                        if trainable_state_dict:
+                            torch.save(trainable_state_dict, os.path.join(output_dir, "non_lora_weights.pt"))
+                            saved_keys = list(trainable_state_dict.keys())
+                            print(f"✅ Saved non-LoRA weights: {saved_keys}")
+                        
+                        # Legacy support: Save projection layer weights separately
+                        elif projection_state_dict:
                             saved_keys = list(projection_state_dict.keys())
                             if "concat" in pipeline_type:
                                 # Concat models: save as projection_layer_weights.pt
@@ -1470,6 +1497,8 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
                                 # Adapter models: save as cond_proj_weights.pt
                                 torch.save(projection_state_dict, os.path.join(output_dir, "cond_proj_weights.pt"))
                                 print(f"✅ Saved adapter projection weights: {saved_keys}")
+                        else:
+                            print("⚠️ No trainable parameters or projection layer weights to save")
                     elif training_mode == "partial":
                         # Save only trainable parameters for partial training
                         trainable_state_dict = {}
@@ -1616,12 +1645,10 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
         elif pipeline_type == "cogvideox_fun_static_to_video_pose_cond_token":
             # For VideoX-Fun Pipeline with cond token, use cond token transformer
             condition_channels = config["pipeline"].get("condition_channels", 16)
-            use_zero_proj = config["pipeline"].get("use_zero_proj", True)
             transformer_ = CogVideoXFunTransformer3DModelWithCondToken.from_pretrained(
                 pretrained_model_name_or_path=None,  # Always start from base model
                 base_model_name_or_path=config["model"]["base_model_name_or_path"],
                 condition_channels=condition_channels,
-                use_zero_proj=use_zero_proj,
                 subfolder="transformer",
             )
         elif pipeline_type == "cogvideox_static_to_video_pose_concat":
@@ -1639,7 +1666,6 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
             cross_attn_num_heads = config["pipeline"].get("cross_attn_num_heads", 16)
             cross_attn_kv_dim = config["pipeline"].get("cross_attn_kv_dim", None)
             condition_channels = config["pipeline"].get("condition_channels", 16)
-            use_zero_proj = config["pipeline"].get("use_zero_proj", True)
             
             transformer_ = CrossTransformer3DModelWithAdapter.from_pretrained(
                 pretrained_model_name_or_path=None,  # Always start from base model
@@ -1650,7 +1676,6 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
                 cross_attn_num_heads=cross_attn_num_heads,
                 cross_attn_kv_dim=cross_attn_kv_dim,
                 condition_channels=condition_channels,
-                use_zero_proj=use_zero_proj,
                 subfolder="transformer",
             )
         else:
@@ -1717,38 +1742,50 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
             transformer_state_dict = convert_unet_state_dict_to_peft(transformer_state_dict)
             set_peft_model_state_dict(transformer_, transformer_state_dict, adapter_name="default")
             
-            # Load projection layer weights if they exist
-            if "concat" in pipeline_type:
-                # Concat models: load proj weights
-                projection_file = os.path.join(input_dir, "projection_layer_weights.pt")
-                if os.path.exists(projection_file):
-                    projection_state_dict = torch.load(projection_file, map_location="cpu")
-                    if hasattr(transformer_, 'patch_embed') and hasattr(transformer_.patch_embed, 'proj'):
-                        loaded_keys = []
-                        if "transformer.patch_embed.proj.weight" in projection_state_dict:
-                            transformer_.patch_embed.proj.weight.data.copy_(projection_state_dict["transformer.patch_embed.proj.weight"])
-                            loaded_keys.append("proj.weight")
-                        if "transformer.patch_embed.proj.bias" in projection_state_dict and projection_state_dict["transformer.patch_embed.proj.bias"] is not None:
-                            transformer_.patch_embed.proj.bias.data.copy_(projection_state_dict["transformer.patch_embed.proj.bias"])
-                            loaded_keys.append("proj.bias")
-                        print(f"✅ Loaded concat projection weights: {loaded_keys}")
+            # Load non-LoRA weights (trainable parameters) if they exist
+            non_lora_file = os.path.join(input_dir, "non_lora_weights.pt")
+            if os.path.exists(non_lora_file):
+                non_lora_state_dict = torch.load(non_lora_file, map_location="cpu")
+                model_state_dict = transformer_.state_dict()
+                loaded_keys = []
+                for name, param_data in non_lora_state_dict.items():
+                    if name in model_state_dict:
+                        model_state_dict[name].copy_(param_data)
+                        loaded_keys.append(name)
+                print(f"✅ Loaded non-LoRA weights: {loaded_keys}")
+            else:
+                # Legacy support: Load projection layer weights if they exist
+                if "concat" in pipeline_type:
+                    # Concat models: load proj weights
+                    projection_file = os.path.join(input_dir, "projection_layer_weights.pt")
+                    if os.path.exists(projection_file):
+                        projection_state_dict = torch.load(projection_file, map_location="cpu")
+                        if hasattr(transformer_, 'patch_embed') and hasattr(transformer_.patch_embed, 'proj'):
+                            loaded_keys = []
+                            if "transformer.patch_embed.proj.weight" in projection_state_dict:
+                                transformer_.patch_embed.proj.weight.data.copy_(projection_state_dict["transformer.patch_embed.proj.weight"])
+                                loaded_keys.append("proj.weight")
+                            if "transformer.patch_embed.proj.bias" in projection_state_dict and projection_state_dict["transformer.patch_embed.proj.bias"] is not None:
+                                transformer_.patch_embed.proj.bias.data.copy_(projection_state_dict["transformer.patch_embed.proj.bias"])
+                                loaded_keys.append("proj.bias")
+                            print(f"✅ Loaded concat projection weights: {loaded_keys}")
+                        else:
+                            print("⚠️ No patch_embed.proj found for concat model")
                     else:
-                        print("⚠️ No patch_embed.proj found for concat model")
-                else:
-                    print("⚠️ No projection_layer_weights.pt found for concat model")
-            elif "adapter" in pipeline_type:
-                # Adapter models: load cond_proj weights (including cond_norm and cond_gate for v2)
-                cond_proj_file = os.path.join(input_dir, "cond_proj_weights.pt")
-                if os.path.exists(cond_proj_file):
-                    cond_proj_state_dict = torch.load(cond_proj_file, map_location="cpu")
-                    if hasattr(transformer_, 'patch_embed') and hasattr(transformer_.patch_embed, 'cond_proj'):
-                        loaded_keys = []
-                        if "transformer.patch_embed.cond_proj.weight" in cond_proj_state_dict:
-                            transformer_.patch_embed.cond_proj.weight.data.copy_(cond_proj_state_dict["transformer.patch_embed.cond_proj.weight"])
-                            loaded_keys.append("cond_proj.weight")
-                        if "transformer.patch_embed.cond_proj.bias" in cond_proj_state_dict and cond_proj_state_dict["transformer.patch_embed.cond_proj.bias"] is not None:
-                            transformer_.patch_embed.cond_proj.bias.data.copy_(cond_proj_state_dict["transformer.patch_embed.cond_proj.bias"])
-                            loaded_keys.append("cond_proj.bias")
+                        print("⚠️ No projection_layer_weights.pt found for concat model")
+                elif "adapter" in pipeline_type:
+                    # Adapter models: load cond_proj weights (including cond_norm and cond_gate for v2)
+                    cond_proj_file = os.path.join(input_dir, "cond_proj_weights.pt")
+                    if os.path.exists(cond_proj_file):
+                        cond_proj_state_dict = torch.load(cond_proj_file, map_location="cpu")
+                        if hasattr(transformer_, 'patch_embed') and hasattr(transformer_.patch_embed, 'cond_proj'):
+                            loaded_keys = []
+                            if "transformer.patch_embed.cond_proj.weight" in cond_proj_state_dict:
+                                transformer_.patch_embed.cond_proj.weight.data.copy_(cond_proj_state_dict["transformer.patch_embed.cond_proj.weight"])
+                                loaded_keys.append("cond_proj.weight")
+                            if "transformer.patch_embed.cond_proj.bias" in cond_proj_state_dict and cond_proj_state_dict["transformer.patch_embed.cond_proj.bias"] is not None:
+                                transformer_.patch_embed.cond_proj.bias.data.copy_(cond_proj_state_dict["transformer.patch_embed.cond_proj.bias"])
+                                loaded_keys.append("cond_proj.bias")
                         
                         # Load cond_norm weights for CogVideoXPatchEmbedWithAdapterV2
                         if hasattr(transformer_.patch_embed, 'cond_norm'):
@@ -1764,6 +1801,33 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
                             if "transformer.patch_embed.cond_gate" in cond_proj_state_dict:
                                 transformer_.patch_embed.cond_gate.data.copy_(cond_proj_state_dict["transformer.patch_embed.cond_gate"])
                                 loaded_keys.append("cond_gate")
+                        
+                        # Load add_conv_in weights for CogVideoXPatchEmbedWithAdapterV3/V4
+                        if hasattr(transformer_.patch_embed, 'add_conv_in'):
+                            if "transformer.patch_embed.add_conv_in.weight" in cond_proj_state_dict:
+                                transformer_.patch_embed.add_conv_in.weight.data.copy_(cond_proj_state_dict["transformer.patch_embed.add_conv_in.weight"])
+                                loaded_keys.append("add_conv_in.weight")
+                            if "transformer.patch_embed.add_conv_in.bias" in cond_proj_state_dict and cond_proj_state_dict["transformer.patch_embed.add_conv_in.bias"] is not None:
+                                transformer_.patch_embed.add_conv_in.bias.data.copy_(cond_proj_state_dict["transformer.patch_embed.add_conv_in.bias"])
+                                loaded_keys.append("add_conv_in.bias")
+                        
+                        # Load add_norm weights for CogVideoXPatchEmbedWithAdapterV4 (enhanced processing)
+                        if hasattr(transformer_.patch_embed, 'add_norm') and transformer_.patch_embed.add_norm is not None:
+                            if "transformer.patch_embed.add_norm.weight" in cond_proj_state_dict:
+                                transformer_.patch_embed.add_norm.weight.data.copy_(cond_proj_state_dict["transformer.patch_embed.add_norm.weight"])
+                                loaded_keys.append("add_norm.weight")
+                            if "transformer.patch_embed.add_norm.bias" in cond_proj_state_dict:
+                                transformer_.patch_embed.add_norm.bias.data.copy_(cond_proj_state_dict["transformer.patch_embed.add_norm.bias"])
+                                loaded_keys.append("add_norm.bias")
+                        
+                        # Load add_zero_proj weights for CogVideoXPatchEmbedWithAdapterV3/V4
+                        if hasattr(transformer_.patch_embed, 'add_zero_proj') and transformer_.patch_embed.add_zero_proj is not None:
+                            if "transformer.patch_embed.add_zero_proj.weight" in cond_proj_state_dict:
+                                transformer_.patch_embed.add_zero_proj.weight.data.copy_(cond_proj_state_dict["transformer.patch_embed.add_zero_proj.weight"])
+                                loaded_keys.append("add_zero_proj.weight")
+                            if "transformer.patch_embed.add_zero_proj.bias" in cond_proj_state_dict and cond_proj_state_dict["transformer.patch_embed.add_zero_proj.bias"] is not None:
+                                transformer_.patch_embed.add_zero_proj.bias.data.copy_(cond_proj_state_dict["transformer.patch_embed.add_zero_proj.bias"])
+                                loaded_keys.append("add_zero_proj.bias")
                         
                         print(f"✅ Loaded adapter projection weights: {loaded_keys}")
                     else:
@@ -1876,21 +1940,21 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
                 from training.cogvideox_static_pose.cogvideox_fun_transformer_with_conditions import CogVideoXFunTransformer3DModelWithAdapter
                 condition_channels = config["pipeline"].get("condition_channels", 16)
                 use_adapter = config["pipeline"].get("use_adapter", True)
+                adapter_version = config["pipeline"].get("adapter_version", "v1")
                 load_model = CogVideoXFunTransformer3DModelWithAdapter.from_pretrained(
                     pretrained_model_name_or_path=os.path.join(input_dir, "transformer"),
                     base_model_name_or_path=config["model"]["base_model_name_or_path"],
                     condition_channels=condition_channels,
                     use_adapter=use_adapter,
+                    adapter_version=adapter_version,
                 )
             elif pipeline_type == "cogvideox_fun_static_to_video_pose_cond_token":
                 # For VideoX-Fun Pipeline with cond token, use cond token transformer
                 condition_channels = config["pipeline"].get("condition_channels", 16)
-                use_zero_proj = config["pipeline"].get("use_zero_proj", True)
                 load_model = CogVideoXFunTransformer3DModelWithCondToken.from_pretrained(
                     pretrained_model_name_or_path=os.path.join(input_dir, "transformer"),
                     base_model_name_or_path=config["model"]["base_model_name_or_path"],
                     condition_channels=condition_channels,
-                    use_zero_proj=use_zero_proj,
                 )
             elif pipeline_type == "cogvideox_static_to_video_pose_concat":
                 # For static-to-video pose concat, use concat transformer
@@ -2167,6 +2231,7 @@ def main():
         "width_buckets": data_config.get("width_buckets", 720),
         "frame_buckets": data_config.get("frame_buckets", 49),
         "image_to_video": data_config.get("image_to_video", False),
+        "use_gray_hand_videos": data_config.get("use_gray_hand_videos", False),
     }
     
     # Choose dataset class based on pipeline type
@@ -2220,15 +2285,41 @@ def main():
     )
 
     # Setup learning rate scheduler
+    # num_update_steps_per_epoch = batches_per_epoch / gradient_accumulation_steps
+    # where batches_per_epoch = len(train_dataset) / batch_size
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / training_config["gradient_accumulation_steps"])
+    
+    # Debug info for training steps calculation
+    print(f"📊 Training steps calculation:")
+    print(f"   Dataset size: {len(train_dataset)}")
+    print(f"   Batch size: {training_config['batch_size']}")
+    print(f"   Dataloader length: {len(train_dataloader)}")
+    print(f"   Expected batches per epoch: {len(train_dataset) // training_config['batch_size']}")
+    print(f"   Gradient accumulation steps: {training_config['gradient_accumulation_steps']}")
+    print(f"   Update steps per epoch: {num_update_steps_per_epoch}")
+    
+    # Verify the calculation
+    expected_batches = len(train_dataset) // training_config['batch_size']
+    if len(train_dataloader) != expected_batches:
+        print(f"⚠️  WARNING: Dataloader length ({len(train_dataloader)}) != expected batches ({expected_batches})")
+        print(f"   This suggests a custom sampler is being used")
+    else:
+        print(f"✅ Dataloader length matches expected batches")
     
     # Use max_train_steps directly if specified, otherwise calculate from epochs
     if "max_train_steps" in training_config:
         max_train_steps = training_config["max_train_steps"]
-        num_epochs = math.ceil(max_train_steps / num_update_steps_per_epoch)
+        # Set num_epochs to a large number to ensure we reach max_train_steps
+        # The actual stopping will be controlled by global_step >= max_train_steps check
+        num_epochs = max(100, math.ceil(max_train_steps / num_update_steps_per_epoch) * 2)
+        print(f"   Max train steps specified: {max_train_steps}")
+        print(f"   Calculated epochs (large): {num_epochs}")
+        print(f"   Training will stop at step {max_train_steps} (controlled by global_step check)")
     else:
         num_epochs = training_config["num_epochs"]
         max_train_steps = num_epochs * num_update_steps_per_epoch
+        print(f"   Num epochs specified: {num_epochs}")
+        print(f"   Calculated max train steps: {max_train_steps}")
     
     # Determine weight dtype for mixed precision training
     weight_dtype = torch.float32
@@ -2905,9 +2996,9 @@ def main():
                     # For VideoX-Fun Pipeline with cond token, use static_videos and hand_videos as conditions
                     # Training loop: static_videos and hand_videos are already in latent space
                     static_videos_latents = static_videos.to(device=accelerator.device, dtype=weight_dtype)
-                    static_videos_latents = static_videos_latents
+                    static_videos_latents = static_videos_latents * VAE_SCALING_FACTOR
                     hand_video_latents = hand_videos.to(device=accelerator.device, dtype=weight_dtype)
-                    hand_video_latents = hand_video_latents
+                    hand_video_latents = hand_video_latents * VAE_SCALING_FACTOR
 
                     # VideoX-Fun always uses mask (zeros for static video conditioning)
                     mask_input = torch.ones_like(noisy_model_input[:, :, :1]) * VAE_SCALING_FACTOR
@@ -3291,6 +3382,7 @@ def main():
             # Get condition_channels and use_adapter from pipeline config
             condition_channels = pipeline_config.get("condition_channels", 16)
             use_adapter = pipeline_config.get("use_adapter", True)
+            adapter_version = pipeline_config.get("adapter_version", "v1")
             
             pipeline = CogVideoXFunStaticToVideoPipeline(
                 tokenizer=tokenizer,
@@ -3303,7 +3395,6 @@ def main():
             # Get condition_channels and use_cond_token from pipeline config
             condition_channels = pipeline_config.get("condition_channels", 16)
             use_cond_token = pipeline_config.get("use_cond_token", True)
-            use_zero_proj = pipeline_config.get("use_zero_proj", False)
             
             pipeline = CogVideoXFunStaticToVideoHandTokenPipeline(
                 tokenizer=tokenizer,
