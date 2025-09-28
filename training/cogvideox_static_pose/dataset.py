@@ -48,6 +48,7 @@ class VideoDataset(Dataset):
         load_tensors: bool = False,
         random_flip: Optional[float] = None,
         image_to_video: bool = False,
+        use_gray_hand_videos: bool = False,
     ) -> None:
         super().__init__()
 
@@ -208,7 +209,8 @@ class VideoDataset(Dataset):
 
         # Derive prompt paths from video paths (same as _load_dataset_from_datafile)
         prompt_paths = [path.parent.parent.joinpath("prompts", path.name.replace(".mp4", ".txt")) for path in video_paths]
-        prompts = [path.read_text().strip() for path in prompt_paths]
+        # prompts = [path.read_text().strip() for path in prompt_paths]
+        prompts = ["" for path in prompt_paths]
 
         if not self.load_tensors and any(not path.is_file() for path in video_paths):
             raise ValueError(
@@ -352,6 +354,7 @@ class VideoDatasetWithConditions(VideoDataset):
         load_tensors: bool = False,
         random_flip: Optional[float] = None,
         image_to_video: bool = False,
+        use_gray_hand_videos: bool = False,
     ) -> None:
         # Initialize parent class with main video column
         super().__init__(
@@ -369,8 +372,14 @@ class VideoDatasetWithConditions(VideoDataset):
             image_to_video=image_to_video,
         )
         
+        # Store the use_gray_hand_videos flag
+        self.use_gray_hand_videos = use_gray_hand_videos
+        
         # Automatically derive hand video and static video paths from main video paths
-        self.hand_video_paths = self._derive_condition_video_paths("videos_hands")
+        if self.use_gray_hand_videos:
+            self.hand_video_paths = self._derive_condition_video_paths("videos_hands_gray")
+        else:
+            self.hand_video_paths = self._derive_condition_video_paths("videos_hands")
         self.static_video_paths = self._derive_condition_video_paths("videos_static")
         # Validate that all condition videos exist
         if not self.load_tensors:
@@ -379,6 +388,12 @@ class VideoDatasetWithConditions(VideoDataset):
                 raise ValueError(
                     f"Some hand video files are missing. First few missing files: {missing_hand_videos[:5]}"
                 )
+            
+            # if any(not path.is_file() for path in self.hand_video_gray_paths):
+            #     missing_hand_gray_videos = [path for path in self.hand_video_gray_paths if not path.is_file()]
+            #     raise ValueError(
+            #         f"Some hand gray video files are missing. First few missing files: {missing_hand_gray_videos[:5]}"
+            #     )
             
             if any(not path.is_file() for path in self.static_video_paths):
                 missing_static_videos = [path for path in self.static_video_paths if not path.is_file()]
@@ -423,7 +438,10 @@ class VideoDatasetWithConditions(VideoDataset):
         if self.load_tensors:
             # Load preprocessed latents for condition videos
             try:
-                hand_video_latents = self._load_condition_video_latents(self.hand_video_paths[index], "hand_video_latents")
+                if self.use_gray_hand_videos:
+                    hand_video_latents = self._load_condition_video_latents(self.hand_video_paths[index], "hand_video_gray_latents")
+                else:
+                    hand_video_latents = self._load_condition_video_latents(self.hand_video_paths[index], "hand_video_latents")
                 main_data["hand_videos"] = hand_video_latents
             except Exception as e:
                 logger.warning(f"Failed to load hand video latents for index {index}: {e}")
@@ -718,6 +736,7 @@ class VideoDatasetWithHumanMotions(VideoDatasetWithConditions):
         load_tensors: bool = False,
         random_flip: Optional[float] = None,
         image_to_video: bool = False,
+        use_gray_hand_videos: bool = False,
     ) -> None:
         # Initialize parent class with main video column
         super().__init__(
@@ -733,6 +752,7 @@ class VideoDatasetWithHumanMotions(VideoDatasetWithConditions):
             load_tensors=load_tensors,
             random_flip=random_flip,
             image_to_video=image_to_video,
+            use_gray_hand_videos=use_gray_hand_videos,
         )
         
         # Automatically derive human_motions paths from main video paths
