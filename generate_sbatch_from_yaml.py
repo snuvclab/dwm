@@ -238,7 +238,7 @@ elif [ "$SLURM_TEST_MODE" = true ]; then
     echo "🧪 SLURM test mode: Using 2 GPUs with accelerate"
 else
     # SLURM mode - use GPU count from YAML
-    NUM_GPUS={slurm.get('gpus', 2)}
+    NUM_GPUS={slurm.get('gpus_per_node', 4)}
     
     # Use SLURM allocated GPU IDs
     if [ -n "$CUDA_VISIBLE_DEVICES" ]; then
