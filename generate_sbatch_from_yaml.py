@@ -55,7 +55,7 @@ def generate_sbatch_script(yaml_file, output_script=None, aicomputing=False):
         print("🔧 AICOMPUTING mode: Overriding SLURM settings for aicomputing cluster")
         slurm.update({
             'nodes': 1,
-            'gpus_per_node': 4,
+            'gpus_per_node': slurm.get('gpus', 4),
             'cpus_per_task': 48,
             'mem': '400G',
             'partition': 'train',
@@ -101,7 +101,7 @@ def generate_sbatch_script(yaml_file, output_script=None, aicomputing=False):
         slurm_directives = f"""#!/bin/bash
 #SBATCH --job-name={slurm.get('job_name', 'default_job')}
 #SBATCH --nodes={slurm.get('nodes', 1)}
-#SBATCH --gpus-per-node={slurm.get('gpus_per_node', 4)}
+#SBATCH --gpus-per-node={slurm.get('gpus_per_node', slurm.get('gpus', 4))}
 #SBATCH --cpus-per-task={slurm.get('cpus_per_task', 48)}
 #SBATCH --mem={slurm.get('mem', '400G')}
 #SBATCH --partition={slurm.get('partition', 'train')}
@@ -406,7 +406,7 @@ echo "   - SLURM error: {slurm.get('error', 'out/%j_default.err')}"
         print(f"   - Job Name: {slurm.get('job_name', 'default_job')}")
         print(f"   - Nodes: {slurm.get('nodes', 1)}")
         if aicomputing:
-            print(f"   - GPUs per node: {slurm.get('gpus_per_node', 4)}")
+            print(f"   - GPUs per node: {slurm.get('gpus_per_node', slurm.get('gpus', 4))}")
             print(f"   - CPUs per task: {slurm.get('cpus_per_task', 48)}")
             print(f"   - Memory: {slurm.get('mem', '400G')}")
             print(f"   - Node list: {slurm.get('nodelist', 'compute-st-kait-gpu-2')}")
