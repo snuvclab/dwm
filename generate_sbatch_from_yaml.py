@@ -238,14 +238,7 @@ elif [ "$SLURM_TEST_MODE" = true ]; then
     echo "🧪 SLURM test mode: Using 2 GPUs with accelerate"
 else
     # SLURM mode - use GPU count from YAML
-    if [ "{aicomputing}" = "True" ]; then
-        # AICOMPUTING mode - use gpus-per-node
-        NUM_GPUS={slurm.get('gpus_per_node', 4)}
-        echo "🔧 AICOMPUTING mode: Using $NUM_GPUS GPUs per node"
-    else
-        # Standard mode - use gpus field
-        NUM_GPUS={slurm.get('gpus', 2)}
-    fi
+    NUM_GPUS={slurm.get('gpus', 2)}
     
     # Use SLURM allocated GPU IDs
     if [ -n "$CUDA_VISIBLE_DEVICES" ]; then
@@ -327,7 +320,7 @@ if [ "$DEBUG_MODE" = true ]; then
     echo "🔧 Debug mode command: $cmd"
     echo "🔧 Debug mode: Batch size overridden to 1, validation videos to 1 for easier debugging"
 elif [ "$SLURM_TEST_MODE" = true ]; then
-    cmd="accelerate launch --config_file $ACCELERATE_CONFIG_FILE --gpu_ids $GPU_IDS $SCRIPT_NAME --experiment_config $EXPERIMENT_CONFIG --mode slurm_test --override data.max_validation_videos=1"
+    cmd="accelerate launch --config_file $ACCELERATE_CONFIG_FILE --gpu_ids $GPU_IDS $SCRIPT_NAME --experiment_config $EXPERIMENT_CONFIG --mode slurm_test --override data.max_validation_videos=0"
     echo "🚀 Accelerate command: $cmd"
     echo "🧪 SLURM test mode: Validation videos overridden to 1 for faster testing"
 else
