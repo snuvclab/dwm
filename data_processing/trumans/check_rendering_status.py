@@ -295,25 +295,40 @@ except Exception as e:
     except Exception as e:
         return 2400  # Default fallback
 
-def check_animation_completeness(anim_path, expected_frames):
+def check_animation_completeness(anim_path, expected_frames, no_depth=False):
     """Check if an animation folder has all expected frames rendered."""
     rgb_path = os.path.join(anim_path, "images")
     depth_path = os.path.join(anim_path, "depth")
     cam_params_path = os.path.join(anim_path, "cam_params")
     
-    # Check if all required folders exist
-    if not all(os.path.exists(p) for p in [rgb_path, depth_path, cam_params_path]):
-        return False, 0, 0, 0
-    
-    # Count files in each folder
-    rgb_files = len([f for f in os.listdir(rgb_path) if f.endswith('.png')])
-    depth_files = len([f for f in os.listdir(depth_path) if f.endswith('.exr')])
-    cam_files = len([f for f in os.listdir(cam_params_path) if f.startswith('cam')])
-    
-    # Check if we have the expected number of files
-    is_complete = (rgb_files == expected_frames and 
-                   depth_files == expected_frames and 
-                   cam_files == expected_frames)
+    # Check required folders based on no_depth mode
+    if no_depth:
+        # RGB-only mode: only check images and cam_params
+        required_paths = [rgb_path, cam_params_path]
+        if not all(os.path.exists(p) for p in required_paths):
+            return False, 0, 0, 0
+        
+        # Count files in each folder
+        rgb_files = len([f for f in os.listdir(rgb_path) if f.endswith('.png')])
+        cam_files = len([f for f in os.listdir(cam_params_path) if f.startswith('cam')])
+        depth_files = 0  # No depth files expected
+        
+        # Check if we have the expected number of files (RGB and cam only)
+        is_complete = (rgb_files == expected_frames and cam_files == expected_frames)
+    else:
+        # Full mode: check all folders
+        if not all(os.path.exists(p) for p in [rgb_path, depth_path, cam_params_path]):
+            return False, 0, 0, 0
+        
+        # Count files in each folder
+        rgb_files = len([f for f in os.listdir(rgb_path) if f.endswith('.png')])
+        depth_files = len([f for f in os.listdir(depth_path) if f.endswith('.exr')])
+        cam_files = len([f for f in os.listdir(cam_params_path) if f.startswith('cam')])
+        
+        # Check if we have the expected number of files
+        is_complete = (rgb_files == expected_frames and 
+                       depth_files == expected_frames and 
+                       cam_files == expected_frames)
     
     return is_complete, rgb_files, depth_files, cam_files
 
@@ -326,30 +341,8 @@ def check_rendering_status(frame_skip=3):
     
     print(f"Using frame skip: {frame_skip} (expecting every {frame_skip}th frame to be rendered)")
     
-    # Load existing status report if available
-    existing_status_report = None
-    status_report_path = "rendering_status_report.json"
-    if os.path.exists(status_report_path):
-        try:
-            with open(status_report_path, 'r') as f:
-                existing_status_report = json.load(f)
-            print(f"✓ Loaded existing status report: {status_report_path}")
-            print(f"  Contains data for {len(existing_status_report.get('rendered_scenes_details', {}))} scenes")
-        except Exception as e:
-            print(f"⚠️  Could not load existing status report: {e}")
-    
-    # Create a set of scenes that are already fully rendered according to the status report
-    fully_rendered_scenes = set()
-    if existing_status_report and "rendered_scenes_details" in existing_status_report:
-        for scene_key, scene_details in existing_status_report["rendered_scenes_details"].items():
-            # Check if scene is fully complete (no incomplete or not started animations)
-            incomplete_count = len(scene_details.get("incomplete_animations", []))
-            not_started_count = len(scene_details.get("not_started_animations", []))
-            if incomplete_count == 0 and not_started_count == 0:
-                fully_rendered_scenes.add(scene_key)
-        
-        print(f"  Found {len(fully_rendered_scenes)} fully rendered scenes in status report")
-        print(f"  Will skip these scenes to speed up checking")
+    # Always check all scenes to get current status
+    print("Checking all scenes for current rendering status...")
     
     # Find all blend files
     blend_files = []
@@ -379,61 +372,31 @@ def check_rendering_status(frame_skip=3):
         # Use directory_name as the key for consistency with actual output folders
         scene_key = directory_name
         
-        # Check if this scene is already fully rendered according to the status report
-        if scene_key in fully_rendered_scenes:
-            # Use existing data from status report
-            scene_details = existing_status_report["rendered_scenes_details"][scene_key]
-            rendered_scenes[scene_key] = scene_details
-            rendered_animations += len(scene_details["complete_animations"])
-            total_animations += scene_details["expected_animations"]
-            print(f"✓ {scene_key} ({blend_name}): Already fully rendered (using status report data)")
+        # Get expected animation count for this scene
+        expected_animations = get_animation_count(blend_file)
+        
+        if expected_animations is None or expected_animations == 0:
+            print(f"⚠️  {scene_key} ({blend_name}): No animations found")
+            scenes_with_no_animations.append(scene_key)
             continue
         
-        # Check if this scene has existing data in the status report (but not fully rendered)
-        existing_scene_data = None
-        if existing_status_report and "rendered_scenes_details" in existing_status_report and scene_key in existing_status_report["rendered_scenes_details"]:
-            existing_scene_data = existing_status_report["rendered_scenes_details"][scene_key]
-            print(f"📊 {scene_key} ({blend_name}): Using existing status report data (not fully rendered)")
-        else:
-            # Get expected animation count (only for new scenes or scenes not in status report)
-            expected_animations = get_animation_count(blend_file)
-        
-        if existing_scene_data is None:
-            # New scene or scene not in status report - need to check everything
-            if expected_animations is None or expected_animations == 0:
-                print(f"⚠️  {scene_key} ({blend_name}): No animations found")
-                scenes_with_no_animations.append(scene_key)
-                continue
-            
-            print(f"📊 {scene_key} ({blend_name}): Expected {expected_animations} animations")
-        else:
-            # Use existing data from status report
-            expected_animations = existing_scene_data["expected_animations"]
-            print(f"📊 {scene_key} ({blend_name}): Expected {expected_animations} animations (from status report)")
+        print(f"📊 {scene_key} ({blend_name}): Expected {expected_animations} animations")
         
         if not os.path.exists(scene_output):
             print(f"❌ {scene_key} ({blend_name}): Not rendered")
-            # For scenes not rendered at all, check if they have animations
-            if existing_scene_data is None:
-                # Need to check blend file for animations
-                animation_names = get_animation_names(blend_file)
-                if not animation_names:
-                    print(f"  ⚠️  No animations found in this scene, skipping")
-                    scenes_with_no_animations.append(scene_key)
-                    continue
-                # Clean animation names (remove .pkl extension if present)
-                clean_animation_names = []
-                for anim_name in animation_names:
-                    clean_name = anim_name[:-4] if anim_name.endswith('.pkl') else anim_name
-                    clean_animation_names.append(clean_name)
-                not_started_animations_by_scene[scene_key] = clean_animation_names
-                total_animations += len(clean_animation_names)
-            else:
-                # Use existing data from status report
-                not_started_anims = existing_scene_data.get("not_started_animations", [])
-                not_started_animations_by_scene[scene_key] = not_started_anims
-                total_animations += len(not_started_anims)
-                print(f"  Using status report data: {len(not_started_anims)} not started animations")
+            # Get animation names for this scene
+            animation_names = get_animation_names(blend_file)
+            if not animation_names:
+                print(f"  ⚠️  No animations found in this scene, skipping")
+                scenes_with_no_animations.append(scene_key)
+                continue
+            # Clean animation names (remove .pkl extension if present)
+            clean_animation_names = []
+            for anim_name in animation_names:
+                clean_name = anim_name[:-4] if anim_name.endswith('.pkl') else anim_name
+                clean_animation_names.append(clean_name)
+            not_started_animations_by_scene[scene_key] = clean_animation_names
+            total_animations += len(clean_animation_names)
             continue
         
         # Check for animation folders
@@ -441,38 +404,17 @@ def check_rendering_status(frame_skip=3):
         scene_incomplete = []
         scene_not_started = []
         
-        if existing_scene_data is None:
-            # Need to check blend file for animations
-            animation_names = get_animation_names(blend_file)
-            if not animation_names:
-                print(f"  ⚠️  No animations found in this scene, skipping")
-                scenes_with_no_animations.append(scene_key)
-                continue
-        else:
-            # Use existing data from status report
-            complete_anims = existing_scene_data.get("complete_animations", [])
-            incomplete_anims = existing_scene_data.get("incomplete_animations", [])
-            not_started_anims = existing_scene_data.get("not_started_animations", [])
-            
-            # Use existing data for complete and incomplete animations
-            scene_animations = complete_anims.copy()
-            scene_incomplete = incomplete_anims.copy()
-            scene_not_started = not_started_anims.copy()
-            
-            # Only re-check incomplete animations to see if they're now complete
-            animation_names = [anim["name"] for anim in incomplete_anims] + not_started_anims
-            print(f"  Using status report data: {len(complete_anims)} complete, {len(incomplete_anims)} incomplete, {len(not_started_anims)} not started")
-            print(f"  Will re-check {len(animation_names)} incomplete/not started animations")
+        # Get animation names for this scene
+        animation_names = get_animation_names(blend_file)
+        if not animation_names:
+            print(f"  ⚠️  No animations found in this scene, skipping")
+            scenes_with_no_animations.append(scene_key)
+            continue
         
         # Check each expected animation
         for anim_name in animation_names:
-            # Handle both cases: raw animation names from blend file and clean names from status report
-            if existing_scene_data is None:
-                # Remove .pkl extension if present (to match folder naming in Blender script)
-                clean_anim_name = anim_name[:-4] if anim_name.endswith('.pkl') else anim_name
-            else:
-                # Animation name is already clean from status report
-                clean_anim_name = anim_name
+            # Remove .pkl extension if present (to match folder naming in Blender script)
+            clean_anim_name = anim_name[:-4] if anim_name.endswith('.pkl') else anim_name
             
             anim_path = os.path.join(scene_output, clean_anim_name)
             
@@ -730,6 +672,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Check rendering status for Trumans dataset")
     parser.add_argument("--frame-skip", type=int, default=3, 
                        help="Frame skip value used during rendering (default: 3)")
+    parser.add_argument("--no-depth", action="store_true", 
+                       help="Check status for RGB-only rendering (no depth files expected)")
     parser.add_argument("--recordings-path", type=str, default="data/trumans/Recordings_blend",
                        help="Path to recordings directory (default: data/trumans/Recordings_blend)")
     parser.add_argument("--output-base", type=str, default="data/trumans/ego_render_fov90",
@@ -745,33 +689,14 @@ if __name__ == "__main__":
         recordings_path = args.recordings_path
         output_base = args.output_base
         frame_skip = args.frame_skip
+        no_depth = args.no_depth
         
         print(f"Using frame skip: {frame_skip} (expecting every {frame_skip}th frame to be rendered)")
+        if no_depth:
+            print("No-depth mode: Checking RGB-only rendering (no depth files expected)")
         
-        # Load existing status report if available
-        existing_status_report = None
-        status_report_path = "rendering_status_report.json"
-        if os.path.exists(status_report_path):
-            try:
-                with open(status_report_path, 'r') as f:
-                    existing_status_report = json.load(f)
-                print(f"✓ Loaded existing status report: {status_report_path}")
-                print(f"  Contains data for {len(existing_status_report.get('rendered_scenes_details', {}))} scenes")
-            except Exception as e:
-                print(f"⚠️  Could not load existing status report: {e}")
-        
-        # Create a set of scenes that are already fully rendered according to the status report
-        fully_rendered_scenes = set()
-        if existing_status_report and "rendered_scenes_details" in existing_status_report:
-            for scene_key, scene_details in existing_status_report["rendered_scenes_details"].items():
-                # Check if scene is fully complete (no incomplete or not started animations)
-                incomplete_count = len(scene_details.get("incomplete_animations", []))
-                not_started_count = len(scene_details.get("not_started_animations", []))
-                if incomplete_count == 0 and not_started_count == 0:
-                    fully_rendered_scenes.add(scene_key)
-            
-            print(f"  Found {len(fully_rendered_scenes)} fully rendered scenes in status report")
-            print(f"  Will skip these scenes to speed up checking")
+        # Always check all scenes to get current status
+        print("Checking all scenes for current rendering status...")
         
         # Find all blend files
         blend_files = []
@@ -801,61 +726,31 @@ if __name__ == "__main__":
             # Use directory_name as the key for consistency with actual output folders
             scene_key = directory_name
             
-            # Check if this scene is already fully rendered according to the status report
-            if scene_key in fully_rendered_scenes:
-                # Use existing data from status report
-                scene_details = existing_status_report["rendered_scenes_details"][scene_key]
-                rendered_scenes[scene_key] = scene_details
-                rendered_animations += len(scene_details["complete_animations"])
-                total_animations += scene_details["expected_animations"]
-                print(f"✓ {scene_key} ({blend_name}): Already fully rendered (using status report data)")
+            # Get expected animation count for this scene
+            expected_animations = get_animation_count(blend_file)
+            
+            if expected_animations is None or expected_animations == 0:
+                print(f"⚠️  {scene_key} ({blend_name}): No animations found")
+                scenes_with_no_animations.append(scene_key)
                 continue
             
-            # Check if this scene has existing data in the status report (but not fully rendered)
-            existing_scene_data = None
-            if existing_status_report and "rendered_scenes_details" in existing_status_report and scene_key in existing_status_report["rendered_scenes_details"]:
-                existing_scene_data = existing_status_report["rendered_scenes_details"][scene_key]
-                print(f"📊 {scene_key} ({blend_name}): Using existing status report data (not fully rendered)")
-            else:
-                # Get expected animation count (only for new scenes or scenes not in status report)
-                expected_animations = get_animation_count(blend_file)
-            
-            if existing_scene_data is None:
-                # New scene or scene not in status report - need to check everything
-                if expected_animations is None or expected_animations == 0:
-                    print(f"⚠️  {scene_key} ({blend_name}): No animations found")
-                    scenes_with_no_animations.append(scene_key)
-                    continue
-                
-                print(f"📊 {scene_key} ({blend_name}): Expected {expected_animations} animations")
-            else:
-                # Use existing data from status report
-                expected_animations = existing_scene_data["expected_animations"]
-                print(f"📊 {scene_key} ({blend_name}): Expected {expected_animations} animations (from status report)")
+            print(f"📊 {scene_key} ({blend_name}): Expected {expected_animations} animations")
             
             if not os.path.exists(scene_output):
                 print(f"❌ {scene_key} ({blend_name}): Not rendered")
-                # For scenes not rendered at all, check if they have animations
-                if existing_scene_data is None:
-                    # Need to check blend file for animations
-                    animation_names = get_animation_names(blend_file)
-                    if not animation_names:
-                        print(f"  ⚠️  No animations found in this scene, skipping")
-                        scenes_with_no_animations.append(scene_key)
-                        continue
-                    # Clean animation names (remove .pkl extension if present)
-                    clean_animation_names = []
-                    for anim_name in animation_names:
-                        clean_name = anim_name[:-4] if anim_name.endswith('.pkl') else anim_name
-                        clean_animation_names.append(clean_name)
-                    not_started_animations_by_scene[scene_key] = clean_animation_names
-                    total_animations += len(clean_animation_names)
-                else:
-                    # Use existing data from status report
-                    not_started_anims = existing_scene_data.get("not_started_animations", [])
-                    not_started_animations_by_scene[scene_key] = not_started_anims
-                    total_animations += len(not_started_anims)
-                    print(f"  Using status report data: {len(not_started_anims)} not started animations")
+                # Get animation names for this scene
+                animation_names = get_animation_names(blend_file)
+                if not animation_names:
+                    print(f"  ⚠️  No animations found in this scene, skipping")
+                    scenes_with_no_animations.append(scene_key)
+                    continue
+                # Clean animation names (remove .pkl extension if present)
+                clean_animation_names = []
+                for anim_name in animation_names:
+                    clean_name = anim_name[:-4] if anim_name.endswith('.pkl') else anim_name
+                    clean_animation_names.append(clean_name)
+                not_started_animations_by_scene[scene_key] = clean_animation_names
+                total_animations += len(clean_animation_names)
                 continue
             
             # Check for animation folders
@@ -863,38 +758,17 @@ if __name__ == "__main__":
             scene_incomplete = []
             scene_not_started = []
             
-            if existing_scene_data is None:
-                # Need to check blend file for animations
-                animation_names = get_animation_names(blend_file)
-                if not animation_names:
-                    print(f"  ⚠️  No animations found in this scene, skipping")
-                    scenes_with_no_animations.append(scene_key)
-                    continue
-            else:
-                # Use existing data from status report
-                complete_anims = existing_scene_data.get("complete_animations", [])
-                incomplete_anims = existing_scene_data.get("incomplete_animations", [])
-                not_started_anims = existing_scene_data.get("not_started_animations", [])
-                
-                # Use existing data for complete and incomplete animations
-                scene_animations = complete_anims.copy()
-                scene_incomplete = incomplete_anims.copy()
-                scene_not_started = not_started_anims.copy()
-                
-                # Only re-check incomplete animations to see if they're now complete
-                animation_names = [anim["name"] for anim in incomplete_anims] + not_started_anims
-                print(f"  Using status report data: {len(complete_anims)} complete, {len(incomplete_anims)} incomplete, {len(not_started_anims)} not started")
-                print(f"  Will re-check {len(animation_names)} incomplete/not started animations")
+            # Get animation names for this scene
+            animation_names = get_animation_names(blend_file)
+            if not animation_names:
+                print(f"  ⚠️  No animations found in this scene, skipping")
+                scenes_with_no_animations.append(scene_key)
+                continue
             
             # Check each expected animation
             for anim_name in animation_names:
-                # Handle both cases: raw animation names from blend file and clean names from status report
-                if existing_scene_data is None:
-                    # Remove .pkl extension if present (to match folder naming in Blender script)
-                    clean_anim_name = anim_name[:-4] if anim_name.endswith('.pkl') else anim_name
-                else:
-                    # Animation name is already clean from status report
-                    clean_anim_name = anim_name
+                # Remove .pkl extension if present (to match folder naming in Blender script)
+                clean_anim_name = anim_name[:-4] if anim_name.endswith('.pkl') else anim_name
                 
                 anim_path = os.path.join(scene_output, clean_anim_name)
                 
@@ -907,38 +781,32 @@ if __name__ == "__main__":
                     # Animation has been started, check completeness
                     expected_frames = get_animation_frame_count(blend_file, anim_name, frame_skip)
                     is_complete, rgb_count, depth_count, cam_count = check_animation_completeness(
-                        anim_path, expected_frames
+                        anim_path, expected_frames, no_depth
                     )
                     
                     if is_complete:
-                        # Remove from incomplete/not_started lists and add to complete
-                        scene_not_started = [anim for anim in scene_not_started if anim != clean_anim_name]
-                        scene_incomplete = [anim for anim in scene_incomplete if anim.get('name') != clean_anim_name]
+                        # Add to complete animations
                         if clean_anim_name not in scene_animations:
                             scene_animations.append(clean_anim_name)
-                        print(f"  ✅ {clean_anim_name}: Complete ({rgb_count} RGB, {depth_count} depth, {cam_count} cam)")
-                    else:
-                        # Update incomplete animation data
-                        existing_incomplete = next((anim for anim in scene_incomplete if anim.get('name') == clean_anim_name), None)
-                        if existing_incomplete:
-                            # Update existing entry
-                            existing_incomplete.update({
-                                'rgb': rgb_count,
-                                'depth': depth_count,
-                                'cam': cam_count,
-                                'expected': expected_frames
-                            })
+                        if no_depth:
+                            print(f"  ✅ {clean_anim_name}: Complete ({rgb_count} RGB, {cam_count} cam)")
                         else:
-                            # Add new incomplete entry
-                            scene_incomplete.append({
-                                'name': clean_anim_name,
-                                'rgb': rgb_count,
-                                'depth': depth_count,
-                                'cam': cam_count,
-                                'expected': expected_frames
-                            })
-                        print(f"  ⚠️  {clean_anim_name}: Incomplete (RGB: {rgb_count}/{expected_frames}, "
-                              f"Depth: {depth_count}/{expected_frames}, Cam: {cam_count}/{expected_frames})")
+                            print(f"  ✅ {clean_anim_name}: Complete ({rgb_count} RGB, {depth_count} depth, {cam_count} cam)")
+                    else:
+                        # Add incomplete animation data
+                        scene_incomplete.append({
+                            'name': clean_anim_name,
+                            'rgb': rgb_count,
+                            'depth': depth_count,
+                            'cam': cam_count,
+                            'expected': expected_frames
+                        })
+                        if no_depth:
+                            print(f"  ⚠️  {clean_anim_name}: Incomplete (RGB: {rgb_count}/{expected_frames}, "
+                                  f"Cam: {cam_count}/{expected_frames})")
+                        else:
+                            print(f"  ⚠️  {clean_anim_name}: Incomplete (RGB: {rgb_count}/{expected_frames}, "
+                                  f"Depth: {depth_count}/{expected_frames}, Cam: {cam_count}/{expected_frames})")
             
             # Store scene results
             rendered_scenes[scene_key] = {
@@ -988,8 +856,12 @@ if __name__ == "__main__":
             for scene, anims in incomplete_animations_by_scene.items():
                 print(f"{scene}:")
                 for anim in anims:
-                    print(f"  {anim['name']}: RGB {anim['rgb']}/{anim['expected']}, "
-                          f"Depth {anim['depth']}/{anim['expected']}, Cam {anim['cam']}/{anim['expected']}")
+                    if no_depth:
+                        print(f"  {anim['name']}: RGB {anim['rgb']}/{anim['expected']}, "
+                              f"Cam {anim['cam']}/{anim['expected']}")
+                    else:
+                        print(f"  {anim['name']}: RGB {anim['rgb']}/{anim['expected']}, "
+                              f"Depth {anim['depth']}/{anim['expected']}, Cam {anim['cam']}/{anim['expected']}")
         
         if not_started_animations_by_scene:
             print(f"\nNOT STARTED ANIMATIONS BY SCENE:")
@@ -1032,7 +904,8 @@ if __name__ == "__main__":
             "scenes_with_no_animations_list": scenes_with_no_animations,
             "all_blend_files": [Path(f).stem for f in blend_files],
             "scene_status": {},  # Add scene status for easy lookup
-            "frame_skip": frame_skip  # Store the frame skip value used
+            "frame_skip": frame_skip,  # Store the frame skip value used
+            "no_depth": no_depth  # Store the no_depth mode used
         }
         
         # Create a simple scene status lookup
