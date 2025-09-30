@@ -44,7 +44,10 @@ parser.add_argument("--no-skip-existing", action="store_true", help="Disable ski
 parser.add_argument("--frame-skip", type=int, default=3, help="Render every Nth frame")
 parser.add_argument("--stride", type=int, default=25, help="Stride for video sequences (default: 25)")
 parser.add_argument("--fov", type=float, default=90.0, help="Camera FOV in degrees (perspective)")
+parser.add_argument("--width", type=int, default=720, help="Render width in pixels (default: 720)")
+parser.add_argument("--height", type=int, default=480, help="Render height in pixels (default: 480)")
 parser.add_argument("--grayscale", action="store_true", help="Render hands in grayscale (black & white)")
+parser.add_argument("--save-images", action="store_true", help="Save individual images instead of creating videos")
 args = parser.parse_args(argv)
 if args.no_skip_existing:
     args.skip_existing = False
@@ -500,7 +503,7 @@ def get_hand_mesh_data(hand_obj):
         eval_obj.to_mesh_clear()
 
 
-def render_hands_pytorch3d(camera_obj, hand_objects, render_shape=(480, 720), grayscale=False):
+def render_hands_pytorch3d(camera_obj, hand_objects, render_shape=None, grayscale=False):
     """
     Render CC_Hand_L/CC_Hand_R with Soft Phong shading via PyTorch3D.
     If grayscale=True, render in black & white with enhanced contrast.
@@ -508,7 +511,11 @@ def render_hands_pytorch3d(camera_obj, hand_objects, render_shape=(480, 720), gr
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # --- Intrinsics (pixels) ---
-    H, W = render_shape
+    if render_shape is None:
+        # Use default resolution if not specified
+        H, W = 480, 720
+    else:
+        H, W = render_shape
     fov_rad = camera_obj.data.angle
     fx = fy = (W / 2.0) / math.tan(fov_rad / 2.0)
     cx, cy = W / 2.0, H / 2.0
@@ -694,15 +701,24 @@ def setup_lighting_for_hands():
 # ---------------------------
 def render_animation_sequence(animation_index, animation_name):
     anim_output_folder = os.path.join(output_folder, f"{animation_name}")
-    sequences_folder = os.path.join(anim_output_folder, "sequences")
-    # Use different path for grayscale vs color videos
-    video_folder_suffix = "hands_gray" if args.grayscale else "hands"
-    videos_output_path = os.path.join(sequences_folder, f"videos_{video_folder_suffix}")
-    os.makedirs(videos_output_path, exist_ok=True)
-
-    print(f"Rendering animation {animation_index}: {animation_name}")
-    print(f"  Mode: {'Grayscale' if args.grayscale else 'Color'}")
-    print(f"  Videos: {videos_output_path}")
+    
+    if args.save_images:
+        # Image mode: save to images_hands folder
+        images_output_path = os.path.join(anim_output_folder, "images_hands")
+        os.makedirs(images_output_path, exist_ok=True)
+        print(f"Rendering animation {animation_index}: {animation_name}")
+        print(f"  Mode: {'Grayscale' if args.grayscale else 'Color'} (Images)")
+        print(f"  Images: {images_output_path}")
+    else:
+        # Video mode: save to sequences/videos_hands folder
+        sequences_folder = os.path.join(anim_output_folder, "sequences")
+        # Use different path for grayscale vs color videos
+        video_folder_suffix = "hands_gray" if args.grayscale else "hands"
+        videos_output_path = os.path.join(sequences_folder, f"videos_{video_folder_suffix}")
+        os.makedirs(videos_output_path, exist_ok=True)
+        print(f"Rendering animation {animation_index}: {animation_name}")
+        print(f"  Mode: {'Grayscale' if args.grayscale else 'Color'} (Videos)")
+        print(f"  Videos: {videos_output_path}")
 
     # Get hand objects
     hand_objects = []
@@ -721,136 +737,194 @@ def render_animation_sequence(animation_index, animation_name):
         print("Error: No active camera found!")
         return
 
-    # Frame range and video sequence parameters
+    # Frame range
     scene = bpy.context.scene
     render_start_frame = scene.frame_start if start_frame is None else start_frame
     render_end_frame   = scene.frame_end   if end_frame   is None else end_frame
     
-    # Video sequence parameters (same as static.py)
-    clip_length = 49  # 49 frames per video
-    stride = args.stride  # Use command line argument
-    frame_skip = args.frame_skip
-    fps = 8
-    
-    # Calculate video start frames
-    effective_stride = stride * frame_skip  # Actual frame stride
-    video_start_frames = []
-    current_frame = render_start_frame
-    while current_frame + (clip_length - 1) * frame_skip <= render_end_frame:
-        video_start_frames.append(current_frame)
-        current_frame += effective_stride
-    
-    print(f"Animation frames: {render_start_frame}..{render_end_frame}")
-    print(f"Video parameters: {clip_length} frames, stride {stride}, frame_skip {frame_skip}")
-    print(f"Effective stride: {effective_stride} frames (50% overlap)")
-    print(f"Creating {len(video_start_frames)} video sequences")
+    if args.save_images:
+        # Image mode: render all frames directly
+        frames_to_render = list(range(render_start_frame, render_end_frame + 1, args.frame_skip))
+        print(f"Animation frames: {render_start_frame}..{render_end_frame}")
+        print(f"Frame step: {args.frame_skip} -> {len(frames_to_render)} frames")
+    else:
+        # Video mode: video sequence parameters
+        clip_length = 49  # 49 frames per video
+        stride = args.stride  # Use command line argument
+        frame_skip = args.frame_skip
+        fps = 8
+        
+        # Calculate video start frames
+        effective_stride = stride * frame_skip  # Actual frame stride
+        video_start_frames = []
+        current_frame = render_start_frame
+        while current_frame + (clip_length - 1) * frame_skip <= render_end_frame:
+            video_start_frames.append(current_frame)
+            current_frame += effective_stride
+        
+        print(f"Animation frames: {render_start_frame}..{render_end_frame}")
+        print(f"Video parameters: {clip_length} frames, stride {stride}, frame_skip {frame_skip}")
+        print(f"Effective stride: {effective_stride} frames (50% overlap)")
+        print(f"Creating {len(video_start_frames)} video sequences")
 
     start_time = time.time()
-    videos_completed = 0
     total_render_time = 0.0
 
-    for video_idx, start_frame_num in enumerate(video_start_frames):
-        video_end_frame = start_frame_num + (clip_length - 1) * frame_skip
-        frames_to_render = list(range(start_frame_num, video_end_frame + 1, frame_skip))
-
-        # Check if video already exists
-        video_exists, needs_video_rendering = check_video_exists(video_idx, videos_output_path)
-        
-        if args.skip_existing and not needs_video_rendering:
-            print(f"\n========== VIDEO {video_idx + 1}/{len(video_start_frames)} ==========")
-            print(f"SKIPPED: Video {video_idx:05d}.mp4 already exists")
-            videos_completed += 1
-            continue
-
-        print(f"\n========== VIDEO {video_idx + 1}/{len(video_start_frames)} ==========")
-        print(f"Frames: {start_frame_num}..{video_end_frame} (step {frame_skip}) -> {len(frames_to_render)} frames")
-
-        # Create temp directory for this video
-        video_temp_dir = os.path.join(videos_output_path, f"temp_{video_idx:05d}")
-        os.makedirs(video_temp_dir, exist_ok=True)
-        
-        # Render all frames for this video
-        video_start_time = time.time()
-        frames_rendered = 0
+    if args.save_images:
+        # Image mode: render all frames directly
+        frames_completed = 0
+        frames_skipped = 0
         
         for frame_idx, frame_num in enumerate(frames_to_render):
             scene.frame_set(frame_num)
-
+            
+            # Check if frame already exists
+            image_path = os.path.join(images_output_path, f"{frame_num:04d}.png")
+            image_exists, needs_rendering = check_frame_exists(frame_num, images_output_path)
+            
+            if args.skip_existing and not needs_rendering:
+                frames_skipped += 1
+                print(f"[IMAGE] Frame {frame_num}: SKIPPED (already exists)")
+                continue
+            
             # Render with PyTorch3D
             frame_render_start = time.time()
-            print(f"[VIDEO {video_idx + 1}] Rendering frame {frame_num} ({frame_idx + 1}/{len(frames_to_render)})...")
+            print(f"[IMAGE] Rendering frame {frame_num} ({frame_idx + 1}/{len(frames_to_render)})...")
             
             # Render hands using PyTorch3D
-            image, depth = render_hands_pytorch3d(camera_obj, hand_objects, render_shape=(480, 720), grayscale=args.grayscale)
+            image, depth = render_hands_pytorch3d(camera_obj, hand_objects, render_shape=(args.height, args.width), grayscale=args.grayscale)
             
-            # Save image to temp directory
-            image_path = os.path.join(video_temp_dir, f"{frame_idx:04d}.png")
+            # Save image directly
             import cv2
             cv2.imwrite(image_path, cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
             
             frame_time = time.time() - frame_render_start
             total_render_time += frame_time
-            frames_rendered += 1
-
+            frames_completed += 1
+            
             if frame_idx % 10 == 0 or frame_idx == len(frames_to_render) - 1:
                 progress = (frame_idx + 1) / len(frames_to_render) * 100.0
-                avg_frame_time = total_render_time / frames_rendered if frames_rendered > 0 else 0
+                avg_frame_time = total_render_time / frames_completed if frames_completed > 0 else 0
                 print(f"  Frame {frame_idx + 1}/{len(frames_to_render)} ({progress:.1f}%) - {frame_time:.1f}s")
         
-        # Convert frames to video using ffmpeg
-        video_output_path = os.path.join(videos_output_path, f"{video_idx:05d}.mp4")
+        total_time = time.time() - start_time
+        avg_fps = frames_completed / total_time if total_time > 0 and frames_completed > 0 else 0
         
-        try:
-            import subprocess
-            
-            # Create RGB video
-            rgb_cmd = [
-                'ffmpeg', '-y', '-framerate', str(fps),
-                '-pattern_type', 'glob', '-i', os.path.join(video_temp_dir, '*.png'),
-                '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
-                '-crf', '18', video_output_path
-            ]
-            subprocess.run(rgb_cmd, check=True, capture_output=True)
-            
-            print(f"  ✅ Created video: {os.path.basename(video_output_path)}")
-            
-        except subprocess.CalledProcessError as e:
-            print(f"  ❌ Failed to create video: {e}")
-            print(f"  Command output: {e.stderr.decode()}")
-        except FileNotFoundError:
-            print(f"  ❌ ffmpeg not found. Please install ffmpeg to create videos.")
-            print(f"  Rendered frames saved in: {video_temp_dir}")
+        print("\n" + "="*50)
+        print(f"COMPLETED: Animation {animation_index} ({animation_name}) - IMAGE MODE")
+        print(f"Total time: {total_time/60:.1f} minutes")
+        print(f"Frames rendered: {frames_completed} | Skipped: {frames_skipped}")
+        print(f"Frame step: {args.frame_skip}")
+        print(f"Average throughput: {avg_fps:.2f} fps")
+        print(f"Images saved to: {images_output_path}")
+        print("="*50)
         
-        # Clean up temporary files (optional - uncomment if you want to save disk space)
-        # try:
-        #     import shutil
-        #     shutil.rmtree(video_temp_dir)
-        # except Exception as e:
-        #     print(f"  Warning: Could not clean up temp files: {e}")
+    else:
+        # Video mode: existing video creation logic
+        videos_completed = 0
         
-        videos_completed += 1
-        
-        # Overall progress
-        total_elapsed = time.time() - start_time
-        if videos_completed > 1:
-            avg_video_time = total_elapsed / videos_completed
-            remaining_videos = len(video_start_frames) - videos_completed
-            eta = remaining_videos * avg_video_time
-            print(f"  📊 Progress: {videos_completed}/{len(video_start_frames)} videos")
-            print(f"  ⏱️  Video time: {time.time() - video_start_time:.1f}s | Avg: {avg_video_time:.1f}s")
-            print(f"  🎯 ETA: {eta/60:.1f} min | Elapsed: {total_elapsed/60:.1f} min")
+        for video_idx, start_frame_num in enumerate(video_start_frames):
+            video_end_frame = start_frame_num + (clip_length - 1) * frame_skip
+            frames_to_render = list(range(start_frame_num, video_end_frame + 1, frame_skip))
 
-    total_time = time.time() - start_time
-    avg_fps = (videos_completed * clip_length) / total_time if total_time > 0 else 0
+            # Check if video already exists
+            video_exists, needs_video_rendering = check_video_exists(video_idx, videos_output_path)
+        
+            if args.skip_existing and not needs_video_rendering:
+                print(f"\n========== VIDEO {video_idx + 1}/{len(video_start_frames)} ==========")
+                print(f"SKIPPED: Video {video_idx:05d}.mp4 already exists")
+                videos_completed += 1
+                continue
 
-    print("\n" + "="*50)
-    print(f"COMPLETED: Animation {animation_index} ({animation_name})")
-    print(f"Total time: {total_time/60:.1f} minutes")
-    print(f"Videos created: {videos_completed}/{len(video_start_frames)}")
-    print(f"Frame step: {frame_skip} | Stride: {stride} | Effective stride: {effective_stride}")
-    print(f"Average throughput: {avg_fps:.2f} fps")
-    print(f"Skip existing: {args.skip_existing}")
-    print("="*50)
+            print(f"\n========== VIDEO {video_idx + 1}/{len(video_start_frames)} ==========")
+            print(f"Frames: {start_frame_num}..{video_end_frame} (step {frame_skip}) -> {len(frames_to_render)} frames")
+
+            # Create temp directory for this video
+            video_temp_dir = os.path.join(videos_output_path, f"temp_{video_idx:05d}")
+            os.makedirs(video_temp_dir, exist_ok=True)
+            
+            # Render all frames for this video
+            video_start_time = time.time()
+            frames_rendered = 0
+            
+            for frame_idx, frame_num in enumerate(frames_to_render):
+                scene.frame_set(frame_num)
+
+                # Render with PyTorch3D
+                frame_render_start = time.time()
+                print(f"[VIDEO {video_idx + 1}] Rendering frame {frame_num} ({frame_idx + 1}/{len(frames_to_render)})...")
+                
+                # Render hands using PyTorch3D
+                image, depth = render_hands_pytorch3d(camera_obj, hand_objects, render_shape=(args.height, args.width), grayscale=args.grayscale)
+                
+                # Save image to temp directory
+                image_path = os.path.join(video_temp_dir, f"{frame_idx:04d}.png")
+                import cv2
+                cv2.imwrite(image_path, cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+                
+                frame_time = time.time() - frame_render_start
+                total_render_time += frame_time
+                frames_rendered += 1
+
+                if frame_idx % 10 == 0 or frame_idx == len(frames_to_render) - 1:
+                    progress = (frame_idx + 1) / len(frames_to_render) * 100.0
+                    avg_frame_time = total_render_time / frames_rendered if frames_rendered > 0 else 0
+                    print(f"  Frame {frame_idx + 1}/{len(frames_to_render)} ({progress:.1f}%) - {frame_time:.1f}s")
+            
+            # Convert frames to video using ffmpeg
+            video_output_path = os.path.join(videos_output_path, f"{video_idx:05d}.mp4")
+            
+            try:
+                import subprocess
+                
+                # Create RGB video
+                rgb_cmd = [
+                    'ffmpeg', '-y', '-framerate', str(fps),
+                    '-pattern_type', 'glob', '-i', os.path.join(video_temp_dir, '*.png'),
+                    '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+                    '-crf', '18', video_output_path
+                ]
+                subprocess.run(rgb_cmd, check=True, capture_output=True)
+                
+                print(f"  ✅ Created video: {os.path.basename(video_output_path)}")
+                
+            except subprocess.CalledProcessError as e:
+                print(f"  ❌ Failed to create video: {e}")
+                print(f"  Command output: {e.stderr.decode()}")
+            except FileNotFoundError:
+                print(f"  ❌ ffmpeg not found. Please install ffmpeg to create videos.")
+                print(f"  Rendered frames saved in: {video_temp_dir}")
+            
+            # Clean up temporary files (optional - uncomment if you want to save disk space)
+            # try:
+            #     import shutil
+            #     shutil.rmtree(video_temp_dir)
+            # except Exception as e:
+            #     print(f"  Warning: Could not clean up temp files: {e}")
+            
+            videos_completed += 1
+            
+            # Overall progress
+            total_elapsed = time.time() - start_time
+            if videos_completed > 1:
+                avg_video_time = total_elapsed / videos_completed
+                remaining_videos = len(video_start_frames) - videos_completed
+                eta = remaining_videos * avg_video_time
+                print(f"  📊 Progress: {videos_completed}/{len(video_start_frames)} videos")
+                print(f"  ⏱️  Video time: {time.time() - video_start_time:.1f}s | Avg: {avg_video_time:.1f}s")
+                print(f"  🎯 ETA: {eta/60:.1f} min | Elapsed: {total_elapsed/60:.1f} min")
+
+        total_time = time.time() - start_time
+        avg_fps = (videos_completed * clip_length) / total_time if total_time > 0 else 0
+
+        print("\n" + "="*50)
+        print(f"COMPLETED: Animation {animation_index} ({animation_name}) - VIDEO MODE")
+        print(f"Total time: {total_time/60:.1f} minutes")
+        print(f"Videos created: {videos_completed}/{len(video_start_frames)}")
+        print(f"Frame step: {frame_skip} | Stride: {stride} | Effective stride: {effective_stride}")
+        print(f"Average throughput: {avg_fps:.2f} fps")
+        print(f"Skip existing: {args.skip_existing}")
+        print("="*50)
 
 # ---------------------------
 # Setup hand rendering
@@ -881,7 +955,7 @@ if not hand_objects:
 try:
     camera_obj = bpy.context.scene.camera
     if camera_obj and hand_objects:
-        image, depth = render_hands_pytorch3d(camera_obj, hand_objects, render_shape=(480, 720), grayscale=args.grayscale)
+        image, depth = render_hands_pytorch3d(camera_obj, hand_objects, render_shape=(args.height, args.width), grayscale=args.grayscale)
         mode = "grayscale" if args.grayscale else "color"
         print(f"✓ PyTorch3D setup verified - ready for {mode} rendering")
     else:
@@ -966,9 +1040,12 @@ print(f"Results saved in: '{output_folder}'")
 print("Each animation has its own subfolder: {animation_name}/")
 print("Output structure:")
 print("  {animation_name}/")
-print("    └── sequences/")
-print("        └── videos_hands/         # Hand-only video sequences (MP4) - Color mode")
-print("        └── videos_grayscale/     # Hand-only video sequences (MP4) - Grayscale mode")
+if args.save_images:
+    print("    └── images_hands/         # Hand-only images (PNG) - Individual frames")
+else:
+    print("    └── sequences/")
+    print("        └── videos_hands/         # Hand-only video sequences (MP4) - Color mode")
+    print("        └── videos_hands_gray/    # Hand-only video sequences (MP4) - Grayscale mode")
 if failed_animations:
     print(f"\nFAILED ANIMATIONS ({len(failed_animations)}):")
     for anim_idx, anim_name, error_type in failed_animations:
