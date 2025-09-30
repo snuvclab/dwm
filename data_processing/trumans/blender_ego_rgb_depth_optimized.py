@@ -21,7 +21,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--start_frame", type=int, default=None)
 parser.add_argument("--end_frame", type=int, default=None)
 parser.add_argument("--animation_index", type=int, default=None, help="Specific animation index (else: all)")
-parser.add_argument("--samples", type=int, default=64, help="Cycles samples")
+parser.add_argument("--samples", type=int, default=16, help="Cycles samples")
 parser.add_argument("--save-path", type=str, default="/home/byungjun/workspace/trumans_ego/ego_render_new",
                     help="Root output dir")
 parser.add_argument("--skip-existing", action="store_true", default=True, help="Skip frames that already exist")
