@@ -14,55 +14,6 @@ import imageio.v3 as iio
 import json
 import re
 
-# Add the training/aether/utils directory to the path to import postprocess_utils
-import sys
-sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..', 'training', 'aether', 'utils'))
-
-try:
-    from postprocess_utils import depth_to_disparity, colorize_depth
-except ImportError:
-    print("Warning: Could not import postprocess_utils. Using local implementation.")
-    
-    def depth_to_disparity(depth, sqrt_disparity=True):
-        """Convert depth to disparity.
-        
-        Args:
-            depth: (N, H, W) depth map
-            sqrt_disparity (bool, optional): Whether to take the square root of the disparity.
-                Defaults to True.
-        Returns:
-            (N, H, W) disparity map, dmax
-        """
-        import torch
-        
-        is_numpy = isinstance(depth, np.ndarray)
-        if is_numpy:
-            depth = torch.from_numpy(depth).float()
-        
-        disparity = 1.0 / depth
-        valid_disparity = disparity[depth > 1e-6]
-        dmax = valid_disparity.max()
-        disparity = torch.clamp(disparity / dmax, min=0.0, max=1.0)
-
-        if sqrt_disparity:
-            disparity = torch.sqrt(disparity)
-
-        if is_numpy:
-            disparity = disparity.cpu().numpy()
-        return disparity, dmax
-    
-    def colorize_depth(depth, cmap="Spectral"):
-        """Colorize depth map for visualization."""
-        import matplotlib.cm as cmaps
-        
-        min_d, max_d = (depth[depth > 0]).min(), (depth[depth > 0]).max()
-        depth = (max_d - depth) / (max_d - min_d)
-
-        cm = cmaps.get_cmap(cmap)
-        depth = depth.clip(0, 1)
-        depth = cm(depth, bytes=False)[..., 0:3]
-        return depth
-
 def find_all_actions(data_root, scene_start=0, scene_end=-1):
     """Find all action directories in all scenes, optionally filtered by scene index range."""
     actions = []
@@ -153,7 +104,7 @@ def get_sequence_parameters():
     return clip_length, stride, sample_every_nth
 
 
-def check_sequences_exist(action_path, disparity_format="image", save_root=None, scene_name=None, action_name=None, save_colorized_disparity=False):
+def check_sequences_exist(action_path, disparity_format="image", save_root=None, scene_name=None, action_name=None, save_colorized_disparity=False, data_frame_skip=3, third_person_only=False, skip_third_person=False):
     """Check if all expected sequences already exist for this action."""
     if save_root:
         # Use provided scene_name and action_name if available, otherwise extract from path
@@ -189,19 +140,34 @@ def check_sequences_exist(action_path, disparity_format="image", save_root=None,
     clip_length, stride, sample_every_nth = get_sequence_parameters()
     
     # Calculate expected number of clips
+    # Since we have frame-skipped data, we need to account for the actual frame spacing
     total_frames = len(image_files)
-    expected_clips = max(1, (total_frames - clip_length * sample_every_nth) // (stride * sample_every_nth) + 1)
+    
+    # The effective total frames in the original sequence (before frame skipping)
+    # If we have N frames with data_frame_skip=3, the original sequence had N*3 frames
+    original_total_frames = total_frames * data_frame_skip
+    
+    # Calculate expected clips based on the original frame count
+    expected_clips = max(1, (original_total_frames - clip_length * sample_every_nth) // (stride * sample_every_nth) + 1)
     
     # Check required sequence directories
-    required_dirs = ["videos", "trajectory"]
-    if disparity_format == "image":
-        required_dirs.append("disparity_video")
+    if third_person_only:
+        # Only check 3rd person videos
+        required_dirs = ["third_person_videos"]
     else:
-        required_dirs.append("disparity")
-    
-    # Add colorized disparity directory if requested
-    if save_colorized_disparity:
-        required_dirs.append("disparity_colorized")
+        required_dirs = ["videos", "trajectory"]
+        if disparity_format == "image":
+            required_dirs.append("disparity_video")
+        else:
+            required_dirs.append("disparity")
+        
+        # Add colorized disparity directory if requested
+        if save_colorized_disparity:
+            required_dirs.append("disparity_colorized")
+        
+        # Add 3rd person videos directory if not skipping
+        if not skip_third_person:
+            required_dirs.append("third_person_videos")
     
     # Check if all required directories exist
     for dir_name in required_dirs:
@@ -228,6 +194,9 @@ def check_sequences_exist(action_path, disparity_format="image", save_root=None,
                 files = []
         elif dir_name == "disparity_colorized":
             # Check for MP4 files (colorized disparity videos)
+            files = list(Path(dir_path).glob("*.mp4"))
+        elif dir_name == "third_person_videos":
+            # Check for MP4 files (3rd person videos)
             files = list(Path(dir_path).glob("*.mp4"))
         elif dir_name == "trajectory":
             # Check for NPY files (both relative and absolute trajectories)
@@ -301,10 +270,22 @@ def check_optional_data(action_path):
     if smplx_path.exists():
         optional_data['smplx'] = True
     
+    # Check for 3rd person video
+    third_person_paths = [
+        f"data/trumans/video_render/{action_name}.pkl.mp4",
+        f"data/trumans/video_render/{action_name}.mp4",
+        os.path.join(action_path, "..", "..", "video_render", f"{action_name}.pkl.mp4"),
+        os.path.join(action_path, "..", "..", "video_render", f"{action_name}.mp4"),
+    ]
+    for path in third_person_paths:
+        if os.path.exists(path):
+            optional_data['third_person_video'] = path
+            break
+    
     return optional_data
 
 
-def run_sequence_generation(action_path, disparity_format="image", start_idx=0, end_idx=-1, debug=False, sqrt_disparity=True, skip_existing_clips=False, dataset_type=None, smplx_base_path=None, save_root=None, scene_name=None, action_name=None, verbose=False, force_depth_reprocessing=False, force_cam_pose_reprocessing=False, save_colorized_disparity=False):
+def run_sequence_generation(action_path, disparity_format="image", start_idx=0, end_idx=-1, debug=False, sqrt_disparity=False, skip_existing_clips=False, dataset_type=None, smplx_base_path=None, save_root=None, scene_name=None, action_name=None, verbose=False, force_depth_reprocessing=False, force_cam_pose_reprocessing=False, force_human_pose_reprocessing=False, save_colorized_disparity=False, third_person_only=False, skip_third_person=False, third_person_video_path=None):
     """Run make_sequences.py for a single action with optional depth-to-disparity conversion."""
     
     # Check if we should use existing disparity or convert from depth
@@ -353,8 +334,8 @@ def run_sequence_generation(action_path, disparity_format="image", start_idx=0, 
     if skip_existing_clips:
         cmd.append("--skip_existing_clips")
     
-    if not sqrt_disparity:
-        cmd.append("--no_sqrt_disparity")
+    if sqrt_disparity:
+        cmd.append("--sqrt_disparity")
     
     if dataset_type:
         cmd.extend(["--dataset_type", dataset_type])
@@ -367,10 +348,23 @@ def run_sequence_generation(action_path, disparity_format="image", start_idx=0, 
         cmd.append("--force_depth_reprocessing")
     if force_cam_pose_reprocessing:
         cmd.append("--force_cam_pose_reprocessing")
+    if force_human_pose_reprocessing:
+        cmd.append("--force_human_pose_reprocessing")
     
     # Add colorized disparity flag if specified
     if save_colorized_disparity:
         cmd.append("--save_colorized_disparity")
+    
+    # Add 3rd person video flags if specified
+    if third_person_only:
+        cmd.append("--third_person_only")
+    if skip_third_person:
+        cmd.append("--skip_third_person")
+    if third_person_video_path:
+        cmd.extend(["--third_person_video_path", third_person_video_path])
+    elif not skip_third_person and not third_person_only:
+        # Auto-enable 3rd person video processing if not explicitly disabled
+        cmd.append("--save_third_person_clips")
     
     # Check if depth files exist (for Trumans datasets)
     if os.path.exists(depth_path):
@@ -390,6 +384,7 @@ def run_sequence_generation(action_path, disparity_format="image", start_idx=0, 
     
     try:
         # Run with real-time output to show progress
+        print(f"Running command: {' '.join(cmd)}")
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
                                  text=True, bufsize=1, universal_newlines=True)
         
@@ -489,7 +484,7 @@ def main():
     parser.add_argument("--dry_run", action="store_true", help="Show what would be processed without running")
     parser.add_argument("--skip_existing", action="store_true", help="Skip actions that already have sequences folder")
     parser.add_argument("--skip_existing_clips", action="store_true", help="Skip individual clips that already exist within actions")
-    parser.add_argument("--no_sqrt_disparity", action="store_true", help="Disable square root of disparity (default: enabled)")
+    parser.add_argument("--sqrt_disparity", action="store_true", help="Enable square root of disparity (default: disabled)")
     parser.add_argument("--dataset_type", type=str, choices=["aria", "trumans"], default="trumans",
                        help="Dataset type: 'aria' for egoallo data, 'trumans' for SMPLX data. Auto-detected if not specified.")
     parser.add_argument("--smplx_base_path", type=str, default=None, 
@@ -510,15 +505,26 @@ def main():
                        help="Force reprocessing of depth files even if disparity files already exist")
     parser.add_argument("--force_cam_pose_reprocessing", action="store_true",
                        help="Force reprocessing of camera poses even if trajectory files already exist")
+    parser.add_argument("--force_human_pose_reprocessing", action="store_true",
+                       help="Force reprocessing of human pose data even if pose files already exist")
     parser.add_argument("--save_colorized_disparity", action="store_true",
                        help="Additionally save colorized disparity videos (MP4 format)")
+    parser.add_argument("--data_frame_skip", type=int, default=3,
+                       help="Frame skip used during rendering (default: 3)")
+    parser.add_argument("--third_person_only", action="store_true",
+                       help="Process only 3rd person view videos")
+    parser.add_argument("--skip_third_person", action="store_true", 
+                       help="Skip 3rd person view video processing")
+    parser.add_argument("--third_person_video_path", type=str, default=None,
+                       help="Path to 3rd person view video file (auto-detected if not specified)")
 
     
     args = parser.parse_args()
     
-    # Set sqrt_disparity based on argument
-    sqrt_disparity = not args.no_sqrt_disparity
+    # Set sqrt_disparity based on argument (default: False)
+    sqrt_disparity = args.sqrt_disparity  # Default is False, only True if --sqrt_disparity is used
     print(f"Using sqrt_disparity: {sqrt_disparity}")
+    print(f"Using data_frame_skip: {args.data_frame_skip}")
     
     print(f"Scanning for actions in: {args.data_root}")
     
@@ -568,7 +574,7 @@ def main():
     for action in actions:
         if check_action_requirements(action['path']):
             # Check if sequences already exist
-            if args.skip_existing and check_sequences_exist(action['path'], args.disparity_format, args.save_root, action['scene'], action['action'], args.save_colorized_disparity):
+            if args.skip_existing and check_sequences_exist(action['path'], args.disparity_format, args.save_root, action['scene'], action['action'], args.save_colorized_disparity, args.data_frame_skip, args.third_person_only, args.skip_third_person):
                 skipped_actions.append(action)
                 print(f"⏭️  Skipping {action['scene']}/{action['action']}: All sequences already exist")
             else:
@@ -582,8 +588,13 @@ def main():
                     
                     # Get parameters from make_sequences.py
                     clip_length, stride, sample_every_nth = get_sequence_parameters()
-                    expected_clips = max(1, (total_frames - clip_length * sample_every_nth) // (stride * sample_every_nth) + 1)
-                    
+                    # Calculate expected clips accounting for frame skip
+                    original_total_frames = total_frames * args.data_frame_skip
+                    expected_clips = max(1, (original_total_frames - clip_length * sample_every_nth) // (stride * sample_every_nth) + 1)
+                
+                    # Debug information
+                    print(f"   📊 Frame calculation: {total_frames} frames (frame_skip={args.data_frame_skip}) → {original_total_frames} original frames")
+                    print(f"   📊 Expected clips: {expected_clips} (clip_length={clip_length}, stride={stride}, sample_every_nth={sample_every_nth})")
                     # Determine the correct sequences path
                     if args.save_root:
                         # Use scene and action names directly
@@ -661,6 +672,8 @@ def main():
             data_info.append(f"egoallo: available (ARIA dataset)")
         if 'smplx' in optional_data:
             data_info.append(f"smplx: available (Trumans dataset)")
+        if 'third_person_video' in optional_data:
+            data_info.append(f"3rd person video: available")
         
         data_str = ", ".join(data_info) if data_info else "images only"
         print(f"  {action['scene']}/{action['action']}: {data_str}")
@@ -714,7 +727,11 @@ def main():
             args.verbose,
             args.force_depth_reprocessing,
             args.force_cam_pose_reprocessing,
-            args.save_colorized_disparity
+            args.force_human_pose_reprocessing,
+            args.save_colorized_disparity,
+            args.third_person_only,
+            args.skip_third_person,
+            args.third_person_video_path
         )
         
         if success:
@@ -750,17 +767,20 @@ def main():
     if successful > 0:
         print(f"\nOutput structure for successful actions:")
         print(f"  {args.data_root}/<scene>/<action>/sequences/")
-        print(f"    ├── videos/                    # RGB video sequences")
-        if args.disparity_format == "image":
-            print(f"    ├── disparity_video/           # Disparity video sequences (MP4)")
-        elif args.disparity_format == "npy":
-            print(f"    ├── disparity/                 # Disparity sequences (NPY)")
-        else:  # npz format
-            print(f"    ├── disparity/                 # Disparity sequences (compressed NPZ)")
-        if args.save_colorized_disparity:
-            print(f"    ├── disparity_colorized/       # Colorized disparity videos (MP4)")
-        print(f"    ├── trajectory/                  # Camera trajectory sequences")
-        print(f"    └── human_motions/               # Human pose sequences (if available)")
+        if not args.third_person_only:
+            print(f"    ├── videos/                    # RGB video sequences")
+            if args.disparity_format == "image":
+                print(f"    ├── disparity_video/           # Disparity video sequences (MP4)")
+            elif args.disparity_format == "npy":
+                print(f"    ├── disparity/                 # Disparity sequences (NPY)")
+            else:  # npz format
+                print(f"    ├── disparity/                 # Disparity sequences (compressed NPZ)")
+            if args.save_colorized_disparity:
+                print(f"    ├── disparity_colorized/       # Colorized disparity videos (MP4)")
+            print(f"    ├── trajectory/                  # Camera trajectory sequences")
+            print(f"    └── human_motions/               # Human pose sequences (if available)")
+        if not args.skip_third_person:
+            print(f"    └── third_person_videos/        # 3rd person view video sequences (MP4)")
 
 if __name__ == "__main__":
     main() 
