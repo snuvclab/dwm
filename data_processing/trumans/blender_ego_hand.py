@@ -1144,12 +1144,34 @@ def render_animation_sequence(animation_index, animation_name):
                 video_end_frame = start_frame_num + (clip_length - 1) * frame_skip
                 frames_for_video = list(range(start_frame_num, video_end_frame + 1, frame_skip))
 
+                # Define output paths first
+                left_video_output_path = os.path.join(videos_output_path_left, f"{video_idx:05d}.mp4")
+                right_video_output_path = os.path.join(videos_output_path_right, f"{video_idx:05d}.mp4")
+                
                 # Check if both videos already exist
                 left_video_exists, left_needs_video_rendering = check_video_exists(video_idx, videos_output_path_left)
                 right_video_exists, right_needs_video_rendering = check_video_exists(video_idx, videos_output_path_right)
                 
-                left_video_output_path = os.path.join(videos_output_path_left, f"{video_idx:05d}.mp4")
-                right_video_output_path = os.path.join(videos_output_path_right, f"{video_idx:05d}.mp4")
+                # Force re-rendering if --no-skip-existing is used
+                if not args.skip_existing:
+                    left_needs_video_rendering = True
+                    right_needs_video_rendering = True
+                    print(f"    [FORCE] --no-skip-existing: Will re-render both videos")
+                    
+                    # Delete existing video files to ensure clean re-rendering
+                    if left_video_exists:
+                        try:
+                            os.remove(left_video_output_path)
+                            print(f"    [DELETE] Removed existing left video: {left_video_output_path}")
+                        except OSError as e:
+                            print(f"    [WARNING] Could not remove left video: {e}")
+                    
+                    if right_video_exists:
+                        try:
+                            os.remove(right_video_output_path)
+                            print(f"    [DELETE] Removed existing right video: {right_video_output_path}")
+                        except OSError as e:
+                            print(f"    [WARNING] Could not remove right video: {e}")
             
                 if args.skip_existing and not left_needs_video_rendering and not right_needs_video_rendering:
                     print(f"[VIDEO {video_idx + 1}] SKIPPED: Both videos already exist")
@@ -1157,6 +1179,7 @@ def render_animation_sequence(animation_index, animation_name):
                     continue
 
                 print(f"\n[VIDEO {video_idx + 1}] Processing frames {start_frame_num}..{video_end_frame} ({len(frames_for_video)} frames)")
+                print(f"  Frame sequence: {frames_for_video[:5]}{'...' if len(frames_for_video) > 5 else ''} (showing first 5)")
                 
                 # Step 1: Render frames for this video
                 frames_rendered = 0
@@ -1168,8 +1191,9 @@ def render_animation_sequence(animation_index, animation_name):
                     scene.frame_set(frame_num)
                     
                     # Check if frame already exists
-                    left_frame_path = current_video_temp_dir / f"left_frame_{frame_idx:04d}.png"
-                    right_frame_path = current_video_temp_dir / f"right_frame_{frame_idx:04d}.png"
+                    # Use 1-based indexing for ffmpeg compatibility
+                    left_frame_path = current_video_temp_dir / f"left_frame_{frame_idx + 1:04d}.png"
+                    right_frame_path = current_video_temp_dir / f"right_frame_{frame_idx + 1:04d}.png"
                     
                     if args.skip_existing and left_frame_path.exists() and right_frame_path.exists():
                         frames_skipped += 1
@@ -1221,14 +1245,25 @@ def render_animation_sequence(animation_index, animation_name):
                     
                     # Create left hand video
                     if left_needs_video_rendering and left_video_frames:
+                        # Debug: Check if frame files actually exist
+                        frame_files_exist = 0
+                        for frame_path in left_video_frames[:5]:  # Check first 5 frames
+                            if frame_path.exists():
+                                frame_files_exist += 1
+                        print(f"    [DEBUG] {frame_files_exist}/{min(5, len(left_video_frames))} frame files exist in temp directory")
                         left_rgb_cmd = [
                             'ffmpeg', '-y', '-framerate', str(fps),
                             '-i', str(current_video_temp_dir / 'left_frame_%04d.png'),
                             '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
                             '-crf', '18', left_video_output_path
                         ]
-                        subprocess.run(left_rgb_cmd, check=True, capture_output=True)
-                        print(f"    ✅ Created left hand video: {left_video_output_path}")
+                        print(f"    [FFMPEG] Creating left hand video with {len(left_video_frames)} frames")
+                        print(f"    [FFMPEG] Command: {' '.join(left_rgb_cmd)}")
+                        result = subprocess.run(left_rgb_cmd, check=True, capture_output=True, text=True)
+                        if os.path.exists(left_video_output_path) and os.path.getsize(left_video_output_path) > 0:
+                            print(f"    ✅ Created left hand video: {left_video_output_path}")
+                        else:
+                            print(f"    ❌ Left hand video file not created or empty: {left_video_output_path}")
                     
                     # Create right hand video
                     if right_needs_video_rendering and right_video_frames:
@@ -1238,8 +1273,13 @@ def render_animation_sequence(animation_index, animation_name):
                             '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
                             '-crf', '18', right_video_output_path
                         ]
-                        subprocess.run(right_rgb_cmd, check=True, capture_output=True)
-                        print(f"    ✅ Created right hand video: {right_video_output_path}")
+                        print(f"    [FFMPEG] Creating right hand video with {len(right_video_frames)} frames")
+                        print(f"    [FFMPEG] Command: {' '.join(right_rgb_cmd)}")
+                        result = subprocess.run(right_rgb_cmd, check=True, capture_output=True, text=True)
+                        if os.path.exists(right_video_output_path) and os.path.getsize(right_video_output_path) > 0:
+                            print(f"    ✅ Created right hand video: {right_video_output_path}")
+                        else:
+                            print(f"    ❌ Right hand video file not created or empty: {right_video_output_path}")
                     
                 except subprocess.CalledProcessError as e:
                     print(f"    ❌ Failed to create separate videos: {e}")
@@ -1259,15 +1299,21 @@ def render_animation_sequence(animation_index, animation_name):
                         if 0 <= frame_idx_in_current < len(frames_for_video):
                             frames_to_keep.append(frame_idx_in_current)
                 
-                # Remove frames that won't be needed
+                # Remove frames that won't be needed (use 1-based indexing for ffmpeg compatibility)
+                frames_removed = 0
                 for frame_idx in range(len(frames_for_video)):
                     if frame_idx not in frames_to_keep:
-                        left_frame_path = current_video_temp_dir / f"left_frame_{frame_idx:04d}.png"
-                        right_frame_path = current_video_temp_dir / f"right_frame_{frame_idx:04d}.png"
+                        left_frame_path = current_video_temp_dir / f"left_frame_{frame_idx + 1:04d}.png"
+                        right_frame_path = current_video_temp_dir / f"right_frame_{frame_idx + 1:04d}.png"
                         if left_frame_path.exists():
                             left_frame_path.unlink()
+                            frames_removed += 1
                         if right_frame_path.exists():
                             right_frame_path.unlink()
+                            frames_removed += 1
+                
+                if frames_removed > 0:
+                    print(f"    Removed {frames_removed} frame files, kept {len(frames_to_keep)} for next video")
                 
                 videos_completed += 2
                 
@@ -1303,9 +1349,24 @@ def render_animation_sequence(animation_index, animation_name):
                 video_end_frame = start_frame_num + (clip_length - 1) * frame_skip
                 frames_for_video = list(range(start_frame_num, video_end_frame + 1, frame_skip))
 
+                # Define output path first
+                video_output_path = os.path.join(videos_output_path, f"{video_idx:05d}.mp4")
+                
                 # Check if video already exists
                 video_exists, needs_video_rendering = check_video_exists(video_idx, videos_output_path)
-                video_output_path = os.path.join(videos_output_path, f"{video_idx:05d}.mp4")
+                
+                # Force re-rendering if --no-skip-existing is used
+                if not args.skip_existing:
+                    needs_video_rendering = True
+                    print(f"    [FORCE] --no-skip-existing: Will re-render video")
+                    
+                    # Delete existing video file to ensure clean re-rendering
+                    if video_exists:
+                        try:
+                            os.remove(video_output_path)
+                            print(f"    [DELETE] Removed existing video: {video_output_path}")
+                        except OSError as e:
+                            print(f"    [WARNING] Could not remove video: {e}")
             
                 if args.skip_existing and not needs_video_rendering:
                     print(f"[VIDEO {video_idx + 1}] SKIPPED: Video already exists")
@@ -1313,6 +1374,7 @@ def render_animation_sequence(animation_index, animation_name):
                     continue
 
                 print(f"\n[VIDEO {video_idx + 1}] Processing frames {start_frame_num}..{video_end_frame} ({len(frames_for_video)} frames)")
+                print(f"  Frame sequence: {frames_for_video[:5]}{'...' if len(frames_for_video) > 5 else ''} (showing first 5)")
                 
                 # Step 1: Render frames for this video
                 frames_rendered = 0
@@ -1323,7 +1385,8 @@ def render_animation_sequence(animation_index, animation_name):
                     scene.frame_set(frame_num)
                     
                     # Check if frame already exists
-                    frame_path = current_video_temp_dir / f"frame_{frame_idx:04d}.png"
+                    # Use 1-based indexing for ffmpeg compatibility
+                    frame_path = current_video_temp_dir / f"frame_{frame_idx + 1:04d}.png"
                     
                     if args.skip_existing and frame_path.exists():
                         frames_skipped += 1
@@ -1368,9 +1431,13 @@ def render_animation_sequence(animation_index, animation_name):
                         '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
                         '-crf', '18', video_output_path
                     ]
-                    subprocess.run(rgb_cmd, check=True, capture_output=True)
-                    
-                    print(f"    ✅ Created video: {video_output_path}")
+                    print(f"    [FFMPEG] Creating video with {len(video_frames)} frames")
+                    print(f"    [FFMPEG] Command: {' '.join(rgb_cmd)}")
+                    result = subprocess.run(rgb_cmd, check=True, capture_output=True, text=True)
+                    if os.path.exists(video_output_path) and os.path.getsize(video_output_path) > 0:
+                        print(f"    ✅ Created video: {video_output_path}")
+                    else:
+                        print(f"    ❌ Video file not created or empty: {video_output_path}")
                     
                 except subprocess.CalledProcessError as e:
                     print(f"    ❌ Failed to create video: {e}")
@@ -1390,12 +1457,17 @@ def render_animation_sequence(animation_index, animation_name):
                         if 0 <= frame_idx_in_current < len(frames_for_video):
                             frames_to_keep.append(frame_idx_in_current)
                 
-                # Remove frames that won't be needed
+                # Remove frames that won't be needed (use 1-based indexing for ffmpeg compatibility)
+                frames_removed = 0
                 for frame_idx in range(len(frames_for_video)):
                     if frame_idx not in frames_to_keep:
-                        frame_path = current_video_temp_dir / f"frame_{frame_idx:04d}.png"
+                        frame_path = current_video_temp_dir / f"frame_{frame_idx + 1:04d}.png"
                         if frame_path.exists():
                             frame_path.unlink()
+                            frames_removed += 1
+                
+                if frames_removed > 0:
+                    print(f"    Removed {frames_removed} frame files, kept {len(frames_to_keep)} for next video")
                 
                 videos_completed += 1
                 

@@ -444,6 +444,7 @@ def main():
     parser.add_argument("--grayscale", action="store_true", help="Render hands in grayscale (black & white) - only applies to blender_ego_hand.py")
     parser.add_argument("--save-images", action="store_true", help="Save individual images instead of creating videos - only applies to blender_ego_hand.py")
     parser.add_argument("--separate", action="store_true", help="Create separate videos for left and right hands (only works with --grayscale) - only applies to blender_ego_hand.py")
+    parser.add_argument("--no-skip-existing", action="store_true", help="Force re-render even if files already exist - only applies to blender_ego_hand.py")
     parser.add_argument("--parallel-animations", action="store_true", help="Launch separate jobs for each animation (faster for single scenes, more blend file overhead)")
     parser.add_argument("--scenes", type=str, nargs='+', help="Specific scene names (directory names) to render. If not specified, renders all scenes.")
     parser.add_argument("--scene-pattern", type=str, help="Pattern to match scene names (e.g., 'scene_*' or '*_walk')")
@@ -502,6 +503,8 @@ def main():
         print(f"Image mode: Enabled (individual images instead of videos)")
     if args.separate and 'blender_ego_hand.py' in args.script_path:
         print(f"Separate mode: Enabled (separate videos for left and right hands)")
+    if args.no_skip_existing and 'blender_ego_hand.py' in args.script_path:
+        print(f"No-skip-existing: Enabled (will force re-render existing files)")
     if 'blender_ego_hand.py' in args.script_path:
         print(f"Hand rendering resolution: {args.width}x{args.height} pixels")
     if args.no_depth and 'blender_ego_rgb_depth_optimized.py' in args.script_path:
@@ -1093,6 +1096,10 @@ def main():
         # Add separate option if specified and using blender_ego_hand.py
         if args.separate and 'blender_ego_hand.py' in args.script_path:
             cmd.append("--separate")
+        
+        # Add no-skip-existing option if specified and using blender_ego_hand.py
+        if args.no_skip_existing and 'blender_ego_hand.py' in args.script_path:
+            cmd.append("--no-skip-existing")
         
         # Add width and height options for blender_ego_hand.py
         if 'blender_ego_hand.py' in args.script_path:
