@@ -102,6 +102,9 @@ def log_validation_with_dataset(
     validation_hand_video_path: str = None,
     validation_static_video_path: str = None,
     validation_human_motions_path: str = None,
+    validation_hand_video_left_path: str = None,
+    validation_hand_video_right_path: str = None,
+    validation_smpl_pos_map_path: str = None,
     is_final_validation: bool = False,
     step: int = 0,
     pipeline_type: str = None,
@@ -133,12 +136,40 @@ def log_validation_with_dataset(
         static_video = None
     else:
         # For concat/adapter, load hand and static videos
-        if validation_hand_video_path and os.path.exists(validation_hand_video_path):
-            hand_video = iio.imread(validation_hand_video_path).astype(np.float32) / 255.0
-            hand_video = hand_video.transpose(3, 0, 1, 2)  # [F, H, W, C] -> [C, F, H, W]
-            hand_video = hand_video[np.newaxis, :]  # Add batch dimension: [C, F, H, W] -> [1, C, F, H, W]
+        split_hands = config.get("data", {}).get("split_hands", False)
+        
+        if split_hands:
+            # Split hands mode: load left and right hand videos separately
+            hand_left_video = None
+            hand_right_video = None
+            
+            if validation_hand_video_left_path and os.path.exists(validation_hand_video_left_path):
+                hand_left_video = iio.imread(validation_hand_video_left_path).astype(np.float32) / 255.0
+                hand_left_video = hand_left_video.transpose(3, 0, 1, 2)  # [F, H, W, C] -> [C, F, H, W]
+                hand_left_video = hand_left_video[np.newaxis, :]  # Add batch dimension: [C, F, H, W] -> [1, C, F, H, W]
+            
+            if validation_hand_video_right_path and os.path.exists(validation_hand_video_right_path):
+                hand_right_video = iio.imread(validation_hand_video_right_path).astype(np.float32) / 255.0
+                hand_right_video = hand_right_video.transpose(3, 0, 1, 2)  # [F, H, W, C] -> [C, F, H, W]
+                hand_right_video = hand_right_video[np.newaxis, :]  # Add batch dimension: [C, F, H, W] -> [1, C, F, H, W]
+            
+            # Concatenate left and right hand videos along channel dimension
+            if hand_left_video is not None and hand_right_video is not None:
+                hand_video = np.concatenate([hand_left_video, hand_right_video], axis=1)  # [1, 2C, F, H, W]
+            elif hand_left_video is not None:
+                hand_video = hand_left_video
+            elif hand_right_video is not None:
+                hand_video = hand_right_video
+            else:
+                hand_video = None
         else:
-            hand_video = None
+            # Regular mode: load single hand video
+            if validation_hand_video_path and os.path.exists(validation_hand_video_path):
+                hand_video = iio.imread(validation_hand_video_path).astype(np.float32) / 255.0
+                hand_video = hand_video.transpose(3, 0, 1, 2)  # [F, H, W, C] -> [C, F, H, W]
+                hand_video = hand_video[np.newaxis, :]  # Add batch dimension: [C, F, H, W] -> [1, C, F, H, W]
+            else:
+                hand_video = None
             
         if validation_static_video_path and os.path.exists(validation_static_video_path):
             static_video = iio.imread(validation_static_video_path).astype(np.float32) / 255.0
@@ -146,6 +177,65 @@ def log_validation_with_dataset(
             static_video = static_video[np.newaxis, :]  # Add batch dimension: [C, F, H, W] -> [1, C, F, H, W]
         else:
             static_video = None
+        
+        # Load SMPL pos map if available
+        if validation_smpl_pos_map_path and os.path.exists(validation_smpl_pos_map_path):
+            # Check if we should use compressed version
+            compress_smpl_pos_map_temporal = config.get("data", {}).get("compress_smpl_pos_map_temporal", False)
+            
+            if compress_smpl_pos_map_temporal:
+                # Load from dataset using the same method
+                from training.cogvideox_static_pose.dataset import VideoDatasetWithConditions
+                dataset_config = config.get("data", {})
+                
+                # Create a minimal dataset instance just to use the loading method
+                import decord
+                from pathlib import Path
+                video_reader = decord.VideoReader(uri=validation_smpl_pos_map_path.as_posix())
+                smpl_pos_map = video_reader[:]  # [F, H, W, C]
+                smpl_pos_map = smpl_pos_map.permute(3, 0, 1, 2)  # [C, F, H, W]
+                smpl_pos_map = smpl_pos_map.unsqueeze(0)  # [1, C, F, H, W]
+                smpl_pos_map = smpl_pos_map / 255.0
+                smpl_pos_map = (smpl_pos_map - 0.5) / 0.5
+                
+                # Spatial compression
+                vae_scale_factor_spatial = dataset_config.get("vae_scale_factor_spatial", 8)
+                b, c, f, h, w = smpl_pos_map.shape
+                smpl_pos_map_2d = smpl_pos_map.permute(0, 2, 1, 3, 4).reshape(b * f, c, h, w)
+                new_h = h // vae_scale_factor_spatial
+                new_w = w // vae_scale_factor_spatial
+                import torch.nn.functional as F
+                smpl_pos_map_2d = F.interpolate(
+                    smpl_pos_map_2d,
+                    size=(new_h, new_w),
+                    mode='bilinear',
+                    align_corners=False
+                )
+                smpl_pos_map = smpl_pos_map_2d.reshape(b, f, c, new_h, new_w).permute(0, 2, 1, 3, 4)
+                
+                # Temporal compression
+                vae_scale_factor_temporal = dataset_config.get("vae_scale_factor_temporal", 4)
+                num_frames = smpl_pos_map.shape[2]
+                if num_frames % vae_scale_factor_temporal != 0:
+                    pad_frames = vae_scale_factor_temporal - (num_frames % vae_scale_factor_temporal)
+                    padding = smpl_pos_map[:, :, :pad_frames, :, :]
+                    smpl_pos_map = torch.cat([padding, smpl_pos_map], dim=2)
+                
+                from einops import rearrange
+                smpl_pos_map = rearrange(
+                    smpl_pos_map,
+                    "b c (n t) h w -> b t (n c) h w",
+                    n=vae_scale_factor_temporal,
+                )
+                # smpl_pos_map is now [1, F', C*4, H/8, W/8]
+            else:
+                # Load as regular video
+                smpl_pos_map = iio.imread(validation_smpl_pos_map_path).astype(np.float32) / 255.0
+                smpl_pos_map = smpl_pos_map.transpose(3, 0, 1, 2)  # [F, H, W, C] -> [C, F, H, W]
+                smpl_pos_map = smpl_pos_map[np.newaxis, :]  # Add batch dimension: [C, F, H, W] -> [1, C, F, H, W]
+                smpl_pos_map = torch.from_numpy(smpl_pos_map).float()
+        else:
+            smpl_pos_map = None
         
         human_motions = None
 
@@ -207,7 +297,9 @@ def log_validation_with_dataset(
         if isinstance(dummy_image, np.ndarray):
             dummy_image = Image.fromarray(dummy_image)
         pipeline_args["image"] = dummy_image
-    elif pipeline_type in ["cogvideox_static_to_video", "cogvideox_static_to_video_pose_concat", "cogvideox_fun_static_to_video", "cogvideox_fun_static_to_video_pose_concat"]:
+    elif pipeline_type in ["cogvideox_static_to_video", "cogvideox_static_to_video_pose_concat", 
+                           "cogvideox_fun_static_to_video", "cogvideox_fun_static_to_video_pose_concat",
+                           "cogvideox_fun_static_to_video_posmap_concat", "cogvideox_fun_static_to_video_posmap_adapter"]:
         # I2V-based pipelines with video conditioning
         # For these pipelines, we test both I2V and static-to-video modes
         if validation_mode == "image_to_video":
@@ -243,6 +335,12 @@ def log_validation_with_dataset(
             elif pipeline_type == "cogvideox_fun_static_to_video_pose_concat":
                 pipeline_args["static_videos"] = static_video
                 pipeline_args["hand_videos"] = hand_video
+            elif pipeline_type == "cogvideox_fun_static_to_video_posmap_concat":
+                pipeline_args["static_videos"] = static_video
+                pipeline_args["smpl_pos_map"] = smpl_pos_map
+            elif pipeline_type == "cogvideox_fun_static_to_video_posmap_adapter":
+                pipeline_args["static_videos"] = static_video
+                pipeline_args["smpl_pos_map"] = smpl_pos_map  # Will be used as adapter control based on adapter_control_type
             elif pipeline_type == "cogvideox_fun_static_to_video_cross":
                 pipeline_args["static_videos"] = static_video
                 pipeline_args["hand_videos"] = hand_video
@@ -292,7 +390,24 @@ def log_validation_with_dataset(
     if static_video is not None:
         video_components.append(static_video)
     if hand_video is not None:
-        video_components.append(hand_video)
+        # Handle split_hands case: convert 6-channel to RGB by assigning to R, G channels
+        if hand_video.shape[3] == 6:  # split_hands mode: 6 channels (left 3 + right 3)
+            # Convert 6-channel to 3-channel RGB
+            # Left hand (first 3 channels) -> R channel, Right hand (last 3 channels) -> G channel, B channel = 0
+            hand_left = hand_video[:, :, :, 0:3]  # [F, H, W, 3] - left hand
+            hand_right = hand_video[:, :, :, 3:6]  # [F, H, W, 3] - right hand
+            
+            # Convert to grayscale and assign to R, G channels
+            hand_left_gray = np.mean(hand_left, axis=3, keepdims=True)  # [F, H, W, 1]
+            hand_right_gray = np.mean(hand_right, axis=3, keepdims=True)  # [F, H, W, 1]
+            hand_b = np.zeros_like(hand_left_gray)  # [F, H, W, 1] - zero channel
+            
+            # Concatenate to create RGB: [F, H, W, 3]
+            hand_video_rgb = np.concatenate([hand_left_gray, hand_right_gray, hand_b], axis=3)
+            video_components.append(hand_video_rgb)
+        else:
+            # Regular mode: use as is
+            video_components.append(hand_video)
     video_components.extend([generated_video, gt_video])
     
     comparison_video = np.concatenate(video_components, axis=2)  # Concatenate along width
@@ -363,6 +478,7 @@ def run_validation(
     # Setup pipeline for validation
     pipeline_config = config["pipeline"]
     model_config_dict = config["model"]
+    data_config = config.get("data", {})
     
     if pipeline_config["type"] == "cogvideox_i2v":
         # Setup basic CogVideoX I2V Pipeline for validation
@@ -479,6 +595,7 @@ def run_validation(
             revision=model_config_dict.get("revision"),
             variant=model_config_dict.get("variant"),
             torch_dtype=weight_dtype,
+            split_hands=data_config.get("split_hands", False),
         )
     elif pipeline_config["type"] == "cogvideox_fun_static_to_video_pose_concat":
         # Get condition_channels from pipeline config
@@ -493,6 +610,7 @@ def run_validation(
             torch_dtype=weight_dtype,
             condition_channels=condition_channels,
             use_adapter=False,
+            split_hands=data_config.get("split_hands", False),
         )
     elif pipeline_config["type"] == "cogvideox_fun_static_to_video_cross":
         # Get cross-attention parameters from pipeline config
@@ -556,6 +674,40 @@ def run_validation(
             condition_channels=condition_channels,
             use_adapter=use_adapter,
             adapter_version=adapter_version,
+            split_hands=data_config.get("split_hands", False),
+        )
+    elif pipeline_config["type"] == "cogvideox_fun_static_to_video_posmap_concat":
+        # Get compress_smpl_pos_map_temporal from data config
+        compress_smpl_pos_map_temporal = data_config.get("compress_smpl_pos_map_temporal", False)
+        condition_channels = 12 if compress_smpl_pos_map_temporal else 16
+        
+        pipe = CogVideoXFunStaticToVideoPipeline.from_pretrained(
+            base_model_name_or_path=model_config_dict["base_model_name_or_path"],
+            transformer=unwrap_model(accelerator, transformer),
+            scheduler=scheduler,
+            revision=model_config_dict.get("revision"),
+            variant=model_config_dict.get("variant"),
+            torch_dtype=weight_dtype,
+            condition_channels=condition_channels,
+            use_adapter=False,
+            compress_smpl_pos_map_temporal=compress_smpl_pos_map_temporal,
+        )
+    elif pipeline_config["type"] == "cogvideox_fun_static_to_video_posmap_adapter":
+        # Get adapter parameters from data/pipeline config
+        in_dim_control_adapter = data_config.get("vae_scale_factor_temporal", 4) * 3  # Default: 12
+        adapter_control_type = pipeline_config.get("adapter_control_type", "smpl_pos_map")
+        
+        pipe = CogVideoXFunStaticToVideoPipeline.from_pretrained(
+            base_model_name_or_path=model_config_dict["base_model_name_or_path"],
+            transformer=unwrap_model(accelerator, transformer),
+            scheduler=scheduler,
+            revision=model_config_dict.get("revision"),
+            variant=model_config_dict.get("variant"),
+            torch_dtype=weight_dtype,
+            condition_channels=0,  # No concat
+            add_control_adapter=True,
+            in_dim_control_adapter=in_dim_control_adapter,
+            adapter_control_type=adapter_control_type,
         )
     elif pipeline_config["type"] == "cogvideox_fun_static_to_video_pose_cond_token":
         # Get condition_channels and use_cond_token from pipeline config
@@ -662,17 +814,47 @@ def run_validation(
         # Derive hand and static video paths from main video paths
         validation_hand_videos = []
         validation_static_videos = []
+        validation_hand_videos_left = []
+        validation_hand_videos_right = []
+        validation_smpl_pos_maps = []
+        
+        split_hands = data_config.get("split_hands", False)
+        use_smpl_pos_map = pipeline_config["type"] in ["cogvideox_fun_static_to_video_posmap_concat", "cogvideox_fun_static_to_video_posmap_adapter"]
+        
         for video_path in validation_set:
             # Convert video path to hand and static video paths
             video_path_obj = Path(video_path)
-            hand_path = video_path_obj.parent.parent / "videos_hands" / video_path_obj.name
+            
+            if split_hands:
+                # Split hands mode: use left and right hand video paths
+                hand_left_path = video_path_obj.parent.parent / "videos_hands_gray_left" / video_path_obj.name
+                hand_right_path = video_path_obj.parent.parent / "videos_hands_gray_right" / video_path_obj.name
+                validation_hand_videos_left.append(Path(data_config["data_root"]) / hand_left_path)
+                validation_hand_videos_right.append(Path(data_config["data_root"]) / hand_right_path)
+                validation_hand_videos.append(None)  # Not used in split mode
+            else:
+                # Regular mode: use single hand video path
+                if data_config.get("use_gray_hand_videos", False):
+                    hand_path = video_path_obj.parent.parent / "videos_hands_gray" / video_path_obj.name
+                else:
+                    hand_path = video_path_obj.parent.parent / "videos_hands" / video_path_obj.name
+                validation_hand_videos.append(Path(data_config["data_root"]) / hand_path)
+                validation_hand_videos_left.append(None)  # Not used in regular mode
+                validation_hand_videos_right.append(None)  # Not used in regular mode
+            
             static_path = video_path_obj.parent.parent / "videos_static" / video_path_obj.name
-            validation_hand_videos.append(Path(data_config["data_root"]) / hand_path)
             validation_static_videos.append(Path(data_config["data_root"]) / static_path)
+            
+            # Add SMPL pos map path if needed
+            if use_smpl_pos_map:
+                smpl_pos_map_path = video_path_obj.parent.parent / "smpl_pos_map_egoallo" / video_path_obj.name
+                validation_smpl_pos_maps.append(Path(data_config["data_root"]) / smpl_pos_map_path)
+            else:
+                validation_smpl_pos_maps.append(None)
 
         # Run validation for each video
-        for validation_video, validation_prompt, validation_hand_video, validation_static_video in zip(
-            validation_videos, validation_prompts, validation_hand_videos, validation_static_videos
+        for validation_video, validation_prompt, validation_hand_video, validation_static_video, validation_hand_video_left, validation_hand_video_right, validation_smpl_pos_map in zip(
+            validation_videos, validation_prompts, validation_hand_videos, validation_static_videos, validation_hand_videos_left, validation_hand_videos_right, validation_smpl_pos_maps
         ):
             # Check required files based on pipeline type
             if pipeline_config["type"] in ["cogvideox_pose_adaln", "cogvideox_pose_adaln_perframe"]:
@@ -682,7 +864,19 @@ def run_validation(
                 required_files = [validation_video, validation_prompt, human_motions_path]
             else:
                 # For concat/adapter, check for hand/static videos
-                required_files = [validation_video, validation_prompt, validation_hand_video, validation_static_video]
+                required_files = [validation_video, validation_prompt, validation_static_video]
+                
+                # Add hand video files based on split_hands mode
+                if split_hands:
+                    # Split hands mode: check left and right hand videos
+                    if validation_hand_video_left is not None:
+                        required_files.append(validation_hand_video_left)
+                    if validation_hand_video_right is not None:
+                        required_files.append(validation_hand_video_right)
+                else:
+                    # Regular mode: check single hand video
+                    if validation_hand_video is not None:
+                        required_files.append(validation_hand_video)
             
             if not all(os.path.exists(f) for f in required_files):
                 print(f"Warning: Some validation files missing for {validation_video}. Skipping.")
@@ -704,6 +898,8 @@ def run_validation(
                     validation_hand_video_path=None,
                     validation_static_video_path=None,
                     validation_human_motions_path=human_motions_path,
+                    validation_hand_video_left_path=None,
+                    validation_hand_video_right_path=None,
                     step=step,
                     pipeline_type=config["pipeline"]["type"],
                 )
@@ -722,6 +918,8 @@ def run_validation(
                     validation_hand_video_path=validation_hand_video,
                     validation_static_video_path=validation_static_video,
                     validation_human_motions_path=None,
+                    validation_hand_video_left_path=validation_hand_video_left,
+                    validation_hand_video_right_path=validation_hand_video_right,
                     step=step,
                     pipeline_type=config["pipeline"]["type"],
                     validation_mode="static_to_video",
@@ -738,6 +936,8 @@ def run_validation(
                     validation_hand_video_path=None,  # Not used in I2V mode
                     validation_static_video_path=None,  # Not used in I2V mode
                     validation_human_motions_path=None,
+                    validation_hand_video_left_path=None,  # Not used in I2V mode
+                    validation_hand_video_right_path=None,  # Not used in I2V mode
                     step=step,
                     pipeline_type=config["pipeline"]["type"],
                     validation_mode="image_to_video",
@@ -755,6 +955,8 @@ def run_validation(
                     validation_hand_video_path=validation_hand_video,
                     validation_static_video_path=validation_static_video,
                     validation_human_motions_path=None,
+                    validation_hand_video_left_path=validation_hand_video_left,
+                    validation_hand_video_right_path=validation_hand_video_right,
                     step=step,
                     pipeline_type=config["pipeline"]["type"],
                     validation_mode="static_to_video",
@@ -772,6 +974,8 @@ def run_validation(
                     validation_hand_video_path=validation_hand_video,
                     validation_static_video_path=validation_static_video,
                     validation_human_motions_path=None,
+                    validation_hand_video_left_path=validation_hand_video_left,
+                    validation_hand_video_right_path=validation_hand_video_right,
                     step=step,
                     pipeline_type=config["pipeline"]["type"],
                     validation_mode="static_to_video",
@@ -789,6 +993,8 @@ def run_validation(
                     validation_hand_video_path=validation_hand_video,
                     validation_static_video_path=validation_static_video,
                     validation_human_motions_path=None,
+                    validation_hand_video_left_path=validation_hand_video_left,
+                    validation_hand_video_right_path=validation_hand_video_right,
                     step=step,
                     pipeline_type=config["pipeline"]["type"],
                     validation_mode="static_to_video",
@@ -806,6 +1012,48 @@ def run_validation(
                     validation_hand_video_path=validation_hand_video,
                     validation_static_video_path=validation_static_video,
                     validation_human_motions_path=None,
+                    validation_hand_video_left_path=validation_hand_video_left,
+                    validation_hand_video_right_path=validation_hand_video_right,
+                    step=step,
+                    pipeline_type=config["pipeline"]["type"],
+                    validation_mode="static_to_video",
+                )
+            elif config["pipeline"]["type"] == "cogvideox_fun_static_to_video_posmap_concat":
+                # For VideoX-Fun Pipeline with SMPL pos map concat, test static-to-video mode
+                print(f"🎬 Testing VideoX-Fun Pipeline with SMPL pos map concat for {validation_video.name}")
+                
+                log_validation_with_dataset(
+                    pipe=pipe,
+                    config=config,
+                    accelerator=accelerator,
+                    validation_video_path=validation_video,
+                    validation_prompt=prompt_text,
+                    validation_hand_video_path=None,  # No hand video for posmap_concat
+                    validation_static_video_path=validation_static_video,
+                    validation_human_motions_path=None,
+                    validation_hand_video_left_path=None,
+                    validation_hand_video_right_path=None,
+                    validation_smpl_pos_map_path=validation_smpl_pos_map,
+                    step=step,
+                    pipeline_type=config["pipeline"]["type"],
+                    validation_mode="static_to_video",
+                )
+            elif config["pipeline"]["type"] == "cogvideox_fun_static_to_video_posmap_adapter":
+                # For VideoX-Fun Pipeline with SMPL pos map adapter, test static-to-video mode
+                print(f"🎬 Testing VideoX-Fun Pipeline with SMPL pos map adapter for {validation_video.name}")
+                
+                log_validation_with_dataset(
+                    pipe=pipe,
+                    config=config,
+                    accelerator=accelerator,
+                    validation_video_path=validation_video,
+                    validation_prompt=prompt_text,
+                    validation_hand_video_path=None,  # No hand video for posmap_adapter
+                    validation_static_video_path=validation_static_video,
+                    validation_human_motions_path=None,
+                    validation_hand_video_left_path=None,
+                    validation_hand_video_right_path=None,
+                    validation_smpl_pos_map_path=validation_smpl_pos_map,
                     step=step,
                     pipeline_type=config["pipeline"]["type"],
                     validation_mode="static_to_video",
@@ -823,6 +1071,8 @@ def run_validation(
                     validation_hand_video_path=validation_hand_video,
                     validation_static_video_path=validation_static_video,
                     validation_human_motions_path=None,
+                    validation_hand_video_left_path=validation_hand_video_left,
+                    validation_hand_video_right_path=validation_hand_video_right,
                     step=step,
                     pipeline_type=config["pipeline"]["type"],
                     validation_mode="static_to_video",
@@ -838,6 +1088,8 @@ def run_validation(
                     validation_hand_video_path=validation_hand_video,
                     validation_static_video_path=validation_static_video,
                     validation_human_motions_path=None,
+                    validation_hand_video_left_path=validation_hand_video_left,
+                    validation_hand_video_right_path=validation_hand_video_right,
                     step=step,
                     pipeline_type=config["pipeline"]["type"],
                 )
@@ -882,9 +1134,7 @@ def setup_pipeline_from_config(config: Dict[str, Any]):
     """
     pipeline_config = config["pipeline"]
     pipeline_type = pipeline_config.get("type", "cogvideox_pose_concat")
-    concat_config = config.get("concat", {})
-    adapter_config = config.get("adapter", {})
-    adaln_config = config.get("adaln", {})
+    data_config = config.get("data", {})
     
     print(f"🔧 Setting up pipeline: {pipeline_type}")
     
@@ -1024,6 +1274,7 @@ def setup_pipeline_from_config(config: Dict[str, Any]):
             revision=model_config.get("revision"),
             variant=model_config.get("variant"),
             use_adapter=False,
+            split_hands=data_config.get("split_hands", False),
         )
         
     elif pipeline_type == "cogvideox_fun_static_to_video_pose_concat":
@@ -1041,6 +1292,53 @@ def setup_pipeline_from_config(config: Dict[str, Any]):
             variant=model_config.get("variant"),
             condition_channels=condition_channels,
             use_adapter=False,
+            split_hands=data_config.get("split_hands", False),
+        )
+        
+    elif pipeline_type == "cogvideox_fun_static_to_video_posmap_concat":
+        # Setup CogVideoX Fun Static-to-Video with SMPL Pos Map Concat Pipeline
+        print("🔧 Setting up CogVideoX Fun Static-to-Video with SMPL Pos Map Concat pipeline")
+        
+        # Determine condition_channels based on compress_smpl_pos_map_temporal
+        compress_smpl_pos_map_temporal = data_config.get("compress_smpl_pos_map_temporal", False)
+        condition_channels = 12 if compress_smpl_pos_map_temporal else 16
+        
+        print(f"   compress_smpl_pos_map_temporal: {compress_smpl_pos_map_temporal}")
+        print(f"   condition_channels: {condition_channels}")
+        
+        pipeline = CogVideoXFunStaticToVideoPipeline.from_pretrained(
+            pretrained_model_name_or_path=None,  # Always start from base model
+            base_model_name_or_path=model_path,
+            torch_dtype=load_dtype,
+            revision=model_config.get("revision"),
+            variant=model_config.get("variant"),
+            condition_channels=condition_channels,
+            use_adapter=False,
+            compress_smpl_pos_map_temporal=compress_smpl_pos_map_temporal,
+        )
+    
+    elif pipeline_type == "cogvideox_fun_static_to_video_posmap_adapter":
+        # Setup CogVideoX Fun Static-to-Video with SMPL Pos Map Adapter Pipeline
+        print("🔧 Setting up CogVideoX Fun Static-to-Video with SMPL Pos Map Adapter pipeline")
+        
+        # Get adapter parameters from pipeline config
+        in_dim_control_adapter = data_config.get("vae_scale_factor_temporal", 4) * 3  # Default: 12 for compressed pos map
+        adapter_version = pipeline_config.get("adapter_version", "v1")
+        adapter_control_type = pipeline_config.get("adapter_control_type", "smpl_pos_map")
+        
+        print(f"   in_dim_control_adapter: {in_dim_control_adapter}")
+        print(f"   adapter_control_type: {adapter_control_type}")
+        
+        pipeline = CogVideoXFunStaticToVideoPipeline.from_pretrained(
+            pretrained_model_name_or_path=None,  # Always start from base model
+            base_model_name_or_path=model_path,
+            torch_dtype=load_dtype,
+            revision=model_config.get("revision"),
+            variant=model_config.get("variant"),
+            condition_channels=0,  # No concat, using adapter instead
+            add_control_adapter=True,
+            in_dim_control_adapter=in_dim_control_adapter,
+            adapter_control_type=adapter_control_type,
         )
         
     elif pipeline_type == "cogvideox_fun_static_to_video_cross":
@@ -1111,6 +1409,7 @@ def setup_pipeline_from_config(config: Dict[str, Any]):
             condition_channels=condition_channels,
             use_adapter=use_adapter,
             adapter_version=adapter_version,
+            split_hands=data_config.get("split_hands", False),
         )
     elif pipeline_type == "cogvideox_fun_static_to_video_pose_cond_token":
         # Setup CogVideoX Fun Static-to-Video Pipeline with cond token
@@ -1449,6 +1748,16 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
                                 output_dir,
                                 transformer_lora_layers=transformer_lora_layers,
                             )
+                        elif pipeline_type == "cogvideox_fun_static_to_video_posmap_concat":
+                            CogVideoXFunStaticToVideoPipeline.save_lora_weights(
+                                output_dir,
+                                transformer_lora_layers=transformer_lora_layers,
+                            )
+                        elif pipeline_type == "cogvideox_fun_static_to_video_posmap_adapter":
+                            CogVideoXFunStaticToVideoPipeline.save_lora_weights(
+                                output_dir,
+                                transformer_lora_layers=transformer_lora_layers,
+                            )
                         elif pipeline_type == "cogvideox_fun_static_to_video_cross":
                             CogVideoXFunStaticToVideoCrossPipeline.save_lora_weights(
                                 output_dir,
@@ -1592,6 +1901,29 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
                 condition_channels=condition_channels,
                 subfolder="transformer",
             )
+        elif pipeline_type == "cogvideox_fun_static_to_video_posmap_concat":
+            # For VideoX-Fun static-to-video posmap concat, use concat transformer
+            from training.cogvideox_static_pose.cogvideox_fun_transformer_with_conditions import CogVideoXFunTransformer3DModelWithConcat
+            compress_smpl_pos_map_temporal = config["data"].get("compress_smpl_pos_map_temporal", False)
+            condition_channels = 12 if compress_smpl_pos_map_temporal else 16
+            transformer_ = CogVideoXFunTransformer3DModelWithConcat.from_pretrained(
+                pretrained_model_name_or_path=None,  # Always start from base model
+                base_model_name_or_path=config["model"]["base_model_name_or_path"],
+                condition_channels=condition_channels,
+                subfolder="transformer",
+            )
+        elif pipeline_type == "cogvideox_fun_static_to_video_posmap_adapter":
+            # For VideoX-Fun static-to-video posmap adapter, use concat transformer with control adapter
+            from training.cogvideox_static_pose.cogvideox_fun_transformer_with_conditions import CogVideoXFunTransformer3DModelWithConcat
+            in_dim_control_adapter = config["data"].get("vae_scale_factor_temporal", 4) * 3  # Default: 12
+            transformer_ = CogVideoXFunTransformer3DModelWithConcat.from_pretrained(
+                pretrained_model_name_or_path=None,  # Always start from base model
+                base_model_name_or_path=config["model"]["base_model_name_or_path"],
+                condition_channels=0,  # No concat
+                add_control_adapter=True,
+                in_dim_control_adapter=in_dim_control_adapter,
+                subfolder="transformer",
+            )
         elif pipeline_type == "cogvideox_fun_static_to_video_cross":
             # For VideoX-Fun CrossPipeline, use cross-attention transformer (no adapter)
             cross_attn_interval = config["pipeline"].get("cross_attn_interval", 2)
@@ -1722,6 +2054,10 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
             elif pipeline_type == "cogvideox_fun_static_to_video":
                 lora_state_dict = CogVideoXFunStaticToVideoPipeline.lora_state_dict(input_dir)
             elif pipeline_type == "cogvideox_fun_static_to_video_pose_concat":
+                lora_state_dict = CogVideoXFunStaticToVideoPipeline.lora_state_dict(input_dir)
+            elif pipeline_type == "cogvideox_fun_static_to_video_posmap_concat":
+                lora_state_dict = CogVideoXFunStaticToVideoPipeline.lora_state_dict(input_dir)
+            elif pipeline_type == "cogvideox_fun_static_to_video_posmap_adapter":
                 lora_state_dict = CogVideoXFunStaticToVideoPipeline.lora_state_dict(input_dir)
             elif pipeline_type == "cogvideox_fun_static_to_video_cross":
                 lora_state_dict = CogVideoXFunStaticToVideoCrossPipeline.lora_state_dict(input_dir)
@@ -1903,6 +2239,27 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
                     base_model_name_or_path=config["model"]["base_model_name_or_path"],
                     condition_channels=condition_channels
                 )
+            elif pipeline_type == "cogvideox_fun_static_to_video_posmap_concat":
+                # For VideoX-Fun static-to-video posmap concat, use concat transformer
+                from training.cogvideox_static_pose.cogvideox_fun_transformer_with_conditions import CogVideoXFunTransformer3DModelWithConcat
+                compress_smpl_pos_map_temporal = config["data"].get("compress_smpl_pos_map_temporal", False)
+                condition_channels = 12 if compress_smpl_pos_map_temporal else 16
+                load_model = CogVideoXFunTransformer3DModelWithConcat.from_pretrained(
+                    pretrained_model_name_or_path=os.path.join(input_dir, "transformer"),
+                    base_model_name_or_path=config["model"]["base_model_name_or_path"],
+                    condition_channels=condition_channels
+                )
+            elif pipeline_type == "cogvideox_fun_static_to_video_posmap_adapter":
+                # For VideoX-Fun static-to-video posmap adapter, use concat transformer with control adapter
+                from training.cogvideox_static_pose.cogvideox_fun_transformer_with_conditions import CogVideoXFunTransformer3DModelWithConcat
+                in_dim_control_adapter = config["data"].get("vae_scale_factor_temporal", 4) * 3  # Default: 12
+                load_model = CogVideoXFunTransformer3DModelWithConcat.from_pretrained(
+                    pretrained_model_name_or_path=os.path.join(input_dir, "transformer"),
+                    base_model_name_or_path=config["model"]["base_model_name_or_path"],
+                    condition_channels=0,  # No concat
+                    add_control_adapter=True,
+                    in_dim_control_adapter=in_dim_control_adapter
+                )
             elif pipeline_type == "cogvideox_fun_static_to_video_cross":
                 # For VideoX-Fun CrossPipeline, use cross-attention transformer (no adapter)
                 cross_attn_interval = config["pipeline"].get("cross_attn_interval", 2)
@@ -1998,6 +2355,152 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
             cast_training_params([transformer_])
 
     return save_model_hook, load_model_hook
+
+
+def _process_condition_video(condition_video, vae, vae_scaling_factor, device, weight_dtype):
+    """Process condition video: if it's raw video, encode it; if it's already latents, use as-is."""
+    if condition_video is None:
+        return None
+    
+    # Check if this is a raw video that needs encoding
+    if hasattr(condition_video, '_needs_encoding') and condition_video._needs_encoding:
+        logger.info(f"Encoding raw video to latents: {getattr(condition_video, '_source_path', 'unknown')}")
+        
+        # Move to device and dtype
+        condition_video = condition_video.to(device=device, dtype=weight_dtype)
+        
+        # Encode to latents
+        condition_video_permuted = condition_video.permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
+        latent_dist = vae.encode(condition_video_permuted).latent_dist
+        latents = latent_dist.sample() * vae_scaling_factor
+        
+        # Convert back to [B, F, C, H, W] format
+        latents = latents.permute(0, 2, 1, 3, 4)
+        return latents
+    else:
+        # Already latents, just ensure correct format and device
+        return condition_video.to(device=device, dtype=weight_dtype)
+
+
+def _process_condition_videos(hand_videos, static_videos, smpl_pos_map, vae, vae_scaling_factor, device, weight_dtype, load_tensors, split_hands=False):
+    """Process condition videos (hand, static, and smpl_pos_map) individually based on their type."""
+    
+    # Process hand videos
+    if hand_videos is not None:
+        hand_videos = hand_videos.to(device=device, dtype=vae.dtype)
+        # Determine if this is raw video or latents based on channel count
+        batch_size, channels, frames, height, width = hand_videos.shape
+        
+        if channels <= 6:  # Raw video (3 for regular, 6 for split hands)
+            # Raw video needs encoding
+            if split_hands and channels == 6:
+                # Split hands mode: hand_videos has doubled channels (left + right)
+                # Convert to [B, C, F, H, W] format first
+                batch_size_hand, channels, frames, height, width = hand_videos.shape
+                half_channels = channels // 2
+                
+                # Split into left and right hand videos
+                hand_left = hand_videos[:, :half_channels, :, :, :]  # [B, C/2, F, H, W]
+                hand_right = hand_videos[:, half_channels:, :, :, :]  # [B, C/2, F, H, W]
+                
+                # Encode left and right separately with batch processing
+                bs = 1  # Process one batch at a time
+                with torch.no_grad():
+                    new_hand_left = []
+                    for i in range(0, hand_left.shape[0], bs):
+                        lat = vae.encode(hand_left[i:i+bs])[0].sample() * vae_scaling_factor
+                        new_hand_left.append(lat)
+                    hand_left_latents = torch.cat(new_hand_left, dim=0)
+
+                    new_hand_right = []
+                    for i in range(0, hand_right.shape[0], bs):
+                        lat = vae.encode(hand_right[i:i+bs])[0].sample() * vae_scaling_factor
+                        new_hand_right.append(lat)
+                    hand_right_latents = torch.cat(new_hand_right, dim=0)
+                    
+                # Concatenate along channel dimension
+                hand_videos_latents = torch.cat([hand_left_latents, hand_right_latents], dim=1)
+                
+                # Convert back to [B, F, C, H, W] format and move back to device
+                hand_videos_latents = hand_videos_latents.permute(0, 2, 1, 3, 4)
+                hand_videos_latents = hand_videos_latents.to(device=device, dtype=weight_dtype)
+            else:
+                # Regular mode: encode normally
+                with torch.no_grad():
+                    hand_latent = vae.encode(hand_videos)[0]
+                hand_videos_latents = hand_latent.sample() * vae_scaling_factor
+                hand_videos_latents = hand_videos_latents.permute(0, 2, 1, 3, 4)  # [B, F, C, H, W]
+        else:
+            # Already latents (high channel count), need to sample from distribution
+            hand_videos = hand_videos.to(device=device, dtype=weight_dtype)
+            hand_latent_dist = DiagonalGaussianDistribution(hand_videos)
+            hand_videos_latents = hand_latent_dist.sample() * vae_scaling_factor
+            hand_videos_latents = hand_videos_latents.permute(0, 2, 1, 3, 4)  # [B, F, C, H, W]
+            hand_videos_latents = hand_videos_latents.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
+    else:
+        hand_videos_latents = None
+    
+    # Process static videos
+    if static_videos is not None:
+        static_videos = static_videos.to(device=device, dtype=vae.dtype)
+        # Determine if this is raw video or latents based on channel count
+        batch_size, channels, frames, height, width = static_videos.shape
+        
+        if channels <= 3:  # Raw video (3 for RGB)
+            # Raw video needs encoding
+            with torch.no_grad():
+                static_latent = vae.encode(static_videos)[0]
+            static_videos_latents = static_latent.sample() * vae_scaling_factor
+            static_videos_latents = static_videos_latents.permute(0, 2, 1, 3, 4)  # [B, F, C, H, W]
+        else:
+            # Already latents (high channel count), need to sample from distribution
+            static_videos = static_videos.to(device=device, dtype=weight_dtype)
+            static_latent_dist = DiagonalGaussianDistribution(static_videos)
+            static_videos_latents = static_latent_dist.sample() * vae_scaling_factor
+            static_videos_latents = static_videos_latents.permute(0, 2, 1, 3, 4)  # [B, F, C, H, W]
+            static_videos_latents = static_videos_latents.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
+    else:
+        static_videos_latents = None
+    
+    # Process SMPL pos map
+    if smpl_pos_map is not None:
+        # SMPL pos map is already compressed: [B, T', C*4, H/8, W/8] if compress_smpl_pos_map_temporal=True
+        # Or already latents: [B, C, F, H, W] if compress_smpl_pos_map_temporal=False
+        # Either way, just ensure correct format and device
+        smpl_pos_map = smpl_pos_map.to(device=device, dtype=weight_dtype)
+        
+        # Determine if this needs any permutation based on shape
+        if smpl_pos_map.ndim == 4:  # [F, C, H, W] -> add batch dim
+            smpl_pos_map = smpl_pos_map.unsqueeze(0)  # [1, F, C, H, W]
+                
+        smpl_pos_map_latents = smpl_pos_map.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
+    else:
+        smpl_pos_map_latents = None
+    
+    return hand_videos_latents, static_videos_latents, smpl_pos_map_latents
+
+
+def _apply_condition_flags(hand_videos, static_videos, conditions_config):
+    """Apply condition control flags (static_only, hand_only)."""
+    static_only = conditions_config.get("static_only", False)
+    hand_only = conditions_config.get("hand_only", False)
+    
+    if static_only:
+        print("🔧 Static-only mode: Zeroing out hand conditions")
+        hand_videos = None
+    elif hand_only:
+        print("🔧 Hand-only mode: Zeroing out static conditions")
+        static_videos = None
+    
+    return hand_videos, static_videos
+
+
+def _create_fun_mask_input(noisy_model_input, vae_scaling_factor=None):
+    """Create mask input for VideoX-Fun pipelines."""
+    if vae_scaling_factor is not None:
+        return torch.ones_like(noisy_model_input[:, :, :1]) * vae_scaling_factor
+    else:
+        return torch.ones_like(noisy_model_input[:, :, :1])
 
 
 def main():
@@ -2232,6 +2735,11 @@ def main():
         "frame_buckets": data_config.get("frame_buckets", 49),
         "image_to_video": data_config.get("image_to_video", False),
         "use_gray_hand_videos": data_config.get("use_gray_hand_videos", False),
+        "split_hands": data_config.get("split_hands", False),
+        "use_smpl_pos_map": data_config.get("use_smpl_pos_map", False),
+        "compress_smpl_pos_map_temporal": data_config.get("compress_smpl_pos_map_temporal", False),
+        "vae_scale_factor_temporal": data_config.get("vae_scale_factor_temporal", 4),
+        "vae_scale_factor_spatial": data_config.get("vae_scale_factor_spatial", 8),
     }
     
     # Choose dataset class based on pipeline type
@@ -2278,6 +2786,7 @@ def main():
             "images": torch.stack([item["image"] for item in batch]) if "image" in batch[0] and batch[0]["image"] is not None else None,
             "hand_videos": torch.stack([item["hand_videos"] for item in batch]) if "hand_videos" in batch[0] and batch[0]["hand_videos"] is not None else None,
             "static_videos": torch.stack([item["static_videos"] for item in batch]) if "static_videos" in batch[0] and batch[0]["static_videos"] is not None else None,
+            "smpl_pos_map": torch.stack([item["smpl_pos_map"] for item in batch]) if "smpl_pos_map" in batch[0] and batch[0]["smpl_pos_map"] is not None else None,
             "human_motions": torch.stack([item["human_motions"] for item in batch]) if "human_motions" in batch[0] and batch[0]["human_motions"] is not None else None,
         },
         num_workers=data_config.get("dataloader_num_workers", 0),
@@ -2662,7 +3171,16 @@ def main():
                 prompts = batch["prompts"]
                 hand_videos = batch.get("hand_videos")
                 static_videos = batch.get("static_videos")
+                smpl_pos_map = batch.get("smpl_pos_map")  # For SMPL pos map pipeline
                 human_motions = batch.get("human_motions")  # For AdaLN pipeline
+                
+                # Process condition videos once for all pipelines
+                load_tensors = training_config.get("custom_settings", {}).get("load_tensors", False)
+                split_hands = data_config.get("split_hands", False)
+                hand_videos_latents, static_videos_latents, smpl_pos_map_latents = _process_condition_videos(
+                    hand_videos, static_videos, smpl_pos_map, vae, VAE_SCALING_FACTOR, 
+                    accelerator.device, weight_dtype, load_tensors, split_hands
+                )
 
                 # Encode videos
                 if not training_config.get("custom_settings", {}).get("load_tensors", False):
@@ -2677,30 +3195,15 @@ def main():
                 videos = videos.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
                 model_input = videos
 
-                # Encode condition videos if provided
-                if hand_videos is not None and static_videos is not None:
-                    if not training_config.get("custom_settings", {}).get("load_tensors", False):
-                        # hand_videos = hand_videos.permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
-                        # static_videos = static_videos.permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
-                        # hand_latent_dist = vae.encode(hand_videos).latent_dist
-                        # static_latent_dist = vae.encode(static_videos).latent_dist
-                        combined_videos = torch.cat([hand_videos, static_videos], dim=0)
-                        combined_latent_dist = vae.encode(combined_videos).latent_dist
-                        hand_latent_dist, static_latent_dist = combined_latent_dist.chunk(2, dim=0)
-                    else:
-                        hand_latent_dist = DiagonalGaussianDistribution(hand_videos)
-                        static_latent_dist = DiagonalGaussianDistribution(static_videos)
-
-                    hand_videos = hand_latent_dist.sample() * VAE_SCALING_FACTOR
-                    hand_videos = hand_videos.permute(0, 2, 1, 3, 4)  # [B, F, C, H, W]
-                    hand_videos = hand_videos.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
-                    
-                    static_videos = static_latent_dist.sample() * VAE_SCALING_FACTOR
-                    static_videos = static_videos.permute(0, 2, 1, 3, 4)  # [B, F, C, H, W]
-                    static_videos = static_videos.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
+                # Use already processed condition videos from _process_condition_videos
+                if hand_videos_latents is not None:
+                    hand_videos = hand_videos_latents.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
                 else:
-                    # If no condition videos provided, set to None
                     hand_videos = None
+                    
+                if static_videos_latents is not None:
+                    static_videos = static_videos_latents.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
+                else:
                     static_videos = None
 
                 # Encode prompts
@@ -2794,43 +3297,13 @@ def main():
                     transformer_input = torch.cat([noisy_model_input, condition_latents], dim=2)
                 
                 elif pipeline_config["type"] == "cogvideox_pose_adapter":
-                    # Check condition control flags
+                    # Apply condition control flags
                     conditions_config = config.get("conditions", {})
-                    static_only = conditions_config.get("static_only", False)
-                    hand_only = conditions_config.get("hand_only", False)
-                    
-                    # Zero out conditions based on flags
-                    if static_only:
-                        print("🔧 Static-only mode: Zeroing out hand conditions")
-                        hand_videos = None
-                    elif hand_only:
-                        print("🔧 Hand-only mode: Zeroing out static conditions")
-                        static_videos = None
+                    hand_videos, static_videos = _apply_condition_flags(hand_videos, static_videos, conditions_config)
                     
                     # For adapter pipeline, use residual conditioning
                     if hand_videos is not None and static_videos is not None:
-                        # Handle condition videos based on load_tensors setting
-                        if not training_config.get("custom_settings", {}).get("load_tensors", False):
-                            # Encode condition videos to latents
-                            hand_videos_permuted = hand_videos.permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
-                            static_videos_permuted = static_videos.permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
-                            
-                            # Encode to latents
-                            hand_latent_dist = vae.encode(hand_videos_permuted).latent_dist
-                            static_latent_dist = vae.encode(static_videos_permuted).latent_dist
-                            
-                            hand_videos_latents = hand_latent_dist.sample() * VAE_SCALING_FACTOR
-                            static_videos_latents = static_latent_dist.sample() * VAE_SCALING_FACTOR
-                            
-                            # Convert back to [B, F, C, H, W] format
-                            hand_videos_latents = hand_videos_latents.permute(0, 2, 1, 3, 4)
-                            static_videos_latents = static_videos_latents.permute(0, 2, 1, 3, 4)
-                        else:
-                            # Already latents, just ensure correct format
-                            hand_videos_latents = hand_videos
-                            static_videos_latents = static_videos
-                        
-                        # For adapter pipeline, we pass the noisy latents directly
+                        # Use preprocessed condition latents
                         transformer_input = noisy_model_input
                         
                         # Store condition latents for adapter
@@ -2922,88 +3395,75 @@ def main():
                     
                 elif pipeline_config["type"] == "cogvideox_fun_static_to_video":
                     # For VideoX-Fun static-to-video pipeline, use static video as condition
-                    # Training loop: static_videos are already in latent space
-                    static_videos_latents = static_videos.to(device=accelerator.device, dtype=weight_dtype)
-                    static_videos_latents = static_videos_latents
-                    hand_video_latents = None
-
-                    # VideoX-Fun always uses mask (zeros for static video conditioning)
-                    mask_input = torch.ones_like(noisy_model_input[:, :, :1])
+                    # Use preprocessed condition latents
+                    mask_input = _create_fun_mask_input(noisy_model_input)
                     transformer_input = torch.cat([noisy_model_input, mask_input, static_videos_latents], dim=2)
                     condition_latents = None
                     
                 elif pipeline_config["type"] == "cogvideox_fun_static_to_video_pose_concat":
                     # For VideoX-Fun static-to-video pose concat pipeline, use both static and hand videos as conditions
-                    # Training loop: static_videos and hand_videos are already in latent space
-                    static_videos_latents = static_videos.to(device=accelerator.device, dtype=weight_dtype)
-                    static_videos_latents = static_videos_latents
-                    hand_video_latents = hand_videos.to(device=accelerator.device, dtype=weight_dtype)
-                    hand_video_latents = hand_video_latents
-
-                    # VideoX-Fun always uses mask (zeros for static video conditioning)
-                    mask_input = torch.ones_like(noisy_model_input[:, :, :1]) * VAE_SCALING_FACTOR
-                    transformer_input = torch.cat([noisy_model_input, mask_input, static_videos_latents, hand_video_latents], dim=2)
+                    # Use preprocessed condition latents
+                    mask_input = _create_fun_mask_input(noisy_model_input, VAE_SCALING_FACTOR)
+                    transformer_input = torch.cat([noisy_model_input, mask_input, static_videos_latents, hand_videos_latents], dim=2)
+                    condition_latents = None
+                    
+                elif pipeline_config["type"] == "cogvideox_fun_static_to_video_posmap_concat":
+                    # For VideoX-Fun static-to-video posmap concat pipeline, use static and SMPL pos map as conditions
+                    # Use preprocessed condition latents
+                    mask_input = _create_fun_mask_input(noisy_model_input, VAE_SCALING_FACTOR)
+                    transformer_input = torch.cat([noisy_model_input, mask_input, static_videos_latents, smpl_pos_map_latents], dim=2)
+                    condition_latents = None
+                
+                elif pipeline_config["type"] == "cogvideox_fun_static_to_video_posmap_adapter":
+                    # For VideoX-Fun static-to-video posmap adapter pipeline, use static video as concat and SMPL pos map as adapter control
+                    # Adapter control type is specified in pipeline config (default: "smpl_pos_map")
+                    # The transformer will automatically select the control based on adapter_control_type
+                    # smpl_pos_map_latents needs to be in [B, C, F, H, W] format for adapter
+                    if smpl_pos_map_latents is not None:
+                        adapter_control = smpl_pos_map_latents.permute(0, 2, 1, 3, 4)  # [B, F, C, H, W] -> [B, C, F, H, W]
+                    else:
+                        adapter_control = None
+                    
+                    # Use preprocessed condition latents
+                    mask_input = _create_fun_mask_input(noisy_model_input, VAE_SCALING_FACTOR)
+                    transformer_input = torch.cat([noisy_model_input, mask_input, static_videos_latents], dim=2)
                     condition_latents = None
                     
                 elif pipeline_config["type"] == "cogvideox_fun_static_to_video_cross":
                     # For VideoX-Fun CrossPipeline, use static_videos as ref_latents and hand_videos as control_latents
-                    # Training loop: static_videos and hand_videos are already in latent space
-                    static_videos_latents = static_videos.to(device=accelerator.device, dtype=weight_dtype)
-                    static_videos_latents = static_videos_latents
-                    hand_video_latents = hand_videos.to(device=accelerator.device, dtype=weight_dtype)
-                    hand_video_latents = hand_video_latents
-
-                    # VideoX-Fun always uses mask (zeros for static video conditioning)
-                    mask_input = torch.ones_like(noisy_model_input[:, :, :1]) * VAE_SCALING_FACTOR
-                    transformer_input = torch.cat([noisy_model_input, mask_input, static_videos_latents, hand_video_latents], dim=2)
+                    # Use preprocessed condition latents
+                    mask_input = _create_fun_mask_input(noisy_model_input, VAE_SCALING_FACTOR)
+                    transformer_input = torch.cat([noisy_model_input, mask_input, static_videos_latents, hand_videos_latents], dim=2)
                     
                     # For CrossPipeline, prepare ref_latents and control_latents for cross-attention
                     ref_latents = static_videos_latents  # static_videos as ref_latents
-                    control_latents = hand_video_latents  # hand_videos as control_latents
+                    control_latents = hand_videos_latents  # hand_videos as control_latents
                     condition_latents = None
                     
                 elif pipeline_config["type"] == "cogvideox_fun_static_to_video_cross_pose_adapter":
                     # For VideoX-Fun CrossPipeline with pose adapter, use static_videos as ref_latents and hand_videos as control_latents
-                    # Training loop: static_videos and hand_videos are already in latent space
-                    static_videos_latents = static_videos.to(device=accelerator.device, dtype=weight_dtype)
-                    static_videos_latents = static_videos_latents
-                    hand_video_latents = hand_videos.to(device=accelerator.device, dtype=weight_dtype)
-                    hand_video_latents = hand_video_latents
-
-                    # VideoX-Fun always uses mask (zeros for static video conditioning)
-                    mask_input = torch.ones_like(noisy_model_input[:, :, :1]) * VAE_SCALING_FACTOR
-                    transformer_input = torch.cat([noisy_model_input, mask_input, static_videos_latents, hand_video_latents], dim=2)
+                    # Use preprocessed condition latents
+                    mask_input = _create_fun_mask_input(noisy_model_input, VAE_SCALING_FACTOR)
+                    transformer_input = torch.cat([noisy_model_input, mask_input, static_videos_latents, hand_videos_latents], dim=2)
                     
                     # For CrossPipeline, prepare ref_latents and control_latents for cross-attention
                     ref_latents = static_videos_latents  # static_videos as ref_latents
-                    control_latents = hand_video_latents  # hand_videos as control_latents
+                    control_latents = hand_videos_latents  # hand_videos as control_latents
                     condition_latents = None
                     
                 elif pipeline_config["type"] == "cogvideox_fun_static_to_video_pose_adapter":
                     # For VideoX-Fun Pipeline with pose adapter, use static_videos and hand_videos as conditions
-                    # Training loop: static_videos and hand_videos are already in latent space
-                    static_videos_latents = static_videos.to(device=accelerator.device, dtype=weight_dtype)
-                    static_videos_latents = static_videos_latents
-                    hand_video_latents = hand_videos.to(device=accelerator.device, dtype=weight_dtype)
-                    hand_video_latents = hand_video_latents
-
-                    # VideoX-Fun always uses mask (zeros for static video conditioning)
-                    mask_input = torch.ones_like(noisy_model_input[:, :, :1]) * VAE_SCALING_FACTOR
+                    # Use preprocessed condition latents
+                    mask_input = _create_fun_mask_input(noisy_model_input, VAE_SCALING_FACTOR)
                     transformer_input = torch.cat([noisy_model_input, mask_input, static_videos_latents], dim=2)
-                    control_latents = hand_video_latents
+                    control_latents = hand_videos_latents
                     condition_latents = None
                 elif pipeline_config["type"] == "cogvideox_fun_static_to_video_pose_cond_token":
                     # For VideoX-Fun Pipeline with cond token, use static_videos and hand_videos as conditions
-                    # Training loop: static_videos and hand_videos are already in latent space
-                    static_videos_latents = static_videos.to(device=accelerator.device, dtype=weight_dtype)
-                    static_videos_latents = static_videos_latents * VAE_SCALING_FACTOR
-                    hand_video_latents = hand_videos.to(device=accelerator.device, dtype=weight_dtype)
-                    hand_video_latents = hand_video_latents * VAE_SCALING_FACTOR
-
-                    # VideoX-Fun always uses mask (zeros for static video conditioning)
-                    mask_input = torch.ones_like(noisy_model_input[:, :, :1]) * VAE_SCALING_FACTOR
+                    # Use preprocessed condition latents
+                    mask_input = _create_fun_mask_input(noisy_model_input, VAE_SCALING_FACTOR)
                     transformer_input = torch.cat([noisy_model_input, mask_input, static_videos_latents], dim=2)
-                    control_latents = hand_video_latents
+                    control_latents = hand_videos_latents
                     condition_latents = None
 
                 # Predict the noise residual
@@ -3084,13 +3544,23 @@ def main():
                         control_latents=hand_video_latents,
                         ref_latents=static_videos_latents,
                     )[0]
-                elif pipeline_config["type"] in ["cogvideox_fun_static_to_video", "cogvideox_fun_static_to_video_pose_concat"]:
+                elif pipeline_config["type"] in ["cogvideox_fun_static_to_video", "cogvideox_fun_static_to_video_pose_concat", "cogvideox_fun_static_to_video_posmap_concat"]:
                     # For VideoX-Fun static-to-video pipelines, use standard transformer forward (conditions already concatenated)
                     model_output = transformer(
                         hidden_states=transformer_input,
                         encoder_hidden_states=prompt_embeds,
                         timestep=timesteps,
                         image_rotary_emb=image_rotary_emb,
+                        return_dict=False,
+                    )[0]
+                elif pipeline_config["type"] == "cogvideox_fun_static_to_video_posmap_adapter":
+                    # For VideoX-Fun static-to-video posmap adapter pipeline, pass adapter_control
+                    model_output = transformer(
+                        hidden_states=transformer_input,
+                        encoder_hidden_states=prompt_embeds,
+                        timestep=timesteps,
+                        image_rotary_emb=image_rotary_emb,
+                        adapter_control=adapter_control,
                         return_dict=False,
                     )[0]
                 elif pipeline_config["type"] == "cogvideox_fun_static_to_video_cross":
@@ -3348,6 +3818,33 @@ def main():
                 vae=vae,
                 transformer=transformer,
                 scheduler=scheduler,
+            )
+        elif pipeline_config["type"] == "cogvideox_fun_static_to_video_posmap_concat":
+            # Get compress_smpl_pos_map_temporal from data config
+            compress_smpl_pos_map_temporal = data_config.get("compress_smpl_pos_map_temporal", False)
+            
+            pipeline = CogVideoXFunStaticToVideoPipeline(
+                tokenizer=tokenizer,
+                text_encoder=text_encoder,
+                vae=vae,
+                transformer=transformer,
+                scheduler=scheduler,
+                compress_smpl_pos_map_temporal=compress_smpl_pos_map_temporal,
+            )
+        elif pipeline_config["type"] == "cogvideox_fun_static_to_video_posmap_adapter":
+            # Get adapter parameters from data/pipeline config
+            in_dim_control_adapter = data_config.get("vae_scale_factor_temporal", 4) * 3  # Default: 12
+            adapter_control_type = pipeline_config.get("adapter_control_type", "smpl_pos_map")
+            
+            pipeline = CogVideoXFunStaticToVideoPipeline(
+                tokenizer=tokenizer,
+                text_encoder=text_encoder,
+                vae=vae,
+                transformer=transformer,
+                scheduler=scheduler,
+                add_control_adapter=True,
+                in_dim_control_adapter=in_dim_control_adapter,
+                adapter_control_type=adapter_control_type,
             )
         elif pipeline_config["type"] == "cogvideox_fun_static_to_video_cross":
             # Get cross-attention parameters from pipeline config

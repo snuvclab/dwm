@@ -37,6 +37,62 @@ from diffusers.models.transformers.cogvideox_transformer_3d import CogVideoXBloc
 
 logger = logging.get_logger(__name__)
 
+class SimpleAdapter(nn.Module):
+    """
+    Simple adapter for control signals based on Wan camera adapter.
+    Uses PixelUnshuffle and Conv2d to reduce spatial dimensions.
+    """
+    def __init__(self, in_dim, out_dim, kernel_size, stride, num_residual_blocks=1):
+        super(SimpleAdapter, self).__init__()
+        
+        # Pixel Unshuffle: reduce spatial dimensions by a factor of 8
+        self.pixel_unshuffle = nn.PixelUnshuffle(downscale_factor=8)
+        
+        # Convolution: reduce spatial dimensions by a factor of 2 (without overlap)
+        self.conv = nn.Conv2d(in_dim * 64, out_dim, kernel_size=kernel_size, stride=stride, padding=0)
+        
+        # Residual blocks for feature extraction
+        self.residual_blocks = nn.Sequential(
+            *[ResidualBlock(out_dim) for _ in range(num_residual_blocks)]
+        )
+
+    def forward(self, x):
+        # Reshape to merge the frame dimension into batch
+        bs, c, f, h, w = x.size()
+        x = x.permute(0, 2, 1, 3, 4).contiguous().view(bs * f, c, h, w)
+        
+        # Pixel Unshuffle operation
+        x_unshuffled = self.pixel_unshuffle(x)
+        
+        # Convolution operation
+        x_conv = self.conv(x_unshuffled)
+        
+        # Feature extraction with residual blocks
+        out = self.residual_blocks(x_conv)
+        
+        # Reshape to restore original bf dimension
+        out = out.view(bs, f, out.size(1), out.size(2), out.size(3))
+        
+        # Permute dimensions to reorder (if needed), e.g., swap channels and feature frames
+        out = out.permute(0, 2, 1, 3, 4)
+
+        return out
+
+class ResidualBlock(nn.Module):
+    """Residual block for SimpleAdapter."""
+    def __init__(self, dim):
+        super(ResidualBlock, self).__init__()
+        self.conv1 = nn.Conv2d(dim, dim, kernel_size=3, padding=1)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(dim, dim, kernel_size=3, padding=1)
+
+    def forward(self, x):
+        residual = x
+        out = self.relu(self.conv1(x))
+        out = self.conv2(out)
+        out += residual
+        return out
+
 def reshape_tensor(tensor, num_heads):
     """Reshape tensor for multi-head attention."""
     batch_size, seq_len, dim = tensor.shape
@@ -1128,14 +1184,17 @@ class CogVideoXFunTransformer3DModelWithConcat(CogVideoXFunTransformer3DModel):
     1. Supports `add_noise_in_inpaint_model` parameter (VideoX-Fun specific)
     2. Handles `inpaint_latents` and `control_latents` in forward pass
     3. Extends input channels to accommodate condition channels
+    4. Optional control adapter for additional control signals
     """
     
-    def __init__(self, *args, condition_channels: int = 0, **kwargs):
+    def __init__(self, *args, condition_channels: int = 0, add_control_adapter: bool = False, 
+                 in_dim_control_adapter: int = 12, **kwargs):
         # Store original in_channels before modification
         original_in_channels = kwargs.get("in_channels", 16)
         self.original_in_channels = original_in_channels
         
         self.add_noise_in_inpaint_model = kwargs.pop("add_noise_in_inpaint_model", False)
+        self.add_control_adapter = add_control_adapter
         
         super().__init__(*args, **kwargs)
         
@@ -1145,6 +1204,26 @@ class CogVideoXFunTransformer3DModelWithConcat(CogVideoXFunTransformer3DModel):
             self.condition_channels = condition_channels
         else:
             self.condition_channels = 0
+        
+        # Setup control adapter if specified
+        if add_control_adapter:
+            # Get patch size from config
+            patch_size = self.config.patch_size if hasattr(self.config, 'patch_size') else 2
+            # Get hidden dimension
+            num_attention_heads = self.config.num_attention_heads if hasattr(self.config, 'num_attention_heads') else 30
+            attention_head_dim = self.config.attention_head_dim if hasattr(self.config, 'attention_head_dim') else 64
+            out_dim = num_attention_heads * attention_head_dim
+            
+            self.control_adapter = SimpleAdapter(
+                in_dim=in_dim_control_adapter,
+                out_dim=out_dim,
+                kernel_size=(patch_size, patch_size),
+                stride=(patch_size, patch_size),
+                num_residual_blocks=1
+            )
+            print(f"✅ Added control adapter: {in_dim_control_adapter} -> {out_dim} channels")
+        else:
+            self.control_adapter = None
     
     def _setup_condition_channels(self, condition_channels: int, original_proj: Optional[nn.Conv2d] = None):
         """Extend the transformer to handle conditional input channels.
@@ -1196,6 +1275,8 @@ class CogVideoXFunTransformer3DModelWithConcat(CogVideoXFunTransformer3DModel):
         base_model_name_or_path="alibaba-pai/CogVideoX-Fun-V1.1-5b-InP",
         subfolder="transformer",
         condition_channels: Optional[int] = None,
+        add_control_adapter: bool = False,
+        in_dim_control_adapter: int = 12,
         **kwargs
     ):
         """
@@ -1221,7 +1302,11 @@ class CogVideoXFunTransformer3DModelWithConcat(CogVideoXFunTransformer3DModel):
                 # Use base config
                 if condition_channels is None:
                     condition_channels = 32  # default
-                model = cls(condition_channels=condition_channels)
+                model = cls(
+                    condition_channels=condition_channels,
+                    add_control_adapter=add_control_adapter,
+                    in_dim_control_adapter=in_dim_control_adapter
+                )
 
             # 2) Load checkpoint state_dict directly
             # Try to find all safetensors files first
@@ -1279,7 +1364,12 @@ class CogVideoXFunTransformer3DModelWithConcat(CogVideoXFunTransformer3DModel):
                 condition_channels = getattr(base_model.config, "condition_channels", 32)
 
             # Create extended model
-            model = cls(**base_model.config, condition_channels=0)
+            model = cls(
+                **base_model.config, 
+                condition_channels=0,
+                add_control_adapter=add_control_adapter,
+                in_dim_control_adapter=in_dim_control_adapter
+            )
 
             # Load base weights into extended model
             missing, unexpected = model.load_state_dict(base_model.state_dict(), strict=False)
@@ -1317,6 +1407,7 @@ class CogVideoXFunTransformer3DModelWithConcat(CogVideoXFunTransformer3DModel):
         timestep_cond: Optional[torch.Tensor] = None,
         inpaint_latents: Optional[torch.Tensor] = None,
         control_latents: Optional[torch.Tensor] = None,
+        adapter_control: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         return_dict: bool = True,
         **kwargs
@@ -1331,6 +1422,7 @@ class CogVideoXFunTransformer3DModelWithConcat(CogVideoXFunTransformer3DModel):
             timestep_cond: Timestep condition tensor
             inpaint_latents: Inpainting latents (VideoX-Fun specific)
             control_latents: Control latents (VideoX-Fun specific)
+            adapter_control: Additional control signal for adapter (e.g., camera params) [B, C, F, H, W]
             image_rotary_emb: Rotary embeddings
             return_dict: Whether to return a dict
             **kwargs: Additional arguments
@@ -1346,18 +1438,124 @@ class CogVideoXFunTransformer3DModelWithConcat(CogVideoXFunTransformer3DModel):
                     f"but got {actual_channels} channels in hidden_states"
                 )
         
-        # Use parent class forward method which handles VideoX-Fun specific logic
-        return super().forward(
-            hidden_states=hidden_states,
-            encoder_hidden_states=encoder_hidden_states,
-            timestep=timestep,
-            timestep_cond=timestep_cond,
-            inpaint_latents=inpaint_latents,
-            control_latents=control_latents,
-            image_rotary_emb=image_rotary_emb,
-            return_dict=return_dict,
-            **kwargs
-        )
+        # If control adapter is enabled and adapter_control is provided, process it
+        if self.control_adapter is not None and adapter_control is not None:
+            # Store for later use after patch embedding
+            batch_size, num_frames, channels, height, width = hidden_states.shape
+            
+            # Time embedding
+            timesteps = timestep
+            t_emb = self.time_proj(timesteps)
+            t_emb = t_emb.to(dtype=hidden_states.dtype)
+            emb = self.time_embedding(t_emb, timestep_cond)
+            
+            # Handle single frame case (VideoX-Fun specific)
+            if num_frames == 1 and self.patch_size_t is not None:
+                hidden_states = torch.cat([hidden_states, torch.zeros_like(hidden_states)], dim=1)
+                if inpaint_latents is not None:
+                    inpaint_latents = torch.concat([inpaint_latents, torch.zeros_like(inpaint_latents)], dim=1)
+                if control_latents is not None:
+                    control_latents = torch.concat([control_latents, torch.zeros_like(control_latents)], dim=1)
+                local_num_frames = num_frames + 1
+            else:
+                local_num_frames = num_frames
+            
+            # Patch embedding with VideoX-Fun specific concatenation
+            if inpaint_latents is not None:
+                hidden_states = torch.concat([hidden_states, inpaint_latents], 2)
+            if control_latents is not None:
+                hidden_states = torch.concat([hidden_states, control_latents], 2)
+            
+            hidden_states = self.patch_embed(encoder_hidden_states, hidden_states)
+            hidden_states = self.embedding_dropout(hidden_states)
+            
+            # Apply control adapter
+            adapter_features = self.control_adapter(adapter_control)  # [B, out_dim, F, H', W']
+            # Flatten adapter features: [B, out_dim, F, H', W'] -> [B, F*H'*W', out_dim]
+            adapter_features = adapter_features.flatten(2).transpose(1, 2)
+            
+            text_seq_length = encoder_hidden_states.shape[1]
+            encoder_hidden_states = hidden_states[:, :text_seq_length]
+            hidden_states = hidden_states[:, text_seq_length:]
+            
+            # Add adapter features to hidden states
+            if adapter_features.shape[1] == hidden_states.shape[1]:
+                hidden_states = hidden_states + adapter_features
+            else:
+                print(f"⚠️ Adapter features shape mismatch: {adapter_features.shape} vs {hidden_states.shape}")
+            
+            # Transformer blocks
+            for i, block in enumerate(self.transformer_blocks):
+                if torch.is_grad_enabled() and self.gradient_checkpointing:
+                    def create_custom_forward(module):
+                        def custom_forward(*inputs):
+                            return module(*inputs)
+                        return custom_forward
+                    
+                    ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
+                    hidden_states, encoder_hidden_states = torch.utils.checkpoint.checkpoint(
+                        create_custom_forward(block),
+                        hidden_states,
+                        encoder_hidden_states,
+                        emb,
+                        image_rotary_emb,
+                        **ckpt_kwargs,
+                    )
+                else:
+                    hidden_states, encoder_hidden_states = block(
+                        hidden_states=hidden_states,
+                        encoder_hidden_states=encoder_hidden_states,
+                        temb=emb,
+                        image_rotary_emb=image_rotary_emb,
+                    )
+            
+            # Final normalization (VideoX-Fun specific)
+            if not self.config.use_rotary_positional_embeddings:
+                # CogVideoX-2B
+                hidden_states = self.norm_final(hidden_states)
+            else:
+                # CogVideoX-5B
+                hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+                hidden_states = self.norm_final(hidden_states)
+                hidden_states = hidden_states[:, text_seq_length:]
+            
+            # Final block
+            hidden_states = self.norm_out(hidden_states, temb=emb)
+            hidden_states = self.proj_out(hidden_states)
+            
+            # Unpatchify
+            p = self.config.patch_size
+            p_t = self.config.patch_size_t
+            
+            if p_t is None:
+                output = hidden_states.reshape(batch_size, local_num_frames, height // p, width // p, -1, p, p)
+                output = output.permute(0, 1, 4, 2, 5, 3, 6).flatten(5, 6).flatten(3, 4)
+            else:
+                output = hidden_states.reshape(
+                    batch_size, (local_num_frames + p_t - 1) // p_t, height // p, width // p, -1, p_t, p, p
+                )
+                output = output.permute(0, 1, 5, 4, 2, 6, 3, 7).flatten(6, 7).flatten(4, 5).flatten(1, 2)
+            
+            # Handle single frame case (VideoX-Fun specific)
+            if num_frames == 1:
+                output = output[:, :num_frames, :]
+            
+            if not return_dict:
+                return (output,)
+            return Transformer2DModelOutput(sample=output)
+        else:
+            # No control adapter, use parent class forward method
+            return super().forward(
+                hidden_states=hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                timestep=timestep,
+                timestep_cond=timestep_cond,
+                inpaint_latents=inpaint_latents,
+                control_latents=control_latents,
+                image_rotary_emb=image_rotary_emb,
+                return_dict=return_dict,
+                **kwargs
+            )
 
 class CogVideoXPatchEmbedWithAdapter(CogVideoXPatchEmbed):
     """

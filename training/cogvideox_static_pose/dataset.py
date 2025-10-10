@@ -258,7 +258,16 @@ class VideoDataset(Dataset):
                 video_reader = decord.VideoReader(uri=path.as_posix())
                 video_num_frames = len(video_reader)
 
-                indices = list(range(0, video_num_frames, video_num_frames // self.max_num_frames))
+                # Warn if video doesn't have the expected number of frames
+                if video_num_frames != self.max_num_frames:
+                    logger.warning(
+                        f"Video has {video_num_frames} frames, expected {self.max_num_frames} frames. "
+                        f"Path: {path}"
+                    )
+
+                # Calculate step, ensuring it's at least 1 to avoid "range() arg 3 must not be zero" error
+                step = max(1, video_num_frames // self.max_num_frames)
+                indices = list(range(0, video_num_frames, step))
                 frames = video_reader.get_batch(indices)
                 frames = frames[: self.max_num_frames].float()
                 frames = frames.permute(0, 3, 1, 2).contiguous()
@@ -355,6 +364,11 @@ class VideoDatasetWithConditions(VideoDataset):
         random_flip: Optional[float] = None,
         image_to_video: bool = False,
         use_gray_hand_videos: bool = False,
+        split_hands: bool = False,
+        use_smpl_pos_map: bool = False,
+        compress_smpl_pos_map_temporal: bool = False,
+        vae_scale_factor_temporal: int = 4,
+        vae_scale_factor_spatial: int = 8,
     ) -> None:
         # Initialize parent class with main video column
         super().__init__(
@@ -372,34 +386,74 @@ class VideoDatasetWithConditions(VideoDataset):
             image_to_video=image_to_video,
         )
         
-        # Store the use_gray_hand_videos flag
+        # Store the flags
         self.use_gray_hand_videos = use_gray_hand_videos
+        self.split_hands = split_hands
+        self.use_smpl_pos_map = use_smpl_pos_map
+        self.compress_smpl_pos_map_temporal = compress_smpl_pos_map_temporal
+        self.vae_scale_factor_temporal = vae_scale_factor_temporal
+        self.vae_scale_factor_spatial = vae_scale_factor_spatial
         
         # Automatically derive hand video and static video paths from main video paths
-        if self.use_gray_hand_videos:
-            self.hand_video_paths = self._derive_condition_video_paths("videos_hands_gray")
+        if self.split_hands:
+            # Split hands mode: load left and right hand videos separately
+            self.hand_video_left_paths = self._derive_condition_video_paths("videos_hands_gray_left")
+            self.hand_video_right_paths = self._derive_condition_video_paths("videos_hands_gray_right")
+            # For backward compatibility, we'll combine them in __getitem__
+            self.hand_video_paths = None  # Not used in split mode
         else:
-            self.hand_video_paths = self._derive_condition_video_paths("videos_hands")
+            # Regular mode: load combined hand videos
+            if self.use_gray_hand_videos:
+                self.hand_video_paths = self._derive_condition_video_paths("videos_hands_gray")
+            else:
+                self.hand_video_paths = self._derive_condition_video_paths("videos_hands")
+            self.hand_video_left_paths = None
+            self.hand_video_right_paths = None
+        
         self.static_video_paths = self._derive_condition_video_paths("videos_static")
+        
+        # Derive SMPL pos map paths if enabled
+        if self.use_smpl_pos_map:
+            self.smpl_pos_map_paths = self._derive_condition_video_paths("smpl_pos_map_egoallo")
+        else:
+            self.smpl_pos_map_paths = None
+        
         # Validate that all condition videos exist
         if not self.load_tensors:
-            if any(not path.is_file() for path in self.hand_video_paths):
-                missing_hand_videos = [path for path in self.hand_video_paths if not path.is_file()]
-                raise ValueError(
-                    f"Some hand video files are missing. First few missing files: {missing_hand_videos[:5]}"
-                )
-            
-            # if any(not path.is_file() for path in self.hand_video_gray_paths):
-            #     missing_hand_gray_videos = [path for path in self.hand_video_gray_paths if not path.is_file()]
-            #     raise ValueError(
-            #         f"Some hand gray video files are missing. First few missing files: {missing_hand_gray_videos[:5]}"
-            #     )
+            if self.split_hands:
+                # Validate left and right hand videos separately
+                if any(not path.is_file() for path in self.hand_video_left_paths):
+                    missing_hand_left_videos = [path for path in self.hand_video_left_paths if not path.is_file()]
+                    raise ValueError(
+                        f"Some left hand video files are missing. First few missing files: {missing_hand_left_videos[:5]}"
+                    )
+                
+                if any(not path.is_file() for path in self.hand_video_right_paths):
+                    missing_hand_right_videos = [path for path in self.hand_video_right_paths if not path.is_file()]
+                    raise ValueError(
+                        f"Some right hand video files are missing. First few missing files: {missing_hand_right_videos[:5]}"
+                    )
+            else:
+                # Validate combined hand videos
+                if any(not path.is_file() for path in self.hand_video_paths):
+                    missing_hand_videos = [path for path in self.hand_video_paths if not path.is_file()]
+                    raise ValueError(
+                        f"Some hand video files are missing. First few missing files: {missing_hand_videos[:5]}"
+                    )
             
             if any(not path.is_file() for path in self.static_video_paths):
                 missing_static_videos = [path for path in self.static_video_paths if not path.is_file()]
                 raise ValueError(
                     f"Some static video files are missing. First few missing files: {missing_static_videos[:5]}"
                 )
+            
+            # Validate SMPL pos map videos if enabled
+            if self.use_smpl_pos_map:
+                if any(not path.is_file() for path in self.smpl_pos_map_paths):
+                    missing_smpl_pos_maps = [path for path in self.smpl_pos_map_paths if not path.is_file()]
+                    raise ValueError(
+                        f"Some SMPL pos map files are missing. First few missing files: {missing_smpl_pos_maps[:5]}"
+                    )
 
     def _derive_condition_video_paths(self, condition_folder: str) -> List[Path]:
         """Derive condition video paths from main video paths.
@@ -436,28 +490,69 @@ class VideoDatasetWithConditions(VideoDataset):
         
         # Load condition videos
         if self.load_tensors:
-            # Load preprocessed latents for condition videos
+            # Try to load preprocessed latents first, fallback to raw video encoding
             try:
-                if self.use_gray_hand_videos:
-                    hand_video_latents = self._load_condition_video_latents(self.hand_video_paths[index], "hand_video_gray_latents")
+                if self.split_hands:
+                    # Load left and right hand videos separately
+                    hand_left_latents = self._load_condition_video_latents_or_encode(self.hand_video_left_paths[index], "hand_video_gray_left_latents")
+                    hand_right_latents = self._load_condition_video_latents_or_encode(self.hand_video_right_paths[index], "hand_video_gray_right_latents")
+                    # Concatenate along channel dimension: [C1, F, H, W] + [C2, F, H, W] -> [C1+C2, F, H, W]
+                    hand_video_latents = torch.cat([hand_left_latents, hand_right_latents], dim=0)
+                    main_data["hand_videos"] = hand_video_latents
                 else:
-                    hand_video_latents = self._load_condition_video_latents(self.hand_video_paths[index], "hand_video_latents")
-                main_data["hand_videos"] = hand_video_latents
+                    # Regular mode: load combined hand videos
+                    if self.use_gray_hand_videos:
+                        hand_video_latents = self._load_condition_video_latents_or_encode(self.hand_video_paths[index], "hand_video_gray_latents")
+                    else:
+                        hand_video_latents = self._load_condition_video_latents_or_encode(self.hand_video_paths[index], "hand_video_latents")
+                    main_data["hand_videos"] = hand_video_latents
             except Exception as e:
                 logger.warning(f"Failed to load hand video latents for index {index}: {e}")
                 main_data["hand_videos"] = None
             
             try:
-                static_video_latents = self._load_condition_video_latents(self.static_video_paths[index], "static_video_latents")
+                static_video_latents = self._load_condition_video_latents_or_encode(self.static_video_paths[index], "static_video_latents")
                 main_data["static_videos"] = static_video_latents
             except Exception as e:
                 logger.warning(f"Failed to load static video latents for index {index}: {e}")
                 main_data["static_videos"] = None
+            
+            # Load SMPL pos map if enabled
+            if self.use_smpl_pos_map:
+                try:
+                    if self.compress_smpl_pos_map_temporal:
+                        # Load raw video and compress temporal+spatial
+                        smpl_pos_map = self._load_and_compress_smpl_pos_map(
+                            self.smpl_pos_map_paths[index],
+                            vae_scale_factor_temporal=self.vae_scale_factor_temporal,
+                            vae_scale_factor_spatial=self.vae_scale_factor_spatial,
+                        )
+                    else:
+                        # Load latents (existing behavior)
+                        smpl_pos_map = self._load_condition_video_latents_or_encode(
+                            self.smpl_pos_map_paths[index], 
+                            "smpl_pos_map_egoallo_latents"
+                        )
+                    main_data["smpl_pos_map"] = smpl_pos_map
+                except Exception as e:
+                    logger.warning(f"Failed to load SMPL pos map for index {index}: {e}")
+                    main_data["smpl_pos_map"] = None
+            else:
+                main_data["smpl_pos_map"] = None
         else:
             # Load raw videos for condition videos
             try:
-                _, hand_video, _ = self._preprocess_video(self.hand_video_paths[index])
-                main_data["hand_videos"] = hand_video
+                if self.split_hands:
+                    # Load left and right hand videos separately
+                    _, hand_left_video, _ = self._preprocess_video(self.hand_video_left_paths[index])
+                    _, hand_right_video, _ = self._preprocess_video(self.hand_video_right_paths[index])
+                    # Concatenate along channel dimension: [F, C1, H, W] + [F, C2, H, W] -> [F, C1+C2, H, W]
+                    hand_video = torch.cat([hand_left_video, hand_right_video], dim=1)
+                    main_data["hand_videos"] = hand_video
+                else:
+                    # Regular mode: load combined hand videos
+                    _, hand_video, _ = self._preprocess_video(self.hand_video_paths[index])
+                    main_data["hand_videos"] = hand_video
             except Exception as e:
                 logger.warning(f"Failed to load hand video for index {index}: {e}")
                 main_data["hand_videos"] = None
@@ -468,6 +563,17 @@ class VideoDatasetWithConditions(VideoDataset):
             except Exception as e:
                 logger.warning(f"Failed to load static video for index {index}: {e}")
                 main_data["static_videos"] = None
+            
+            # Load SMPL pos map if enabled
+            if self.use_smpl_pos_map:
+                try:
+                    _, smpl_pos_map, _ = self._preprocess_video(self.smpl_pos_map_paths[index])
+                    main_data["smpl_pos_map"] = smpl_pos_map
+                except Exception as e:
+                    logger.warning(f"Failed to load SMPL pos map for index {index}: {e}")
+                    main_data["smpl_pos_map"] = None
+            else:
+                main_data["smpl_pos_map"] = None
 
         return main_data
 
@@ -506,8 +612,119 @@ class VideoDatasetWithConditions(VideoDataset):
                 raise e
                 
         except Exception as e:
-            logger.error(f"Error in _load_condition_video_latents for {path} in {latent_folder}: {e}")
+            if self.split_hands:
+                logger.debug(f"Latents not found for {path}, will load raw video: {e}")
+            else:
+                logger.error(f"Error in _load_condition_video_latents for {path} in {latent_folder}: {e}")
             raise e
+
+    def _load_condition_video_latents_or_encode(self, path: Path, latent_folder: str) -> torch.Tensor:
+        """Load preprocessed latents if available, otherwise return raw video for encoding in training."""
+        # Try to load latents first
+        try:
+            # First try to load preprocessed latents
+            return self._load_condition_video_latents(path, latent_folder)
+        except (FileNotFoundError, Exception) as e:
+            logger.info(f"Preprocessed latents not found for {path}, will encode from raw video in training: {e}")
+            
+            # Fallback: return raw video tensor
+            try:
+                if self.split_hands:
+                    # For split_hands mode, load raw video without downsampling
+                    video_reader = decord.VideoReader(uri=path.as_posix())
+                    video_num_frames = len(video_reader)
+                    frame_indices = list(range(video_num_frames))
+                    frames = video_reader.get_batch(frame_indices)
+                    frames = frames.float()
+                    video = frames.permute(3, 0, 1, 2).contiguous()  # [C, F, H, W]
+                    return video
+                else:
+                    # Regular preprocessing for non-split_hands mode
+                    _, video, _ = self._preprocess_video(path)
+                    return video
+            except Exception as encode_error:
+                logger.error(f"Failed to load raw video {path}: {encode_error}")
+                raise encode_error
+
+    def _load_and_compress_smpl_pos_map(
+        self, 
+        path: Path, 
+        vae_scale_factor_temporal: int = 4,
+        vae_scale_factor_spatial: int = 8,
+    ) -> torch.Tensor:
+        """
+        Load raw SMPL pos map video and compress both temporal and spatial dimensions.
+        
+        Temporal compression: Rearrange frames to channel dimension (like raymap processing)
+        Spatial compression: Downsample by factor of vae_scale_factor_spatial using bilinear interpolation
+        
+        Args:
+            path: Path to video file
+            vae_scale_factor_temporal: Temporal compression factor (default: 4)
+            vae_scale_factor_spatial: Spatial compression factor (default: 8)
+        
+        Returns:
+            torch.Tensor: [T', C*vae_scale_factor_temporal, H/spatial, W/spatial]
+                         where T' = ceil(F / vae_scale_factor_temporal)
+        
+        Example:
+            Input: [49, 480, 720, 3] (F, H, W, C)
+            Output: [13, 12, 60, 90] (T'=13, C*4=12, H/8=60, W/8=90)
+        """
+        from einops import rearrange
+        import torch.nn.functional as F
+        
+        # Load video
+        video_reader = decord.VideoReader(uri=path.as_posix())
+        video = video_reader[:]  # [F, H, W, C]
+
+        video = video.permute(3, 0, 1, 2)  # [C, F, H, W]
+        video = video.unsqueeze(0)  # [1, C, F, H, W]
+        
+        # Normalize [0, 255] -> [-1, 1]
+        video = video / 255.0
+        video = (video - 0.5) / 0.5
+        
+        # Spatial downsampling (H, W) -> (H/spatial_factor, W/spatial_factor)
+        b, c, f, h, w = video.shape
+        # Reshape for spatial downsampling: [B, C, F, H, W] -> [B*F, C, H, W]
+        video_2d = video.permute(0, 2, 1, 3, 4).reshape(b * f, c, h, w)
+        
+        # Downsample using bilinear interpolation
+        new_h = h // vae_scale_factor_spatial
+        new_w = w // vae_scale_factor_spatial
+        video_2d = F.interpolate(
+            video_2d, 
+            size=(new_h, new_w), 
+            mode='bilinear', 
+            align_corners=False
+        )
+        
+        # Reshape back: [B*F, C, H/8, W/8] -> [B, C, F, H/8, W/8]
+        video = video_2d.reshape(b, f, c, new_h, new_w).permute(0, 2, 1, 3, 4)
+        
+        # Temporal padding if needed (pad at the beginning like raymap)
+        num_frames = video.shape[2]
+        if num_frames % vae_scale_factor_temporal != 0:
+            pad_frames = vae_scale_factor_temporal - (num_frames % vae_scale_factor_temporal)
+            # Repeat first pad_frames frames
+            padding = video[:, :, :pad_frames, :, :]
+            video = torch.cat([padding, video], dim=2)
+        
+        # 6. Rearrange: compress temporal dimension into channel
+        # [B, C, (n*t), H, W] -> [B, t, (n*C), H, W]
+        video = rearrange(
+            video,
+            "b c (n t) h w -> b t (n c) h w",
+            n=vae_scale_factor_temporal,
+        )
+        
+        # 7. Remove batch dimension
+        video = video.squeeze(0)  # [T', C*n, H/8, W/8]
+        
+        logger.debug(f"Loaded and compressed SMPL pos map: {path} -> shape {video.shape}")
+        
+        return video
 
 
 class VideoDatasetWithConditionsAndResizing(VideoDatasetWithConditions):
@@ -737,6 +954,11 @@ class VideoDatasetWithHumanMotions(VideoDatasetWithConditions):
         random_flip: Optional[float] = None,
         image_to_video: bool = False,
         use_gray_hand_videos: bool = False,
+        split_hands: bool = False,
+        use_smpl_pos_map: bool = False,
+        compress_smpl_pos_map_temporal: bool = False,
+        vae_scale_factor_temporal: int = 4,
+        vae_scale_factor_spatial: int = 8,
     ) -> None:
         # Initialize parent class with main video column
         super().__init__(
@@ -753,6 +975,11 @@ class VideoDatasetWithHumanMotions(VideoDatasetWithConditions):
             random_flip=random_flip,
             image_to_video=image_to_video,
             use_gray_hand_videos=use_gray_hand_videos,
+            split_hands=split_hands,
+            use_smpl_pos_map=use_smpl_pos_map,
+            compress_smpl_pos_map_temporal=compress_smpl_pos_map_temporal,
+            vae_scale_factor_temporal=vae_scale_factor_temporal,
+            vae_scale_factor_spatial=vae_scale_factor_spatial,
         )
         
         # Automatically derive human_motions paths from main video paths

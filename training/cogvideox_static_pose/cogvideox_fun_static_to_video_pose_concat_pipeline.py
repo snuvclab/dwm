@@ -912,6 +912,10 @@ class CogVideoXFunInpaintPipeline(DiffusionPipeline):
             if self.transformer.config.use_rotary_positional_embeddings
             else None
         )
+        
+        # Initialize adapter_control_for_transformer (used by all pipelines)
+        if not hasattr(self, 'add_control_adapter') or not self.add_control_adapter:
+            adapter_control_for_transformer = None
 
         # 8. Denoising loop
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
@@ -1018,6 +1022,8 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
             A text conditioned `CogVideoXTransformer3DModel` to denoise the encoded video latents.
         scheduler ([`SchedulerMixin`]):
             A scheduler to be used in combination with `transformer` to denoise the encoded video latents.
+        split_hands (bool):
+            Whether to split hand videos into left and right hands for separate processing.
     """
 
     def __init__(
@@ -1027,6 +1033,11 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
         vae: AutoencoderKLCogVideoX,
         transformer: CogVideoXTransformer3DModel,
         scheduler: Union[CogVideoXDDIMScheduler, CogVideoXDPMScheduler],
+        split_hands: bool = False,
+        compress_smpl_pos_map_temporal: bool = False,
+        add_control_adapter: bool = False,
+        in_dim_control_adapter: int = 12,
+        adapter_control_type: str = "smpl_pos_map",
     ):
         super().__init__(
             tokenizer=tokenizer,
@@ -1035,6 +1046,11 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
             transformer=transformer,
             scheduler=scheduler,
         )
+        self.split_hands = split_hands
+        self.compress_smpl_pos_map_temporal = compress_smpl_pos_map_temporal
+        self.add_control_adapter = add_control_adapter
+        self.in_dim_control_adapter = in_dim_control_adapter
+        self.adapter_control_type = adapter_control_type
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path=None, 
@@ -1043,6 +1059,11 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
                         condition_channels=None, 
                         use_adapter=False,
                         adapter_version="v1",
+                        split_hands=False,
+                        compress_smpl_pos_map_temporal=False,
+                        add_control_adapter=False,
+                        in_dim_control_adapter=12,
+                        adapter_control_type="smpl_pos_map",
                         *args, **kwargs):
         """
         Load a CogVideoXFunStaticToVideoPipeline from a saved directory or base model.
@@ -1060,8 +1081,8 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
         """
         # Check if this is a base model path (for creating pose-conditioned pipeline)
         if base_model_name_or_path is not None:
-            print(f"🔧 Creating VideoX-Fun pipeline from base model: {base_model_name_or_path}")
-            # Load the original CogVideoX-Fun pipeline from base model
+            print(f"🔧 Loading pipeline components (tokenizer, text_encoder, vae, scheduler) from base model: {base_model_name_or_path}")
+            # Load the original CogVideoX-Fun pipeline from base model to get non-transformer components
             original_pipeline = super().from_pretrained(base_model_name_or_path, *args, **kwargs)
             
         if transformer is None:
@@ -1090,10 +1111,26 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
                         base_model_name_or_path=base_model_name_or_path,
                         subfolder="transformer",
                         condition_channels=condition_channels,
+                        add_control_adapter=add_control_adapter,
+                        in_dim_control_adapter=in_dim_control_adapter,
                         torch_dtype=kwargs.get("torch_dtype", torch.bfloat16),
                         revision=kwargs.get("revision", None),
                         variant=kwargs.get("variant", None),
                     )
+            elif add_control_adapter:
+                # Control adapter with no concat
+                print(f"🔧 Creating/loading VideoX-Fun transformer with control adapter (in_dim={in_dim_control_adapter})")
+                transformer = CogVideoXFunTransformer3DModelWithConcat.from_pretrained(
+                    pretrained_model_name_or_path=pretrained_model_name_or_path,
+                    base_model_name_or_path=base_model_name_or_path,
+                    subfolder="transformer",
+                    condition_channels=0,  # No concat
+                    add_control_adapter=True,
+                    in_dim_control_adapter=in_dim_control_adapter,
+                    torch_dtype=kwargs.get("torch_dtype", torch.bfloat16),
+                    revision=kwargs.get("revision", None),
+                    variant=kwargs.get("variant", None),
+                )
             else:
                 print(f"🔧 Loading base VideoX-Fun transformer")
                 transformer = CogVideoXFunTransformer3DModel.from_pretrained(
@@ -1125,6 +1162,11 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
             vae=original_pipeline.vae,
             transformer=transformer,
             scheduler=original_pipeline.scheduler,
+            split_hands=split_hands,
+            compress_smpl_pos_map_temporal=compress_smpl_pos_map_temporal,
+            add_control_adapter=add_control_adapter,
+            in_dim_control_adapter=in_dim_control_adapter,
+            adapter_control_type=adapter_control_type,
         )
         
         return pipeline
@@ -1178,6 +1220,7 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
         image: Optional[torch.Tensor] = None,  # For I2V fallback
         static_videos: Optional[torch.Tensor] = None,
         hand_videos: Optional[torch.Tensor] = None,
+        smpl_pos_map: Optional[torch.Tensor] = None,
         timestep: Optional[torch.Tensor] = None,
         is_strength_max: bool = True,
         return_noise: bool = False,
@@ -1225,38 +1268,102 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
         # Prepare condition latents
         static_videos_latents = None
         hand_videos_latents = None
+        smpl_pos_map_latents = None
         
         if static_videos is not None:
             # Process static videos with VAE encoding
             static_videos = static_videos.to(device=device, dtype=self.vae.dtype)
             bs = 1
-            new_static_videos = []
-            for i in range(0, static_videos.shape[0], bs):
-                static_videos_bs = static_videos[i : i + bs]
-                static_videos_bs = self.vae.encode(static_videos_bs)[0]
-                static_videos_bs = static_videos_bs.sample()
-                new_static_videos.append(static_videos_bs)
-            static_videos_latents = torch.cat(new_static_videos, dim=0)
-            static_videos_latents = static_videos_latents * self.vae.config.scaling_factor
-            static_videos_latents = static_videos_latents.repeat(batch_size // static_videos_latents.shape[0], 1, 1, 1, 1)
-            static_videos_latents = static_videos_latents.to(device=device, dtype=dtype)
-            static_videos_latents = rearrange(static_videos_latents, "b c f h w -> b f c h w")
+            with torch.no_grad():
+                new_static_videos = []
+                for i in range(0, static_videos.shape[0], bs):
+                    static_videos_bs = static_videos[i : i + bs]
+                    static_videos_bs = self.vae.encode(static_videos_bs)[0]
+                    static_videos_bs = static_videos_bs.sample()
+                    new_static_videos.append(static_videos_bs)
+                
+                static_videos_latents = torch.cat(new_static_videos, dim=0)
+                static_videos_latents = static_videos_latents * self.vae.config.scaling_factor
+                static_videos_latents = static_videos_latents.repeat(batch_size // static_videos_latents.shape[0], 1, 1, 1, 1)
+                static_videos_latents = static_videos_latents.to(device=device, dtype=dtype)
+                static_videos_latents = rearrange(static_videos_latents, "b c f h w -> b f c h w")
 
         if hand_videos is not None:
             # Process hand videos with VAE encoding
             hand_videos = hand_videos.to(device=device, dtype=self.vae.dtype)
-            bs = 1
-            new_hand_videos = []
-            for i in range(0, hand_videos.shape[0], bs):
-                hand_videos_bs = hand_videos[i : i + bs]
-                hand_videos_bs = self.vae.encode(hand_videos_bs)[0]
-                hand_videos_bs = hand_videos_bs.sample()
-                new_hand_videos.append(hand_videos_bs)
-            hand_videos_latents = torch.cat(new_hand_videos, dim=0)
+            
+            with torch.no_grad():
+                if self.split_hands:
+                    # Split hands mode: split into left and right, encode separately, then concat
+                    batch_size_hand, channels, frames, height, width = hand_videos.shape
+                    half_channels = channels // 2
+                    
+                    # Split into left and right hand videos
+                    hand_left = hand_videos[:, :half_channels, :, :, :]  # [B, C/2, F, H, W]
+                    hand_right = hand_videos[:, half_channels:, :, :, :]  # [B, C/2, F, H, W]
+                    
+                    # Encode left and right separately
+                    bs = 1
+                    new_hand_left = []
+                    new_hand_right = []
+                    
+                    for i in range(0, hand_left.shape[0], bs):
+                        hand_left_bs = hand_left[i : i + bs]
+                        hand_right_bs = hand_right[i : i + bs]
+                        
+                        # Encode left hand
+                        hand_left_bs = self.vae.encode(hand_left_bs)[0]
+                        hand_left_bs = hand_left_bs.sample()
+                        new_hand_left.append(hand_left_bs)
+                        
+                        # Encode right hand
+                        hand_right_bs = self.vae.encode(hand_right_bs)[0]
+                        hand_right_bs = hand_right_bs.sample()
+                        new_hand_right.append(hand_right_bs)
+                    
+                    hand_left_latents = torch.cat(new_hand_left, dim=0)
+                    hand_right_latents = torch.cat(new_hand_right, dim=0)
+                    
+                    # Concatenate along channel dimension
+                    hand_videos_latents = torch.cat([hand_left_latents, hand_right_latents], dim=1)
+                else:
+                    # Regular mode: encode normally
+                    bs = 1
+                    new_hand_videos = []
+                    for i in range(0, hand_videos.shape[0], bs):
+                        hand_videos_bs = hand_videos[i : i + bs]
+                        hand_videos_bs = self.vae.encode(hand_videos_bs)[0]
+                        hand_videos_bs = hand_videos_bs.sample()
+                        new_hand_videos.append(hand_videos_bs)
+                    hand_videos_latents = torch.cat(new_hand_videos, dim=0)
+            
             hand_videos_latents = hand_videos_latents * self.vae.config.scaling_factor
             hand_videos_latents = hand_videos_latents.repeat(batch_size // hand_videos_latents.shape[0], 1, 1, 1, 1)
             hand_videos_latents = hand_videos_latents.to(device=device, dtype=dtype)
             hand_videos_latents = rearrange(hand_videos_latents, "b c f h w -> b f c h w")
+
+        if smpl_pos_map is not None:
+            # Process SMPL pos map
+            if self.compress_smpl_pos_map_temporal:
+                # Already compressed: [B, F, C, H, W] where C = 12 (3 * 4)
+                smpl_pos_map_latents = smpl_pos_map.to(device=device, dtype=dtype)
+            else:
+                # Need to VAE encode: [B, C, F, H, W]
+                smpl_pos_map = smpl_pos_map.to(device=device, dtype=self.vae.dtype)
+                bs = 1
+                with torch.no_grad():
+                    new_smpl_pos_maps = []
+                    for i in range(0, smpl_pos_map.shape[0], bs):
+                        smpl_pos_map_bs = smpl_pos_map[i : i + bs]
+                        smpl_pos_map_bs = self.vae.encode(smpl_pos_map_bs)[0]
+                        smpl_pos_map_bs = smpl_pos_map_bs.sample()
+                        new_smpl_pos_maps.append(smpl_pos_map_bs)
+                    
+                    smpl_pos_map_latents = torch.cat(new_smpl_pos_maps, dim=0)
+                    smpl_pos_map_latents = smpl_pos_map_latents * self.vae.config.scaling_factor
+                    smpl_pos_map_latents = smpl_pos_map_latents.repeat(batch_size // smpl_pos_map_latents.shape[0], 1, 1, 1, 1)
+                    smpl_pos_map_latents = smpl_pos_map_latents.to(device=device, dtype=dtype)
+                    smpl_pos_map_latents = rearrange(smpl_pos_map_latents, "b c f h w -> b f c h w")
 
         # Prepare outputs
         outputs = (latents,)
@@ -1264,8 +1371,8 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
         if return_noise:
             outputs += (noise,)
             
-        # Always return both static and hand video latents (can be None)
-        outputs += (static_videos_latents, hand_videos_latents)
+        # Always return static, hand, and smpl pos map video latents (can be None)
+        outputs += (static_videos_latents, hand_videos_latents, smpl_pos_map_latents)
             
         return outputs
 
@@ -1311,6 +1418,79 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
             )
         
         return hand_videos
+
+    def preprocess_smpl_pos_map(
+        self,
+        smpl_pos_map,
+        height,
+        width,
+        num_frames,
+    ):
+        """Preprocess SMPL pos map videos.
+        
+        Args:
+            smpl_pos_map: Input video tensor 
+                - If compress_smpl_pos_map_temporal=True: [B, T', C*4, H/8, W/8] (already compressed)
+                - If compress_smpl_pos_map_temporal=False: [B, C, F, H, W] (raw video)
+            height: Target height
+            width: Target width  
+            num_frames: Target number of frames
+            
+        Returns:
+            Preprocessed video tensor
+        """
+        # Convert to torch tensor if needed
+        if isinstance(smpl_pos_map, np.ndarray):
+            smpl_pos_map = torch.from_numpy(smpl_pos_map)
+        
+        if self.compress_smpl_pos_map_temporal:
+            # Already compressed format: [B, T', C*4, H/8, W/8]
+            # Just ensure correct dtype and device - no interpolation needed
+            return smpl_pos_map
+        else:
+            # Raw video format: [B, C, F, H, W]
+            if smpl_pos_map.ndim == 4:  # [C, F, H, W] -> [1, C, F, H, W]
+                smpl_pos_map = smpl_pos_map.unsqueeze(0)
+            elif smpl_pos_map.ndim != 5:
+                raise ValueError(f"Expected 4D or 5D tensor, got {smpl_pos_map.ndim}D tensor")
+            
+            # Ensure correct number of frames
+            if smpl_pos_map.shape[2] != num_frames:
+                smpl_pos_map = F.interpolate(
+                    smpl_pos_map,
+                    size=(num_frames, height, width),
+                    mode='trilinear',
+                    align_corners=False
+                )
+            
+            return smpl_pos_map
+
+    def preprocess_adapter_control(
+        self,
+        adapter_control,
+        height,
+        width,
+        num_frames,
+    ):
+        """Preprocess adapter control signals (e.g., SMPL pos map for adapter).
+        
+        Args:
+            adapter_control: Input control tensor [B, T', C, H, W] (already compressed)
+            height: Target height (not used, adapter handles resolution)
+            width: Target width (not used, adapter handles resolution)
+            num_frames: Target number of frames (not used, already compressed temporally)
+            
+        Returns:
+            Preprocessed control tensor (same as input for compressed format)
+        """
+        # Convert to torch tensor if needed
+        if isinstance(adapter_control, np.ndarray):
+            adapter_control = torch.from_numpy(adapter_control)
+        
+        # For adapter control, we expect compressed format: [B, T', C, H, W]
+        # The adapter will handle spatial processing through PixelUnshuffle
+        # No preprocessing needed - just ensure correct format
+        return adapter_control
 
     def check_inputs(
         self,
@@ -1429,6 +1609,7 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
         masked_video_latents: Union[torch.FloatTensor] = None,
         static_videos: Optional[Union[torch.FloatTensor, np.ndarray, List[PIL.Image.Image]]] = None,
         hand_videos: Optional[Union[torch.FloatTensor, np.ndarray, List[PIL.Image.Image]]] = None,
+        smpl_pos_map: Optional[Union[torch.FloatTensor, np.ndarray]] = None,
         num_frames: int = 49,
         num_inference_steps: int = 50,
         timesteps: Optional[List[int]] = None,
@@ -1640,6 +1821,26 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
         if hand_videos is not None:
             processed_hand_videos = self.preprocess_hand_conditions(hand_videos, height, width, num_frames)
 
+        # Preprocess smpl_pos_map if provided
+        processed_smpl_pos_map = None
+        if smpl_pos_map is not None:
+            processed_smpl_pos_map = self.preprocess_smpl_pos_map(smpl_pos_map, height, width, num_frames)
+        
+        # Determine adapter control based on adapter_control_type
+        processed_adapter_control = None
+        if self.add_control_adapter:
+            if self.adapter_control_type == "smpl_pos_map" and processed_smpl_pos_map is not None:
+                # Use SMPL pos map as adapter control
+                processed_adapter_control = self.preprocess_adapter_control(processed_smpl_pos_map, height, width, num_frames)
+                # Don't use smpl_pos_map for concat since it's used for adapter
+                processed_smpl_pos_map = None
+            elif self.adapter_control_type == "hand_videos" and processed_hand_videos is not None:
+                # Use hand videos as adapter control
+                processed_adapter_control = self.preprocess_adapter_control(processed_hand_videos, height, width, num_frames)
+                # Don't use hand_videos for concat since it's used for adapter
+                processed_hand_videos = None
+            # Can add more control types here in the future
+
         latents_outputs = self.prepare_latents(
             batch_size=batch_size * num_videos_per_prompt,
             num_channels_latents=num_channels_latents,
@@ -1652,22 +1853,65 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
             latents=latents,
             static_videos=init_video,
             hand_videos=processed_hand_videos,
+            smpl_pos_map=processed_smpl_pos_map,
             timestep=latent_timestep,
             is_strength_max=is_strength_max,
             return_noise=True,
         )
-        # Always get both static and hand video latents
-        latents, noise, static_videos_latents, hand_videos_latents = latents_outputs
+        # Always get static, hand, and smpl pos map video latents
+        latents, noise, static_videos_latents, hand_videos_latents, smpl_pos_map_latents = latents_outputs
         if comfyui_progressbar and pbar is not None:
             pbar.update(1)
         
-        # Use hand_videos_latents from prepare_latents if available
+        # Concatenate condition latents (hand_videos + smpl_pos_map)
         control_latents = None
+        control_latents_list = []
+        
         if hand_videos_latents is not None:
-            control_latents = hand_videos_latents
+            control_latents_list.append(hand_videos_latents)
+        
+        if smpl_pos_map_latents is not None:
+            control_latents_list.append(smpl_pos_map_latents)
+        
+        if control_latents_list:
+            # Concatenate along channel dimension: [B, F, C1, H, W] + [B, F, C2, H, W] -> [B, F, C1+C2, H, W]
+            control_latents = torch.cat(control_latents_list, dim=2)
             control_latents = (
                 torch.cat([control_latents] * 2) if do_classifier_free_guidance else control_latents
             )
+        
+        # Determine adapter_control based on adapter_control_type
+        adapter_control_for_transformer = None
+        if self.add_control_adapter:
+            if self.adapter_control_type == "smpl_pos_map" and processed_smpl_pos_map is not None:
+                # Use SMPL pos map as adapter control
+                # Convert [B, F, C, H, W] -> [B, C, F, H, W] for adapter
+                adapter_control_for_transformer = processed_smpl_pos_map.permute(0, 2, 1, 3, 4)
+                # Don't include smpl_pos_map in control_latents concat since it's used for adapter
+                if smpl_pos_map_latents is not None:
+                    control_latents_list = [item for item in control_latents_list if item is not smpl_pos_map_latents]
+            elif self.adapter_control_type == "hand_videos" and processed_hand_videos is not None:
+                # Use hand videos as adapter control
+                # Convert [B, F, C, H, W] -> [B, C, F, H, W] for adapter
+                adapter_control_for_transformer = processed_hand_videos.permute(0, 2, 1, 3, 4)
+                # Don't include hand_videos in control_latents concat since it's used for adapter
+                if hand_videos_latents is not None:
+                    control_latents_list = [item for item in control_latents_list if item is not hand_videos_latents]
+            
+            # Apply classifier-free guidance if needed
+            if adapter_control_for_transformer is not None:
+                adapter_control_for_transformer = (
+                    torch.cat([adapter_control_for_transformer] * 2) if do_classifier_free_guidance else adapter_control_for_transformer
+                )
+        
+        # Re-concatenate control_latents after potentially removing adapter control
+        if control_latents_list:
+            control_latents = torch.cat(control_latents_list, dim=2)
+            control_latents = (
+                torch.cat([control_latents] * 2) if do_classifier_free_guidance else control_latents
+            )
+        else:
+            control_latents = None
         if mask_video is not None:
             if (mask_video == 255).all():  # redraw all frames
                 mask_latents = torch.zeros_like(latents)[:, :, :1].to(latents.device, latents.dtype)
@@ -1777,6 +2021,10 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
             if self.transformer.config.use_rotary_positional_embeddings
             else None
         )
+        
+        # Initialize adapter_control_for_transformer (used by all pipelines)
+        if not hasattr(self, 'add_control_adapter') or not self.add_control_adapter:
+            adapter_control_for_transformer = None
 
         # 8. Denoising loop
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
@@ -1803,6 +2051,7 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
                     return_dict=False,
                     inpaint_latents=inpaint_latents,
                     control_latents=control_latents,
+                    adapter_control=adapter_control_for_transformer,
                 )[0]
                 noise_pred = noise_pred.float()
 
@@ -1964,8 +2213,8 @@ class CogVideoXFunStaticToVideoPoseTokenPipeline(CogVideoXFunInpaintPipeline):
         """
         # Check if this is a base model path (for creating pose-conditioned pipeline)
         if base_model_name_or_path is not None:
-            print(f"🔧 Creating VideoX-Fun pipeline from base model: {base_model_name_or_path}")
-            # Load the original CogVideoX-Fun pipeline from base model
+            print(f"🔧 Loading pipeline components (tokenizer, text_encoder, vae, scheduler) from base model: {base_model_name_or_path}")
+            # Load the original CogVideoX-Fun pipeline from base model to get non-transformer components
             original_pipeline = super().from_pretrained(base_model_name_or_path, *args, **kwargs)
             
         if transformer is None:
@@ -2101,6 +2350,7 @@ class CogVideoXFunStaticToVideoPoseTokenPipeline(CogVideoXFunInpaintPipeline):
         # Prepare condition latents
         static_videos_latents = None
         hand_videos_latents = None
+        smpl_pos_map_latents = None
         
         if static_videos is not None:
             # Process static videos with VAE encoding
@@ -2653,6 +2903,10 @@ class CogVideoXFunStaticToVideoPoseTokenPipeline(CogVideoXFunInpaintPipeline):
             if self.transformer.config.use_rotary_positional_embeddings
             else None
         )
+        
+        # Initialize adapter_control_for_transformer (used by all pipelines)
+        if not hasattr(self, 'add_control_adapter') or not self.add_control_adapter:
+            adapter_control_for_transformer = None
 
         # 8. Denoising loop
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
@@ -2679,6 +2933,7 @@ class CogVideoXFunStaticToVideoPoseTokenPipeline(CogVideoXFunInpaintPipeline):
                     return_dict=False,
                     inpaint_latents=inpaint_latents,
                     control_latents=control_latents,
+                    adapter_control=adapter_control_for_transformer,
                 )[0]
                 noise_pred = noise_pred.float()
 
@@ -2892,6 +3147,7 @@ class CogVideoXI2VStaticTokenPoseAdapterPipeline(CogVideoXImageToVideoPipeline):
             vae=original_pipeline.vae,
             transformer=transformer,
             scheduler=original_pipeline.scheduler,
+            split_hands=split_hands,
         )
         
         return pipeline
@@ -2992,6 +3248,7 @@ class CogVideoXI2VStaticTokenPoseAdapterPipeline(CogVideoXImageToVideoPipeline):
         # Prepare condition latents
         static_videos_latents = None
         hand_videos_latents = None
+        smpl_pos_map_latents = None
         
         if static_videos is not None:
             # Process static videos with VAE encoding
@@ -3544,6 +3801,10 @@ class CogVideoXI2VStaticTokenPoseAdapterPipeline(CogVideoXImageToVideoPipeline):
             if self.transformer.config.use_rotary_positional_embeddings
             else None
         )
+        
+        # Initialize adapter_control_for_transformer (used by all pipelines)
+        if not hasattr(self, 'add_control_adapter') or not self.add_control_adapter:
+            adapter_control_for_transformer = None
 
         # 8. Denoising loop
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
@@ -3570,6 +3831,7 @@ class CogVideoXI2VStaticTokenPoseAdapterPipeline(CogVideoXImageToVideoPipeline):
                     return_dict=False,
                     inpaint_latents=inpaint_latents,
                     control_latents=control_latents,
+                    adapter_control=adapter_control_for_transformer,
                 )[0]
                 noise_pred = noise_pred.float()
 
@@ -3744,8 +4006,8 @@ class CogVideoXFunStaticToVideoCrossPipeline(CogVideoXFunInpaintPipeline):
         """
         # Check if this is a base model path (for creating pose-conditioned pipeline)
         if base_model_name_or_path is not None:
-            print(f"🔧 Creating VideoX-Fun pipeline from base model: {base_model_name_or_path}")
-            # Load the original CogVideoX-Fun pipeline from base model
+            print(f"🔧 Loading pipeline components (tokenizer, text_encoder, vae, scheduler) from base model: {base_model_name_or_path}")
+            # Load the original CogVideoX-Fun pipeline from base model to get non-transformer components
             original_pipeline = super().from_pretrained(base_model_name_or_path, *args, **kwargs)
             
         if transformer is None:
@@ -3802,6 +4064,7 @@ class CogVideoXFunStaticToVideoCrossPipeline(CogVideoXFunInpaintPipeline):
             vae=original_pipeline.vae,
             transformer=transformer,
             scheduler=original_pipeline.scheduler,
+            split_hands=split_hands,
         )
         
         return pipeline
@@ -3904,6 +4167,7 @@ class CogVideoXFunStaticToVideoCrossPipeline(CogVideoXFunInpaintPipeline):
         # Prepare condition latents
         static_videos_latents = None
         hand_videos_latents = None
+        smpl_pos_map_latents = None
         
         if static_videos is not None:
             # Process static videos with VAE encoding
@@ -4448,6 +4712,10 @@ class CogVideoXFunStaticToVideoCrossPipeline(CogVideoXFunInpaintPipeline):
             if self.transformer.config.use_rotary_positional_embeddings
             else None
         )
+        
+        # Initialize adapter_control_for_transformer (used by all pipelines)
+        if not hasattr(self, 'add_control_adapter') or not self.add_control_adapter:
+            adapter_control_for_transformer = None
 
         # 8. Denoising loop
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
