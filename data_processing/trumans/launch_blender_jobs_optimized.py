@@ -627,7 +627,8 @@ def main():
         
         if is_rendered:
             rendered_scenes[scene_name] = rendered_anims
-            if not args.force:
+            # Skip only if not forcing re-render with --force or --no-skip-existing
+            if not args.force and not args.no_skip_existing:
                 print(f"✓ {display_name} ({scene_name}): Already rendered ({len(rendered_anims)} animations)")
                 if len(rendered_anims) <= 10:  # Show animation names if not too many
                     for anim in rendered_anims:
@@ -635,6 +636,8 @@ def main():
                 else:
                     print(f"    ✅ {', '.join(rendered_anims[:5])}... and {len(rendered_anims)-5} more")
                 continue
+            elif args.no_skip_existing:
+                print(f"🔄 {display_name} ({scene_name}): Re-rendering all animations (--no-skip-existing)")
         
         if args.check_only:
             if missing_anims:
