@@ -1117,9 +1117,13 @@ def main():
         if args.no_depth and 'blender_ego_rgb_depth_optimized.py' in args.script_path:
             cmd.append("--no-depth")
         
-        # Add animation index for animation-based jobs
+        # Add animation index or name for animation-based jobs
         if job.get('job_type') == 'animation':
-            cmd.extend(["--animation_index", str(job['animation_index'])])
+            # Prefer animation name over index if available
+            if 'animation_name' in job and job['animation_name']:
+                cmd.extend(["--animation_name", job['animation_name']])
+            else:
+                cmd.extend(["--animation_index", str(job['animation_index'])])
         
         # Assign environment variable to restrict GPU usage
         env = os.environ.copy()
