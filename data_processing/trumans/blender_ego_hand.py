@@ -1223,15 +1223,8 @@ def render_animation_sequence(animation_index, animation_name):
                 left_video_output_path = os.path.join(videos_output_path_left, f"{video_idx:05d}.mp4")
                 right_video_output_path = os.path.join(videos_output_path_right, f"{video_idx:05d}.mp4")
                 
-                # Check if videos need to be created
-                if args.skip_existing:
-                    left_video_exists, left_needs_video_rendering = check_video_exists(video_idx, videos_output_path_left)
-                    right_video_exists, right_needs_video_rendering = check_video_exists(video_idx, videos_output_path_right)
-                else:
-                    # Force re-rendering mode
-                    left_needs_video_rendering = True
-                    right_needs_video_rendering = True
-                    # Delete existing videos
+                # Delete existing videos first if in force mode
+                if not args.skip_existing:
                     for video_path in [left_video_output_path, right_video_output_path]:
                         if os.path.exists(video_path):
                             try:
@@ -1239,6 +1232,15 @@ def render_animation_sequence(animation_index, animation_name):
                                 print(f"    [DELETE] Removed existing: {video_path}")
                             except OSError as e:
                                 print(f"    [WARNING] Could not remove: {e}")
+                
+                # Check if videos need to be created (after deletion)
+                if args.skip_existing:
+                    left_video_exists, left_needs_video_rendering = check_video_exists(video_idx, videos_output_path_left)
+                    right_video_exists, right_needs_video_rendering = check_video_exists(video_idx, videos_output_path_right)
+                else:
+                    # Force re-rendering mode: always render
+                    left_needs_video_rendering = True
+                    right_needs_video_rendering = True
             
                 if args.skip_existing and not left_needs_video_rendering and not right_needs_video_rendering:
                     print(f"[VIDEO {video_idx + 1}/{len(video_start_frames)}] SKIPPED: Both videos already exist")

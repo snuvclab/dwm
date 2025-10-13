@@ -174,7 +174,7 @@ except Exception as e:
             temp_script = f.name
         
         cmd = ["blender", "--background", blend_file, "--python", temp_script]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         
         # Clean up temp file
         try:
@@ -1110,11 +1110,11 @@ def main():
             cmd.extend(["--height", str(args.height)])
         
         # Add samples option if specified and using blender_ego_rgb_depth_optimized.py
-        if 'blender_ego_rgb_depth_optimized.py' in args.script_path:
+        if 'blender_ego_rgb_depth_optimized.py' in args.script_path or 'blender_ego_static.py' in args.script_path:
             cmd.extend(["--samples", str(args.samples)])
         
         # Add no-depth option if specified and using blender_ego_rgb_depth_optimized.py
-        if args.no_depth and 'blender_ego_rgb_depth_optimized.py' in args.script_path:
+        if args.no_depth and 'blender_ego_rgb_depth_optimized.py' in args.script_path or 'blender_ego_static.py' in args.script_path:
             cmd.append("--no-depth")
         
         # Add animation index or name for animation-based jobs

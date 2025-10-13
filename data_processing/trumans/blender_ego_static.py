@@ -29,6 +29,8 @@ parser.add_argument("--no-skip-existing", action="store_true", help="Disable ski
 parser.add_argument("--frame-skip", type=int, default=3, help="Render every Nth frame")
 parser.add_argument("--stride", type=int, default=25, help="Stride for video sequences (default: 25)")
 parser.add_argument("--fov", type=float, default=90.0, help="Camera FOV in degrees (perspective)")
+parser.add_argument("--width", type=int, default=720, help="Render width in pixels (default: 720)")
+parser.add_argument("--height", type=int, default=480, help="Render height in pixels (default: 480)")
 args = parser.parse_args(argv)
 if args.no_skip_existing:
     args.skip_existing = False
@@ -333,8 +335,8 @@ except Exception as e:
     print(f"Unexpected GPU setup error: {e}. Using CPU.")
 
 # Resolution & formats
-render.resolution_x = 720
-render.resolution_y = 480
+render.resolution_x = args.width
+render.resolution_y = args.height
 render.resolution_percentage = 100
 render.image_settings.file_format = 'PNG'
 render.image_settings.color_mode = 'RGBA'
