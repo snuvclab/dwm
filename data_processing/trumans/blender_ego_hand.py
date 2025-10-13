@@ -37,6 +37,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--start_frame", type=int, default=None)
 parser.add_argument("--end_frame", type=int, default=None)
 parser.add_argument("--animation_index", type=int, default=None, help="Specific animation index (else: all)")
+parser.add_argument("--animation_name", type=str, default=None, help="Specific animation name (e.g., '2023-01-14@22-06-10.pkl')")
 parser.add_argument("--samples", type=int, default=32, help="Cycles samples")
 parser.add_argument("--save-path", type=str, default="/home/byungjun/workspace/trumans_ego/ego_render_new",
                     help="Root output dir")
@@ -1130,15 +1131,89 @@ def render_animation_sequence(animation_index, animation_name):
         videos_completed = 0
         
         if args.separate:
-            # Separate mode: progressive rendering - render frames and create videos incrementally
-            print(f"\n--- PROGRESSIVE SEPARATE MODE: Render frames and create videos incrementally ---")
+            # Separate mode: stable rendering - render all frames first, then create videos
+            print(f"\n--- STABLE SEPARATE MODE: Render all frames first, then create videos ---")
             
-            # Create temp directory for current video frames
-            current_video_temp_dir = temp_dir / "current_video_frames"
-            current_video_temp_dir.mkdir(exist_ok=True)
+            # Create temp directories for left and right hand frames (separate folders)
+            left_frames_temp_dir = temp_dir / "left_hand_frames"
+            right_frames_temp_dir = temp_dir / "right_hand_frames"
+            left_frames_temp_dir.mkdir(exist_ok=True)
+            right_frames_temp_dir.mkdir(exist_ok=True)
+            
+            # Step 1: Render ALL frames first (no cleanup, stable storage)
+            print(f"\n=== STEP 1: RENDERING ALL FRAMES ===")
             
             frames_rendered_total = 0
             frames_skipped_total = 0
+            
+            # Calculate all frames needed across all videos
+            all_frames_needed = set()
+            for video_start in video_start_frames:
+                video_end = video_start + (clip_length - 1) * frame_skip
+                for frame_num in range(video_start, video_end + 1, frame_skip):
+                    all_frames_needed.add(frame_num)
+            
+            all_frames_sorted = sorted(list(all_frames_needed))
+            print(f"Total unique frames to render: {len(all_frames_sorted)}")
+            print(f"Frame range: {all_frames_sorted[0]} to {all_frames_sorted[-1]}")
+            
+            # Render all frames
+            for frame_idx, frame_num in enumerate(all_frames_sorted):
+                scene.frame_set(frame_num)
+                
+                # Frame paths using frame_num as identifier (stable naming)
+                left_frame_path = left_frames_temp_dir / f"frame_{frame_num:06d}.png"
+                right_frame_path = right_frames_temp_dir / f"frame_{frame_num:06d}.png"
+                
+                left_exists = left_frame_path.exists()
+                right_exists = right_frame_path.exists()
+                
+                if args.skip_existing and left_exists and right_exists:
+                    frames_skipped_total += 1
+                    continue
+                
+                # Render left and right hands SEPARATELY for better quality
+                frame_render_start = time.time()
+                if frame_idx % 10 == 0 or frame_idx == len(all_frames_sorted) - 1:
+                    print(f"  [RENDER] Frame {frame_num} ({frame_idx + 1}/{len(all_frames_sorted)})...")
+                
+                import cv2
+                
+                # Render left hand separately
+                if not left_exists:
+                    left_image, left_depth = render_hands_pytorch3d(
+                        camera_obj, hand_objects,
+                        render_shape=(args.height, args.width),
+                        grayscale=args.grayscale,
+                        separate_hands=True,
+                        target_hand="left"
+                    )
+                    cv2.imwrite(str(left_frame_path), cv2.cvtColor(left_image, cv2.COLOR_RGB2BGR))
+                
+                # Render right hand separately
+                if not right_exists:
+                    right_image, right_depth = render_hands_pytorch3d(
+                        camera_obj, hand_objects,
+                        render_shape=(args.height, args.width),
+                        grayscale=args.grayscale,
+                        separate_hands=True,
+                        target_hand="right"
+                    )
+                    cv2.imwrite(str(right_frame_path), cv2.cvtColor(right_image, cv2.COLOR_RGB2BGR))
+                
+                frame_time = time.time() - frame_render_start
+                total_render_time += frame_time
+                frames_rendered_total += 1
+                
+                if frame_idx % 10 == 0 or frame_idx == len(all_frames_sorted) - 1:
+                    progress = (frame_idx + 1) / len(all_frames_sorted) * 100.0
+                    avg_time = total_render_time / frames_rendered_total if frames_rendered_total > 0 else 0
+                    print(f"    Progress: {frame_idx + 1}/{len(all_frames_sorted)} ({progress:.1f}%) - {frame_time:.1f}s (avg: {avg_time:.1f}s)")
+            
+            print(f"\n✅ FRAME RENDERING COMPLETE: {frames_rendered_total} rendered, {frames_skipped_total} skipped")
+            
+            # Step 2: Create videos from rendered frames
+            print(f"\n=== STEP 2: CREATING VIDEOS FROM FRAMES ===")
             
             for video_idx, start_frame_num in enumerate(video_start_frames):
                 video_end_frame = start_frame_num + (clip_length - 1) * frame_skip
@@ -1148,117 +1223,92 @@ def render_animation_sequence(animation_index, animation_name):
                 left_video_output_path = os.path.join(videos_output_path_left, f"{video_idx:05d}.mp4")
                 right_video_output_path = os.path.join(videos_output_path_right, f"{video_idx:05d}.mp4")
                 
-                # Check if both videos already exist
-                left_video_exists, left_needs_video_rendering = check_video_exists(video_idx, videos_output_path_left)
-                right_video_exists, right_needs_video_rendering = check_video_exists(video_idx, videos_output_path_right)
-                
-                # Force re-rendering if --no-skip-existing is used
+                # Delete existing videos first if in force mode
                 if not args.skip_existing:
+                    for video_path in [left_video_output_path, right_video_output_path]:
+                        if os.path.exists(video_path):
+                            try:
+                                os.remove(video_path)
+                                print(f"    [DELETE] Removed existing: {video_path}")
+                            except OSError as e:
+                                print(f"    [WARNING] Could not remove: {e}")
+                
+                # Check if videos need to be created (after deletion)
+                if args.skip_existing:
+                    left_video_exists, left_needs_video_rendering = check_video_exists(video_idx, videos_output_path_left)
+                    right_video_exists, right_needs_video_rendering = check_video_exists(video_idx, videos_output_path_right)
+                else:
+                    # Force re-rendering mode: always render
                     left_needs_video_rendering = True
                     right_needs_video_rendering = True
-                    print(f"    [FORCE] --no-skip-existing: Will re-render both videos")
-                    
-                    # Delete existing video files to ensure clean re-rendering
-                    if left_video_exists:
-                        try:
-                            os.remove(left_video_output_path)
-                            print(f"    [DELETE] Removed existing left video: {left_video_output_path}")
-                        except OSError as e:
-                            print(f"    [WARNING] Could not remove left video: {e}")
-                    
-                    if right_video_exists:
-                        try:
-                            os.remove(right_video_output_path)
-                            print(f"    [DELETE] Removed existing right video: {right_video_output_path}")
-                        except OSError as e:
-                            print(f"    [WARNING] Could not remove right video: {e}")
             
                 if args.skip_existing and not left_needs_video_rendering and not right_needs_video_rendering:
-                    print(f"[VIDEO {video_idx + 1}] SKIPPED: Both videos already exist")
+                    print(f"[VIDEO {video_idx + 1}/{len(video_start_frames)}] SKIPPED: Both videos already exist")
                     videos_completed += 2
                     continue
 
-                print(f"\n[VIDEO {video_idx + 1}] Processing frames {start_frame_num}..{video_end_frame} ({len(frames_for_video)} frames)")
-                print(f"  Frame sequence: {frames_for_video[:5]}{'...' if len(frames_for_video) > 5 else ''} (showing first 5)")
+                print(f"\n[VIDEO {video_idx + 1}/{len(video_start_frames)}] Creating from frames {start_frame_num}..{video_end_frame}")
+                print(f"  Frames: {len(frames_for_video)} (expected: {clip_length})")
                 
-                # Step 1: Render frames for this video
-                frames_rendered = 0
-                frames_skipped = 0
-                left_video_frames = []
-                right_video_frames = []
+                # Sanity check: ensure we have exactly clip_length frames
+                if len(frames_for_video) != clip_length:
+                    print(f"  ⚠️  WARNING: Expected {clip_length} frames but got {len(frames_for_video)}!")
                 
-                for frame_idx, frame_num in enumerate(frames_for_video):
-                    scene.frame_set(frame_num)
-                    
-                    # Check if frame already exists
-                    # Use 1-based indexing for ffmpeg compatibility
-                    left_frame_path = current_video_temp_dir / f"left_frame_{frame_idx + 1:04d}.png"
-                    right_frame_path = current_video_temp_dir / f"right_frame_{frame_idx + 1:04d}.png"
-                    
-                    if args.skip_existing and left_frame_path.exists() and right_frame_path.exists():
-                        frames_skipped += 1
-                        if left_needs_video_rendering:
-                            left_video_frames.append(left_frame_path)
-                        if right_needs_video_rendering:
-                            right_video_frames.append(right_frame_path)
-                        continue
-                    
-                    # Render with PyTorch3D (both hands in one pass with channel separation)
-                    frame_render_start = time.time()
-                    if frame_idx % 10 == 0 or frame_idx == len(frames_for_video) - 1:
-                        print(f"  [RENDER] Frame {frame_num} ({frame_idx + 1}/{len(frames_for_video)})...")
-                    
-                    # Render hands using channel separation
-                    left_image, right_image, depth = render_hands_pytorch3d_channel_separated(
-                        camera_obj, hand_objects, 
-                        render_shape=(args.height, args.width), 
-                        grayscale=args.grayscale
-                    )
-                    
-                    # Save images to current video temp directory
-                    import cv2
-                    if left_needs_video_rendering:
-                        cv2.imwrite(str(left_frame_path), cv2.cvtColor(left_image, cv2.COLOR_RGB2BGR))
-                        left_video_frames.append(left_frame_path)
-                    
-                    if right_needs_video_rendering:
-                        cv2.imwrite(str(right_frame_path), cv2.cvtColor(right_image, cv2.COLOR_RGB2BGR))
-                        right_video_frames.append(right_frame_path)
-                    
-                    frame_time = time.time() - frame_render_start
-                    total_render_time += frame_time
-                    frames_rendered += 1
-                    
-                    if frame_idx % 10 == 0 or frame_idx == len(frames_for_video) - 1:
-                        progress = (frame_idx + 1) / len(frames_for_video) * 100.0
-                        print(f"    Frame {frame_idx + 1}/{len(frames_for_video)} ({progress:.1f}%) - {frame_time:.1f}s")
+                # Create symlinks with sequential numbering for ffmpeg
+                video_temp_left = temp_dir / f"video_{video_idx:05d}_left"
+                video_temp_right = temp_dir / f"video_{video_idx:05d}_right"
+                video_temp_left.mkdir(exist_ok=True)
+                video_temp_right.mkdir(exist_ok=True)
                 
-                frames_rendered_total += frames_rendered
-                frames_skipped_total += frames_skipped
-                print(f"  [RENDER COMPLETE] Rendered: {frames_rendered} frames, Skipped: {frames_skipped} frames")
+                # Create symlinks for this video's frames with sequential numbering
+                print(f"  [SYMLINK] Creating {clip_length} sequential frame links...")
+                for seq_idx, frame_num in enumerate(frames_for_video):
+                    # Source frames (using frame_num as identifier)
+                    left_source = left_frames_temp_dir / f"frame_{frame_num:06d}.png"
+                    right_source = right_frames_temp_dir / f"frame_{frame_num:06d}.png"
+                    
+                    # Target symlinks (sequential numbering for ffmpeg)
+                    left_link = video_temp_left / f"frame_{seq_idx + 1:04d}.png"
+                    right_link = video_temp_right / f"frame_{seq_idx + 1:04d}.png"
+                    
+                    # Create symlinks (or copy if symlink fails)
+                    if left_needs_video_rendering and left_source.exists():
+                        try:
+                            if left_link.exists():
+                                left_link.unlink()
+                            left_link.symlink_to(left_source.absolute())
+                        except OSError:
+                            # Fallback to copy if symlink not supported
+                            import shutil
+                            shutil.copy2(left_source, left_link)
+                    
+                    if right_needs_video_rendering and right_source.exists():
+                        try:
+                            if right_link.exists():
+                                right_link.unlink()
+                            right_link.symlink_to(right_source.absolute())
+                        except OSError:
+                            # Fallback to copy if symlink not supported
+                            import shutil
+                            shutil.copy2(right_source, right_link)
                 
-                # Step 2: Create videos from rendered frames
-                print(f"  [VIDEO CREATION] Creating videos...")
+                print(f"  [VIDEO CREATION] Creating videos with {clip_length} frames each...")
                 
                 try:
                     import subprocess
                     
                     # Create left hand video
-                    if left_needs_video_rendering and left_video_frames:
-                        # Debug: Check if frame files actually exist
-                        frame_files_exist = 0
-                        for frame_path in left_video_frames[:5]:  # Check first 5 frames
-                            if frame_path.exists():
-                                frame_files_exist += 1
-                        print(f"    [DEBUG] {frame_files_exist}/{min(5, len(left_video_frames))} frame files exist in temp directory")
+                    if left_needs_video_rendering:
                         left_rgb_cmd = [
-                            'ffmpeg', '-y', '-framerate', str(fps),
-                            '-i', str(current_video_temp_dir / 'left_frame_%04d.png'),
+                            'ffmpeg', '-y', 
+                            '-start_number', '1',  # Start from frame_0001.png
+                            '-framerate', str(fps),
+                            '-i', str(video_temp_left / 'frame_%04d.png'),
+                            '-frames:v', str(clip_length),  # MUST be exactly clip_length frames
                             '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
                             '-crf', '18', left_video_output_path
                         ]
-                        print(f"    [FFMPEG] Creating left hand video with {len(left_video_frames)} frames")
-                        print(f"    [FFMPEG] Command: {' '.join(left_rgb_cmd)}")
+                        print(f"    [FFMPEG] Creating left hand video: {clip_length} frames @ {fps} fps")
                         result = subprocess.run(left_rgb_cmd, check=True, capture_output=True, text=True)
                         if os.path.exists(left_video_output_path) and os.path.getsize(left_video_output_path) > 0:
                             print(f"    ✅ Created left hand video: {left_video_output_path}")
@@ -1266,15 +1316,17 @@ def render_animation_sequence(animation_index, animation_name):
                             print(f"    ❌ Left hand video file not created or empty: {left_video_output_path}")
                     
                     # Create right hand video
-                    if right_needs_video_rendering and right_video_frames:
+                    if right_needs_video_rendering:
                         right_rgb_cmd = [
-                            'ffmpeg', '-y', '-framerate', str(fps),
-                            '-i', str(current_video_temp_dir / 'right_frame_%04d.png'),
+                            'ffmpeg', '-y',
+                            '-start_number', '1',  # Start from frame_0001.png
+                            '-framerate', str(fps),
+                            '-i', str(video_temp_right / 'frame_%04d.png'),
+                            '-frames:v', str(clip_length),  # MUST be exactly clip_length frames
                             '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
                             '-crf', '18', right_video_output_path
                         ]
-                        print(f"    [FFMPEG] Creating right hand video with {len(right_video_frames)} frames")
-                        print(f"    [FFMPEG] Command: {' '.join(right_rgb_cmd)}")
+                        print(f"    [FFMPEG] Creating right hand video: {clip_length} frames @ {fps} fps")
                         result = subprocess.run(right_rgb_cmd, check=True, capture_output=True, text=True)
                         if os.path.exists(right_video_output_path) and os.path.getsize(right_video_output_path) > 0:
                             print(f"    ✅ Created right hand video: {right_video_output_path}")
@@ -1282,38 +1334,20 @@ def render_animation_sequence(animation_index, animation_name):
                             print(f"    ❌ Right hand video file not created or empty: {right_video_output_path}")
                     
                 except subprocess.CalledProcessError as e:
-                    print(f"    ❌ Failed to create separate videos: {e}")
-                    print(f"    Command output: {e.stderr.decode()}")
+                    print(f"    ❌ Failed to create videos: {e}")
+                    stderr_output = e.stderr if isinstance(e.stderr, str) else e.stderr.decode() if e.stderr else "No error output"
+                    print(f"    Error output: {stderr_output}")
+                    print(f"    Frames preserved in: {video_temp_left} and {video_temp_right}")
                 except FileNotFoundError:
                     print(f"    ❌ ffmpeg not found. Please install ffmpeg to create videos.")
-                    print(f"    Rendered frames saved in: {current_video_temp_dir}")
                 
-                # Step 3: Clean up current video frames (keep only overlapping frames for next video)
-                print(f"  [CLEANUP] Cleaning up processed frames...")
-                frames_to_keep = []
-                if video_idx < len(video_start_frames) - 1:  # Not the last video
-                    next_video_start = video_start_frames[video_idx + 1]
-                    # Keep frames that will be needed for the next video (overlap)
-                    for frame_num in range(next_video_start, video_end_frame + 1, frame_skip):
-                        frame_idx_in_current = (frame_num - start_frame_num) // frame_skip
-                        if 0 <= frame_idx_in_current < len(frames_for_video):
-                            frames_to_keep.append(frame_idx_in_current)
-                
-                # Remove frames that won't be needed (use 1-based indexing for ffmpeg compatibility)
-                frames_removed = 0
-                for frame_idx in range(len(frames_for_video)):
-                    if frame_idx not in frames_to_keep:
-                        left_frame_path = current_video_temp_dir / f"left_frame_{frame_idx + 1:04d}.png"
-                        right_frame_path = current_video_temp_dir / f"right_frame_{frame_idx + 1:04d}.png"
-                        if left_frame_path.exists():
-                            left_frame_path.unlink()
-                            frames_removed += 1
-                        if right_frame_path.exists():
-                            right_frame_path.unlink()
-                            frames_removed += 1
-                
-                if frames_removed > 0:
-                    print(f"    Removed {frames_removed} frame files, kept {len(frames_to_keep)} for next video")
+                # Clean up symlinks for this video (not the original frames!)
+                import shutil
+                try:
+                    shutil.rmtree(video_temp_left, ignore_errors=True)
+                    shutil.rmtree(video_temp_right, ignore_errors=True)
+                except:
+                    pass
                 
                 videos_completed += 2
                 
@@ -1327,10 +1361,15 @@ def render_animation_sequence(animation_index, animation_name):
                     print(f"  ⏱️  Avg: {avg_video_time:.1f}s per video pair")
                     print(f"  🎯 ETA: {eta/60:.1f} min | Elapsed: {total_elapsed/60:.1f} min")
             
-            # Final cleanup
-            print(f"\n🧹 Final cleanup of temp directory: {current_video_temp_dir}")
+            # Final cleanup of temp directories
+            print(f"\n🧹 Final cleanup of temp frame directories...")
             import shutil
-            shutil.rmtree(current_video_temp_dir, ignore_errors=True)
+            try:
+                shutil.rmtree(left_frames_temp_dir, ignore_errors=True)
+                shutil.rmtree(right_frames_temp_dir, ignore_errors=True)
+                print(f"   ✅ Cleaned up temporary frame directories")
+            except Exception as e:
+                print(f"   ⚠️  Cleanup warning: {e}")
             
             print(f"\n[SEPARATE HAND VIDEOS] Completed: {videos_completed // 2} video pairs ({videos_completed} total videos)")
             print(f"Total frames rendered: {frames_rendered_total}, Total frames skipped: {frames_skipped_total}")
@@ -1352,16 +1391,17 @@ def render_animation_sequence(animation_index, animation_name):
                 # Define output path first
                 video_output_path = os.path.join(videos_output_path, f"{video_idx:05d}.mp4")
                 
-                # Check if video already exists
-                video_exists, needs_video_rendering = check_video_exists(video_idx, videos_output_path)
-                
-                # Force re-rendering if --no-skip-existing is used
-                if not args.skip_existing:
+                # Check if video exists and determine if rendering is needed
+                if args.skip_existing:
+                    # Only check if we're skipping existing files
+                    video_exists, needs_video_rendering = check_video_exists(video_idx, videos_output_path)
+                else:
+                    # Force re-rendering mode: always render
                     needs_video_rendering = True
                     print(f"    [FORCE] --no-skip-existing: Will re-render video")
                     
-                    # Delete existing video file to ensure clean re-rendering
-                    if video_exists:
+                    # Delete existing video file if it exists
+                    if os.path.exists(video_output_path):
                         try:
                             os.remove(video_output_path)
                             print(f"    [DELETE] Removed existing video: {video_output_path}")
@@ -1426,8 +1466,11 @@ def render_animation_sequence(animation_index, animation_name):
                     
                     # Create RGB video from temp images
                     rgb_cmd = [
-                        'ffmpeg', '-y', '-framerate', str(fps),
+                        'ffmpeg', '-y',
+                        '-start_number', '1',  # Explicitly start from frame 1
+                        '-framerate', str(fps),
                         '-i', str(current_video_temp_dir / 'frame_%04d.png'),
+                        '-frames:v', str(len(video_frames)),  # Specify exact number of frames
                         '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
                         '-crf', '18', video_output_path
                     ]
@@ -1441,7 +1484,9 @@ def render_animation_sequence(animation_index, animation_name):
                     
                 except subprocess.CalledProcessError as e:
                     print(f"    ❌ Failed to create video: {e}")
-                    print(f"    Command output: {e.stderr.decode()}")
+                    # e.stderr is already a string (text=True), no need to decode
+                    stderr_output = e.stderr if isinstance(e.stderr, str) else e.stderr.decode() if e.stderr else "No error output"
+                    print(f"    Command output: {stderr_output}")
                 except FileNotFoundError:
                     print(f"    ❌ ffmpeg not found. Please install ffmpeg to create videos.")
                     print(f"    Rendered frames saved in: {current_video_temp_dir}")
@@ -1557,7 +1602,35 @@ if animation_index is not None:
     if animation_index >= len(animation_sets):
         print(f"Error: Animation index {animation_index} out of range."); sys.exit(1)
     animations_to_render = [(animation_index, list(animation_sets.keys())[animation_index])]
-    print(f"Rendering specific animation: {animation_index}")
+    print(f"Rendering specific animation by index: {animation_index}")
+elif args.animation_name is not None:
+    # Find animation index by name
+    animation_names_list = list(animation_sets.keys())
+    
+    # Try exact match first
+    if args.animation_name in animation_names_list:
+        animation_index = animation_names_list.index(args.animation_name)
+        animations_to_render = [(animation_index, args.animation_name)]
+        print(f"Rendering specific animation by name: {args.animation_name} (index: {animation_index})")
+    else:
+        # Try partial match (without .pkl extension)
+        animation_name_no_ext = args.animation_name.replace('.pkl', '')
+        found = False
+        for i, name in enumerate(animation_names_list):
+            if animation_name_no_ext in name or name.replace('.pkl', '') == animation_name_no_ext:
+                animation_index = i
+                animations_to_render = [(i, name)]
+                print(f"Rendering specific animation by name: {name} (index: {i})")
+                print(f"  (matched with input: {args.animation_name})")
+                found = True
+                break
+        
+        if not found:
+            print(f"Error: Animation name '{args.animation_name}' not found!")
+            print(f"Available animations:")
+            for i, name in enumerate(animation_names_list):
+                print(f"  {i}: {name}")
+            sys.exit(1)
 else:
     animations_to_render = [(i, name) for i, name in enumerate(animation_sets.keys())]
     print(f"Rendering all {len(animations_to_render)} animations")

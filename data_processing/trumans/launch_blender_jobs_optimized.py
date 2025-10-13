@@ -174,7 +174,7 @@ except Exception as e:
             temp_script = f.name
         
         cmd = ["blender", "--background", blend_file, "--python", temp_script]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         
         # Clean up temp file
         try:
@@ -495,7 +495,7 @@ def main():
     print(f"Frame skip: {args.frame_skip} (rendering every {args.frame_skip}th frame)")
     print(f"Camera FOV: {args.fov} degrees")
     print(f"Resolution: {args.width}x{args.height} pixels")
-    if args.samples and 'blender_ego_rgb_depth_optimized.py' in args.script_path:
+    if args.samples and ('blender_ego_rgb_depth_optimized.py' in args.script_path or 'blender_ego_static.py' in args.script_path):
         print(f"Cycles samples: {args.samples}")
     if args.grayscale and 'blender_ego_hand.py' in args.script_path:
         print(f"Grayscale mode: Enabled (hands will be rendered in black & white)")
@@ -507,7 +507,7 @@ def main():
         print(f"No-skip-existing: Enabled (will force re-render existing files)")
     if 'blender_ego_hand.py' in args.script_path:
         print(f"Hand rendering resolution: {args.width}x{args.height} pixels")
-    if args.no_depth and 'blender_ego_rgb_depth_optimized.py' in args.script_path:
+    if args.no_depth and ('blender_ego_rgb_depth_optimized.py' in args.script_path or 'blender_ego_static.py' in args.script_path):
         print(f"No-depth mode: Enabled (RGB only, no depth rendering)")
     print(f"Found {len(blend_jobs)} .blend files.")
     
@@ -1110,16 +1110,20 @@ def main():
             cmd.extend(["--height", str(args.height)])
         
         # Add samples option if specified and using blender_ego_rgb_depth_optimized.py
-        if 'blender_ego_rgb_depth_optimized.py' in args.script_path:
+        if 'blender_ego_rgb_depth_optimized.py' in args.script_path or 'blender_ego_static.py' in args.script_path:
             cmd.extend(["--samples", str(args.samples)])
         
         # Add no-depth option if specified and using blender_ego_rgb_depth_optimized.py
-        if args.no_depth and 'blender_ego_rgb_depth_optimized.py' in args.script_path:
+        if args.no_depth and 'blender_ego_rgb_depth_optimized.py' in args.script_path or 'blender_ego_static.py' in args.script_path:
             cmd.append("--no-depth")
         
-        # Add animation index for animation-based jobs
+        # Add animation index or name for animation-based jobs
         if job.get('job_type') == 'animation':
-            cmd.extend(["--animation_index", str(job['animation_index'])])
+            # Prefer animation name over index if available
+            if 'animation_name' in job and job['animation_name']:
+                cmd.extend(["--animation_name", job['animation_name']])
+            else:
+                cmd.extend(["--animation_index", str(job['animation_index'])])
         
         # Assign environment variable to restrict GPU usage
         env = os.environ.copy()
