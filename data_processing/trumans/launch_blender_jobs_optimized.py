@@ -495,7 +495,7 @@ def main():
     print(f"Frame skip: {args.frame_skip} (rendering every {args.frame_skip}th frame)")
     print(f"Camera FOV: {args.fov} degrees")
     print(f"Resolution: {args.width}x{args.height} pixels")
-    if args.samples and 'blender_ego_rgb_depth_optimized.py' in args.script_path:
+    if args.samples and ('blender_ego_rgb_depth_optimized.py' in args.script_path or 'blender_ego_static.py' in args.script_path):
         print(f"Cycles samples: {args.samples}")
     if args.grayscale and 'blender_ego_hand.py' in args.script_path:
         print(f"Grayscale mode: Enabled (hands will be rendered in black & white)")
@@ -507,7 +507,7 @@ def main():
         print(f"No-skip-existing: Enabled (will force re-render existing files)")
     if 'blender_ego_hand.py' in args.script_path:
         print(f"Hand rendering resolution: {args.width}x{args.height} pixels")
-    if args.no_depth and 'blender_ego_rgb_depth_optimized.py' in args.script_path:
+    if args.no_depth and ('blender_ego_rgb_depth_optimized.py' in args.script_path or 'blender_ego_static.py' in args.script_path):
         print(f"No-depth mode: Enabled (RGB only, no depth rendering)")
     print(f"Found {len(blend_jobs)} .blend files.")
     
