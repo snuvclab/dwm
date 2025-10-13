@@ -1492,6 +1492,50 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
         # No preprocessing needed - just ensure correct format
         return adapter_control
 
+    def preprocess_raymap(
+        self,
+        raymap,
+        height,
+        width,
+        num_frames,
+    ):
+        """Preprocess raymap data.
+        
+        Args:
+            raymap: Input raymap tensor [B, F, 6, H/8, W/8] (uncompressed)
+            height: Target height
+            width: Target width  
+            num_frames: Target number of frames
+            
+        Returns:
+            Preprocessed and temporally compressed raymap tensor [B, T', 24, H/8, W/8]
+            where T' = F / vae_scale_factor_temporal, 24 = 6 * 4
+        """
+        # Convert to torch tensor if needed
+        if isinstance(raymap, np.ndarray):
+            raymap = torch.from_numpy(raymap)
+        
+        # Raymap comes in as [B, F, 6, h, w]
+        # Need to compress temporally: [B, F, 6, h, w] -> [B, T', 24, h, w]
+        # where T' = F / vae_scale_factor_temporal (4)
+        
+        # If frames not divisible by vae_scale_factor_temporal, pad by repeating first frames
+        if raymap.shape[1] % self.vae_scale_factor_temporal != 0:
+            # Calculate how many frames to pad
+            padding_frames = self.vae_scale_factor_temporal - (raymap.shape[1] % self.vae_scale_factor_temporal)
+            # Repeat first frames to pad
+            raymap = torch.cat([raymap[:, :padding_frames], raymap], dim=1)
+        
+        # Temporally compress: rearrange (n=4 frames) * (c=6 channels) = 24 channels
+        # b (n t) c h w -> b t (n c) h w
+        camera_conditions = rearrange(
+            raymap,
+            "b (n t) c h w -> b t (n c) h w",
+            n=self.vae_scale_factor_temporal,
+        )
+        
+        return camera_conditions
+
     def check_inputs(
         self,
         prompt,
@@ -1604,12 +1648,14 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
         negative_prompt: Optional[Union[str, List[str]]] = None,
         height: int = 480,
         width: int = 720,
+        image: Optional[Union[PIL.Image.Image, np.ndarray, torch.FloatTensor]] = None,
         video: Union[torch.FloatTensor] = None,
         mask_video: Union[torch.FloatTensor] = None,
         masked_video_latents: Union[torch.FloatTensor] = None,
         static_videos: Optional[Union[torch.FloatTensor, np.ndarray, List[PIL.Image.Image]]] = None,
         hand_videos: Optional[Union[torch.FloatTensor, np.ndarray, List[PIL.Image.Image]]] = None,
         smpl_pos_map: Optional[Union[torch.FloatTensor, np.ndarray]] = None,
+        raymap: Optional[Union[torch.FloatTensor, np.ndarray]] = None,
         num_frames: int = 49,
         num_inference_steps: int = 50,
         timesteps: Optional[List[int]] = None,
@@ -1780,6 +1826,25 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
         is_strength_max = strength == 1.0
 
         # 5. Prepare latents.
+        # Convert image to static_videos if provided (for I2V mode)
+        if image is not None and static_videos is None:
+            # Process image and convert to single-frame static_videos
+            if isinstance(image, PIL.Image.Image):
+                image_tensor = self.video_processor.preprocess(image, height, width, resize_mode="crop")
+            elif isinstance(image, np.ndarray):
+                image_tensor = self._preprocess_image(image, height, width)
+            else:  # torch.Tensor
+                image_tensor = image
+            
+            # Convert to [B, C, 1, H, W] format for static_videos
+            if image_tensor.ndim == 3:  # [C, H, W]
+                image_tensor = image_tensor.unsqueeze(0).unsqueeze(2)  # [1, C, 1, H, W]
+            elif image_tensor.ndim == 4:  # [B, C, H, W]
+                image_tensor = image_tensor.unsqueeze(2)  # [B, C, 1, H, W]
+            
+            # Use image as first frame, rest will be zero-padded in prepare_latents
+            static_videos = image_tensor
+        
         if static_videos is not None:
             # Use static_videos as the condition video
             static_videos = self.preprocess_static_conditions(static_videos, height, width, num_frames)
@@ -1826,6 +1891,11 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
         if smpl_pos_map is not None:
             processed_smpl_pos_map = self.preprocess_smpl_pos_map(smpl_pos_map, height, width, num_frames)
         
+        # Preprocess raymap if provided
+        processed_raymap = None
+        if raymap is not None:
+            processed_raymap = self.preprocess_raymap(raymap, height, width, num_frames)
+        
         # Determine adapter control based on adapter_control_type
         processed_adapter_control = None
         if self.add_control_adapter:
@@ -1863,7 +1933,7 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
         if comfyui_progressbar and pbar is not None:
             pbar.update(1)
         
-        # Concatenate condition latents (hand_videos + smpl_pos_map)
+        # Concatenate condition latents (hand_videos + smpl_pos_map + raymap)
         control_latents = None
         control_latents_list = []
         
@@ -1872,6 +1942,13 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
         
         if smpl_pos_map_latents is not None:
             control_latents_list.append(smpl_pos_map_latents)
+        
+        # Add raymap if provided (already in compressed format [B, T', 24, H/8, W/8])
+        if processed_raymap is not None:
+            # Raymap is already compressed and at correct resolution
+            # Just ensure it's on the correct device and dtype
+            raymap_for_concat = processed_raymap.to(device=device, dtype=latents.dtype)
+            control_latents_list.append(raymap_for_concat)
         
         if control_latents_list:
             # Concatenate along channel dimension: [B, F, C1, H, W] + [B, F, C2, H, W] -> [B, F, C1+C2, H, W]
@@ -1924,7 +2001,7 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
                 inpaint_latents = torch.cat([mask_input, masked_video_latents_input], dim=2).to(latents.dtype)
             else:
                 # Prepare mask latent variables
-                mask_condition = self.mask_processor.preprocess(rearrange(mask_video, "b c f h w -> (b f) h w c"), height=height, width=width) 
+                mask_condition = self.mask_processor.preprocess(rearrange(mask_video, "b c f h w -> (b f) c h w"), height=height, width=width) 
                 mask_condition = mask_condition.to(dtype=torch.float32)
                 mask_condition = rearrange(mask_condition, "(b f) c h w -> b c f h w", f=video_length)
 
@@ -1961,7 +2038,6 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
                     mask = rearrange(mask, "b c f h w -> b f c h w")
                     mask_input = rearrange(mask_input, "b c f h w -> b f c h w")
                     masked_video_latents_input = rearrange(masked_video_latents_input, "b c f h w -> b f c h w")
-
                     inpaint_latents = torch.cat([mask_input, masked_video_latents_input], dim=2).to(latents.dtype)
                 else:
                     mask = torch.tile(mask_condition, [1, num_channels_latents, 1, 1, 1])

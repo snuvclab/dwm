@@ -105,6 +105,7 @@ def log_validation_with_dataset(
     validation_hand_video_left_path: str = None,
     validation_hand_video_right_path: str = None,
     validation_smpl_pos_map_path: str = None,
+    validation_raymap_path: str = None,
     is_final_validation: bool = False,
     step: int = 0,
     pipeline_type: str = None,
@@ -190,7 +191,6 @@ def log_validation_with_dataset(
                 
                 # Create a minimal dataset instance just to use the loading method
                 import decord
-                from pathlib import Path
                 video_reader = decord.VideoReader(uri=validation_smpl_pos_map_path.as_posix())
                 smpl_pos_map = video_reader[:]  # [F, H, W, C]
                 smpl_pos_map = smpl_pos_map.permute(3, 0, 1, 2)  # [C, F, H, W]
@@ -237,6 +237,16 @@ def log_validation_with_dataset(
         else:
             smpl_pos_map = None
         
+        # Load raymap if provided
+        if validation_raymap_path and os.path.exists(validation_raymap_path):
+            raymap = torch.load(validation_raymap_path, map_location="cpu", weights_only=True)
+            # raymap is [F, C, H, W] - convert to [1, F, C, H, W]
+            if raymap.ndim == 4:
+                raymap = raymap.unsqueeze(0)  # Add batch dimension
+            raymap = raymap.numpy()
+        else:
+            raymap = None
+        
         human_motions = None
 
     # Check condition control flags (only for concat/adapter)
@@ -262,6 +272,27 @@ def log_validation_with_dataset(
         "width": 720,
         "num_frames": 49,
     }
+    
+    # Prepare mask_video for VideoX-Fun pipelines
+    # mask_video controls which frames to regenerate (255 = regenerate, 0 = keep)
+    if "fun" in pipeline_type:
+        # Create mask_video based on validation_mode
+        batch_size = 1
+        num_frames = 49
+        height = 480
+        width = 720
+        
+        if validation_mode == "image_to_video":
+            # I2V mode: Only first frame is known (0), rest should be regenerated (255)
+            # Shape: [B, C, F, H, W] where C=1 for mask
+            mask_video = torch.zeros((batch_size, 1, num_frames, height, width), dtype=torch.uint8)
+            mask_video[:, :, 1:, :, :] = 255  # Regenerate all frames except first
+            pipeline_args["mask_video"] = mask_video
+        elif validation_mode == "static_to_video":
+            # Static-to-video mode: All frames are condition video (0 = keep all)
+            # This leverages the Fun checkpoint's behavior to output cond video as-is
+            mask_video = torch.zeros((batch_size, 1, num_frames, height, width), dtype=torch.uint8)
+            pipeline_args["mask_video"] = mask_video
     
     # Add pipeline-specific arguments
     if pipeline_type is None:
@@ -299,7 +330,8 @@ def log_validation_with_dataset(
         pipeline_args["image"] = dummy_image
     elif pipeline_type in ["cogvideox_static_to_video", "cogvideox_static_to_video_pose_concat", 
                            "cogvideox_fun_static_to_video", "cogvideox_fun_static_to_video_pose_concat",
-                           "cogvideox_fun_static_to_video_posmap_concat", "cogvideox_fun_static_to_video_posmap_adapter"]:
+                           "cogvideox_fun_static_to_video_posmap_concat", "cogvideox_fun_static_to_video_posmap_adapter",
+                           "cogvideox_fun_static_to_video_raymap_pose_concat"]:
         # I2V-based pipelines with video conditioning
         # For these pipelines, we test both I2V and static-to-video modes
         if validation_mode == "image_to_video":
@@ -318,8 +350,12 @@ def log_validation_with_dataset(
                     dummy_image = Image.fromarray(dummy_image)
                 pipeline_args["image"] = dummy_image
             
-            # Don't pass video conditions in I2V mode
-            # The pipeline will handle I2V mode by using the image input
+            # For raymap_pose_concat, we still need hand_videos and raymap in I2V mode
+            if pipeline_type == "cogvideox_fun_static_to_video_raymap_pose_concat":
+                pipeline_args["hand_videos"] = hand_video
+                pipeline_args["raymap"] = raymap
+                # Don't pass static_videos in I2V mode (will use image instead)
+            # For other pipelines, don't pass video conditions in I2V mode
         else:
             # Static-to-video mode: use full static video
             if pipeline_type == "cogvideox_static_to_video":
@@ -341,6 +377,10 @@ def log_validation_with_dataset(
             elif pipeline_type == "cogvideox_fun_static_to_video_posmap_adapter":
                 pipeline_args["static_videos"] = static_video
                 pipeline_args["smpl_pos_map"] = smpl_pos_map  # Will be used as adapter control based on adapter_control_type
+            elif pipeline_type == "cogvideox_fun_static_to_video_raymap_pose_concat":
+                pipeline_args["static_videos"] = static_video
+                pipeline_args["hand_videos"] = hand_video
+                pipeline_args["raymap"] = raymap
             elif pipeline_type == "cogvideox_fun_static_to_video_cross":
                 pipeline_args["static_videos"] = static_video
                 pipeline_args["hand_videos"] = hand_video
@@ -692,6 +732,31 @@ def run_validation(
             use_adapter=False,
             compress_smpl_pos_map_temporal=compress_smpl_pos_map_temporal,
         )
+    elif pipeline_config["type"] == "cogvideox_fun_static_to_video_raymap_pose_concat":
+        # Setup CogVideoX Fun Static-to-Video with Raymap + Hand Pose Concat Pipeline for validation
+        print("🔧 Setting up validation pipeline: Raymap + Hand Pose Concat")
+        
+        # Calculate condition_channels based on split_hands
+        # Note: mask(1) and visual(16) are handled by base model inpaint_latents
+        # Split hands: 24 + 32 = 56 channels
+        # Regular hands: 24 + 16 = 40 channels
+        split_hands = data_config.get("split_hands", False)
+        hand_channels = 32 if split_hands else 16
+        condition_channels = 24 + hand_channels  # camera + hand only
+        
+        print(f"   condition_channels: {condition_channels} (camera:24 + hand:{hand_channels})")
+        
+        pipe = CogVideoXFunStaticToVideoPipeline.from_pretrained(
+            base_model_name_or_path=model_config_dict["base_model_name_or_path"],
+            transformer=unwrap_model(accelerator, transformer),
+            scheduler=scheduler,
+            revision=model_config_dict.get("revision"),
+            variant=model_config_dict.get("variant"),
+            torch_dtype=weight_dtype,
+            condition_channels=condition_channels,
+            use_adapter=False,
+            split_hands=split_hands,
+        )
     elif pipeline_config["type"] == "cogvideox_fun_static_to_video_posmap_adapter":
         # Get adapter parameters from data/pipeline config
         in_dim_control_adapter = data_config.get("vae_scale_factor_temporal", 4) * 3  # Default: 12
@@ -817,9 +882,11 @@ def run_validation(
         validation_hand_videos_left = []
         validation_hand_videos_right = []
         validation_smpl_pos_maps = []
+        validation_raymaps = []
         
         split_hands = data_config.get("split_hands", False)
         use_smpl_pos_map = pipeline_config["type"] in ["cogvideox_fun_static_to_video_posmap_concat", "cogvideox_fun_static_to_video_posmap_adapter"]
+        use_raymap = pipeline_config["type"] in ["cogvideox_fun_static_to_video_raymap_pose_concat"]
         
         for video_path in validation_set:
             # Convert video path to hand and static video paths
@@ -851,10 +918,17 @@ def run_validation(
                 validation_smpl_pos_maps.append(Path(data_config["data_root"]) / smpl_pos_map_path)
             else:
                 validation_smpl_pos_maps.append(None)
+            
+            # Add raymap path if needed
+            if use_raymap:
+                raymap_path = video_path_obj.parent.parent / "raymaps" / f"{video_path_obj.stem}.pt"
+                validation_raymaps.append(Path(data_config["data_root"]) / raymap_path)
+            else:
+                validation_raymaps.append(None)
 
         # Run validation for each video
-        for validation_video, validation_prompt, validation_hand_video, validation_static_video, validation_hand_video_left, validation_hand_video_right, validation_smpl_pos_map in zip(
-            validation_videos, validation_prompts, validation_hand_videos, validation_static_videos, validation_hand_videos_left, validation_hand_videos_right, validation_smpl_pos_maps
+        for validation_video, validation_prompt, validation_hand_video, validation_static_video, validation_hand_video_left, validation_hand_video_right, validation_smpl_pos_map, validation_raymap in zip(
+            validation_videos, validation_prompts, validation_hand_videos, validation_static_videos, validation_hand_videos_left, validation_hand_videos_right, validation_smpl_pos_maps, validation_raymaps
         ):
             # Check required files based on pipeline type
             if pipeline_config["type"] in ["cogvideox_pose_adaln", "cogvideox_pose_adaln_perframe"]:
@@ -1076,6 +1150,47 @@ def run_validation(
                     step=step,
                     pipeline_type=config["pipeline"]["type"],
                     validation_mode="static_to_video",
+                )
+            elif config["pipeline"]["type"] == "cogvideox_fun_static_to_video_raymap_pose_concat":
+                # For VideoX-Fun Raymap + Hand Pose Concat pipeline, test both modes
+                print(f"🎬 Testing VideoX-Fun Raymap + Hand Pose Concat pipeline with two modes for {validation_video.name}")
+                
+                # Mode 1: Static Video-to-Video (use full static video)
+                print("   Mode 1: Static Video-to-Video (full static video)")
+                log_validation_with_dataset(
+                    pipe=pipe,
+                    config=config,
+                    accelerator=accelerator,
+                    validation_video_path=validation_video,
+                    validation_prompt=prompt_text,
+                    validation_hand_video_path=validation_hand_video,
+                    validation_static_video_path=validation_static_video,
+                    validation_human_motions_path=None,
+                    validation_hand_video_left_path=validation_hand_video_left,
+                    validation_hand_video_right_path=validation_hand_video_right,
+                    validation_raymap_path=validation_raymap,
+                    step=step,
+                    pipeline_type=config["pipeline"]["type"],
+                    validation_mode="static_to_video",
+                )
+                
+                # Mode 2: Image-to-Video (prediction mode - use first frame only)
+                print("   Mode 2: Image-to-Video / Prediction (first frame only)")
+                log_validation_with_dataset(
+                    pipe=pipe,
+                    config=config,
+                    accelerator=accelerator,
+                    validation_video_path=validation_video,
+                    validation_prompt=prompt_text,
+                    validation_hand_video_path=validation_hand_video,
+                    validation_static_video_path=None,  # Don't use static in prediction mode
+                    validation_human_motions_path=None,
+                    validation_hand_video_left_path=validation_hand_video_left,
+                    validation_hand_video_right_path=validation_hand_video_right,
+                    validation_raymap_path=validation_raymap,
+                    step=step,
+                    pipeline_type=config["pipeline"]["type"],
+                    validation_mode="image_to_video",
                 )
             else:
                 # For concat/adapter, pass hand/static video paths
@@ -1315,6 +1430,38 @@ def setup_pipeline_from_config(config: Dict[str, Any]):
             condition_channels=condition_channels,
             use_adapter=False,
             compress_smpl_pos_map_temporal=compress_smpl_pos_map_temporal,
+        )
+    
+    elif pipeline_type == "cogvideox_fun_static_to_video_raymap_pose_concat":
+        # Setup CogVideoX Fun Static-to-Video with Raymap + Hand Pose Concat Pipeline
+        print("🔧 Setting up CogVideoX Fun Static-to-Video with Raymap + Hand Pose Concat pipeline")
+        
+        # Calculate condition_channels based on split_hands
+        # Channels: camera(24) + hand
+        # Note: mask(1) and visual(16) are handled by the base pretrained model (inpaint_latents)
+        # Split hands: 24 + 32 = 56 channels
+        # Regular hands: 24 + 16 = 40 channels
+        split_hands = data_config.get("split_hands", False)
+        hand_channels = 32 if split_hands else 16
+        condition_channels = 24 + hand_channels  # camera + hand only
+        
+        p_prediction = config.get("training", {}).get("p_prediction", 0.5)
+        
+        print(f"   split_hands: {split_hands}")
+        print(f"   hand_channels: {hand_channels}")
+        print(f"   condition_channels: {condition_channels} (camera:24 + hand:{hand_channels})")
+        print(f"   Note: mask(1) and visual(16) are handled by base model inpaint_latents")
+        print(f"   p_prediction (image vs static): {p_prediction}")
+        
+        pipeline = CogVideoXFunStaticToVideoPipeline.from_pretrained(
+            pretrained_model_name_or_path=None,  # Always start from base model
+            base_model_name_or_path=model_path,
+            torch_dtype=load_dtype,
+            revision=model_config.get("revision"),
+            variant=model_config.get("variant"),
+            condition_channels=condition_channels,
+            use_adapter=False,
+            split_hands=split_hands,
         )
     
     elif pipeline_type == "cogvideox_fun_static_to_video_posmap_adapter":
@@ -1658,12 +1805,11 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
                         # Save trainable parameters (non-LoRA weights) if trainable_parameter_patterns is specified
                         trainable_state_dict = None
                         if "trainable_parameter_patterns" in training_config:
-                            import fnmatch
                             trainable_state_dict = {}
                             for name, param in model.named_parameters():
                                 # Check if this parameter matches any trainable pattern using fnmatch for wildcard support
                                 for pattern in training_config["trainable_parameter_patterns"]:
-                                    if fnmatch.fnmatch(name, pattern):
+                                    if pattern in name:
                                         trainable_state_dict[name] = param.data
                                         break
                         
@@ -1749,6 +1895,11 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
                                 transformer_lora_layers=transformer_lora_layers,
                             )
                         elif pipeline_type == "cogvideox_fun_static_to_video_posmap_concat":
+                            CogVideoXFunStaticToVideoPipeline.save_lora_weights(
+                                output_dir,
+                                transformer_lora_layers=transformer_lora_layers,
+                            )
+                        elif pipeline_type == "cogvideox_fun_static_to_video_raymap_pose_concat":
                             CogVideoXFunStaticToVideoPipeline.save_lora_weights(
                                 output_dir,
                                 transformer_lora_layers=transformer_lora_layers,
@@ -1912,6 +2063,22 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
                 condition_channels=condition_channels,
                 subfolder="transformer",
             )
+        elif pipeline_type == "cogvideox_fun_static_to_video_raymap_pose_concat":
+            # For VideoX-Fun static-to-video raymap pose concat, use concat transformer
+            from training.cogvideox_static_pose.cogvideox_fun_transformer_with_conditions import CogVideoXFunTransformer3DModelWithConcat
+            # Calculate condition_channels based on split_hands
+            # Note: mask(1) and visual(16) are handled by base model inpaint_latents
+            # Split hands: 24 + 32 = 56 channels
+            # Regular hands: 24 + 16 = 40 channels
+            split_hands = config["data"].get("split_hands", False)
+            hand_channels = 32 if split_hands else 16
+            condition_channels = 24 + hand_channels  # camera + hand only
+            transformer_ = CogVideoXFunTransformer3DModelWithConcat.from_pretrained(
+                pretrained_model_name_or_path=None,  # Always start from base model
+                base_model_name_or_path=config["model"]["base_model_name_or_path"],
+                condition_channels=condition_channels,
+                subfolder="transformer",
+            )
         elif pipeline_type == "cogvideox_fun_static_to_video_posmap_adapter":
             # For VideoX-Fun static-to-video posmap adapter, use concat transformer with control adapter
             from training.cogvideox_static_pose.cogvideox_fun_transformer_with_conditions import CogVideoXFunTransformer3DModelWithConcat
@@ -2056,6 +2223,8 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
             elif pipeline_type == "cogvideox_fun_static_to_video_pose_concat":
                 lora_state_dict = CogVideoXFunStaticToVideoPipeline.lora_state_dict(input_dir)
             elif pipeline_type == "cogvideox_fun_static_to_video_posmap_concat":
+                lora_state_dict = CogVideoXFunStaticToVideoPipeline.lora_state_dict(input_dir)
+            elif pipeline_type == "cogvideox_fun_static_to_video_raymap_pose_concat":
                 lora_state_dict = CogVideoXFunStaticToVideoPipeline.lora_state_dict(input_dir)
             elif pipeline_type == "cogvideox_fun_static_to_video_posmap_adapter":
                 lora_state_dict = CogVideoXFunStaticToVideoPipeline.lora_state_dict(input_dir)
@@ -2244,6 +2413,21 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
                 from training.cogvideox_static_pose.cogvideox_fun_transformer_with_conditions import CogVideoXFunTransformer3DModelWithConcat
                 compress_smpl_pos_map_temporal = config["data"].get("compress_smpl_pos_map_temporal", False)
                 condition_channels = 12 if compress_smpl_pos_map_temporal else 16
+                load_model = CogVideoXFunTransformer3DModelWithConcat.from_pretrained(
+                    pretrained_model_name_or_path=os.path.join(input_dir, "transformer"),
+                    base_model_name_or_path=config["model"]["base_model_name_or_path"],
+                    condition_channels=condition_channels
+                )
+            elif pipeline_type == "cogvideox_fun_static_to_video_raymap_pose_concat":
+                # For VideoX-Fun static-to-video raymap pose concat, use concat transformer
+                from training.cogvideox_static_pose.cogvideox_fun_transformer_with_conditions import CogVideoXFunTransformer3DModelWithConcat
+                # Calculate condition_channels based on split_hands
+                # Note: mask(1) and visual(16) are handled by base model inpaint_latents
+                # Split hands: 24 + 32 = 56 channels
+                # Regular hands: 24 + 16 = 40 channels
+                split_hands = config["data"].get("split_hands", False)
+                hand_channels = 32 if split_hands else 16
+                condition_channels = 24 + hand_channels  # camera + hand only
                 load_model = CogVideoXFunTransformer3DModelWithConcat.from_pretrained(
                     pretrained_model_name_or_path=os.path.join(input_dir, "transformer"),
                     base_model_name_or_path=config["model"]["base_model_name_or_path"],
@@ -2556,8 +2740,14 @@ def main():
         experiment_config["output_dir"] = f"{base_output_dir}_debug"
         print(f"🔧 Debug mode: Output directory set to {experiment_config['output_dir']}")
     elif args.mode == "slurm_test":
-        # For test mode, use test default (no resume logic)
-        experiment_config["output_dir"] = f"{base_output_dir}_slurm_test"
+        slurm_job_id = training_config.get("slurm_job_id")
+        if resume_from_checkpoint and slurm_job_id:
+            print(f"🔄 Resume mode: Using SLURM Job ID from config: {slurm_job_id}")
+            experiment_config["output_dir"] = f"{base_output_dir}_slurm_{slurm_job_id}"
+            print(f"📁 SLURM test mode: Output directory set to {experiment_config['output_dir']}")
+        else:
+            experiment_config["output_dir"] = f"{base_output_dir}_slurm_test"
+            print(f"🧪 SLURM test mode: Output directory set to {experiment_config['output_dir']}")
         print(f"🧪 SLURM test mode: Output directory set to {experiment_config['output_dir']}")
     elif args.mode == "slurm":
         # Check if this is a resume situation
@@ -2740,6 +2930,8 @@ def main():
         "compress_smpl_pos_map_temporal": data_config.get("compress_smpl_pos_map_temporal", False),
         "vae_scale_factor_temporal": data_config.get("vae_scale_factor_temporal", 4),
         "vae_scale_factor_spatial": data_config.get("vae_scale_factor_spatial", 8),
+        "load_raymaps": data_config.get("load_raymaps", False),
+        "load_image_goal": data_config.get("load_image_goal", False),
     }
     
     # Choose dataset class based on pipeline type
@@ -2788,6 +2980,8 @@ def main():
             "static_videos": torch.stack([item["static_videos"] for item in batch]) if "static_videos" in batch[0] and batch[0]["static_videos"] is not None else None,
             "smpl_pos_map": torch.stack([item["smpl_pos_map"] for item in batch]) if "smpl_pos_map" in batch[0] and batch[0]["smpl_pos_map"] is not None else None,
             "human_motions": torch.stack([item["human_motions"] for item in batch]) if "human_motions" in batch[0] and batch[0]["human_motions"] is not None else None,
+            "raymaps": torch.stack([item["raymap"] for item in batch]) if "raymap" in batch[0] and batch[0]["raymap"] is not None else None,
+            "image_goal": torch.stack([item["image_goal"] for item in batch]) if "image_goal" in batch[0] and batch[0]["image_goal"] is not None else None,
         },
         num_workers=data_config.get("dataloader_num_workers", 0),
         pin_memory=data_config.get("pin_memory", True),
@@ -3167,12 +3361,14 @@ def main():
                 current_epoch = epoch
                 
                 videos = batch["videos"].to(accelerator.device, non_blocking=True)
-                images = batch.get("images")  # For I2V pipeline
+                images = batch.get("images")  # For I2V pipeline and prediction mode
                 prompts = batch["prompts"]
                 hand_videos = batch.get("hand_videos")
                 static_videos = batch.get("static_videos")
                 smpl_pos_map = batch.get("smpl_pos_map")  # For SMPL pos map pipeline
                 human_motions = batch.get("human_motions")  # For AdaLN pipeline
+                raymaps = batch.get("raymaps")  # For raymap camera condition
+                image_goal = batch.get("image_goal")  # For planning mode (future use)
                 
                 # Process condition videos once for all pipelines
                 load_tensors = training_config.get("custom_settings", {}).get("load_tensors", False)
@@ -3414,6 +3610,87 @@ def main():
                     transformer_input = torch.cat([noisy_model_input, mask_input, static_videos_latents, smpl_pos_map_latents], dim=2)
                     condition_latents = None
                 
+                elif pipeline_config["type"] == "cogvideox_fun_static_to_video_raymap_pose_concat":
+                    # For VideoX-Fun static-to-video raymap pose concat pipeline
+                    # Two modes: prediction (image + zero padding) or static-to-video (full static)
+                    p_prediction = training_config.get("p_prediction", 0.5)
+                    
+                    # Process images to latents if in prediction mode
+                    if images is not None and random.random() < p_prediction:
+                        # Prediction mode: image + zero padding
+                        if not load_tensors:
+                            # Encode image to latents
+                            images = images.to(accelerator.device, dtype=weight_dtype)
+                            images = images.permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
+                            with torch.no_grad():
+                                image_latent_dist = vae.encode(images).latent_dist
+                            image_latents = image_latent_dist.sample() * VAE_SCALING_FACTOR
+                            image_latents = image_latents.permute(0, 2, 1, 3, 4)  # [B, F, C, H, W]
+                            image_latents = image_latents.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
+                        else:
+                            image_latent_dist = DiagonalGaussianDistribution(images)
+                            image_latents = image_latent_dist.sample() * VAE_SCALING_FACTOR
+                            image_latents = image_latents.permute(0, 2, 1, 3, 4)  # [B, F, C, H, W]
+                            image_latents = image_latents.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
+                        
+                        # Create visual condition: image + zero padding
+                        padding_shape = (batch_size, num_frames - 1, *image_latents.shape[2:])
+                        latent_padding = image_latents.new_zeros(padding_shape)
+                        visual_condition = torch.cat([image_latents, latent_padding], dim=1)
+                        
+                        # Mask: first frame only
+                        mask_input = torch.zeros_like(noisy_model_input[:, :, :1])
+                        mask_input[:, 0:1, :] = VAE_SCALING_FACTOR
+                    else:
+                        # Static-to-video mode: full static video
+                        visual_condition = static_videos_latents
+                        
+                        # Mask: all ones
+                        mask_input = torch.ones_like(noisy_model_input[:, :, :1]) * VAE_SCALING_FACTOR
+                    
+                    # Camera condition (raymap with temporal compression like Aether)
+                    # Raymap: 6 channels * 4 frames = 24 channels after compression
+                    if raymaps is not None:
+                        raymaps = raymaps.to(device=accelerator.device, dtype=weight_dtype)
+                        
+                        # Temporal padding (like Aether)
+                        VAE_SCALE_FACTOR_TEMPORAL = data_config.get("vae_scale_factor_temporal", 4)
+                        pad_frames = VAE_SCALE_FACTOR_TEMPORAL - (raymaps.shape[1] % VAE_SCALE_FACTOR_TEMPORAL)
+                        if pad_frames > 0 and pad_frames < VAE_SCALE_FACTOR_TEMPORAL:
+                            raymap_padding = raymaps[:, :pad_frames]
+                            raymaps = torch.cat([raymap_padding, raymaps], dim=1)
+                        
+                        # Temporal compression: [B, F, 6, H, W] -> [B, F/4, 24, H, W]
+                        from einops import rearrange
+                        camera_condition = rearrange(
+                            raymaps,
+                            "b (n t) c h w -> b t (n c) h w",
+                            n=VAE_SCALE_FACTOR_TEMPORAL,
+                        )
+                    else:
+                        # Zero camera condition if raymap not available (6 * 4 = 24 channels)
+                        camera_condition = torch.zeros(
+                            batch_size, num_frames, 24, height, width,
+                            device=accelerator.device, dtype=weight_dtype
+                        )
+                    
+                    # Final concat: [noisy, mask, visual, camera, hand]
+                    # Note: mask(1) and visual(16) are handled by base model (inpaint_latents)
+                    # Total transformer input channels:
+                    #   - Split hands: 16 + 1 + 16 + 24 + 32 = 89 channels
+                    #   - Regular hands: 16 + 1 + 16 + 24 + 16 = 73 channels
+                    # But condition_channels (for transformer.patch_embed.proj) only includes:
+                    #   - Split hands: 24 + 32 = 56 channels (camera + hand)
+                    #   - Regular hands: 24 + 16 = 40 channels (camera + hand)
+                    transformer_input = torch.cat([
+                        noisy_model_input,      # 16 (noisy latents)
+                        mask_input,             # 1 (mask - handled by base model)
+                        visual_condition,       # 16 (image+zero OR static - handled by base model)
+                        camera_condition,       # 24 (raymap: 6ch * 4frames - NEW condition)
+                        hand_videos_latents     # 32 (split) or 16 (regular - NEW condition)
+                    ], dim=2)
+                    condition_latents = None
+                
                 elif pipeline_config["type"] == "cogvideox_fun_static_to_video_posmap_adapter":
                     # For VideoX-Fun static-to-video posmap adapter pipeline, use static video as concat and SMPL pos map as adapter control
                     # Adapter control type is specified in pipeline config (default: "smpl_pos_map")
@@ -3544,7 +3821,7 @@ def main():
                         control_latents=hand_video_latents,
                         ref_latents=static_videos_latents,
                     )[0]
-                elif pipeline_config["type"] in ["cogvideox_fun_static_to_video", "cogvideox_fun_static_to_video_pose_concat", "cogvideox_fun_static_to_video_posmap_concat"]:
+                elif pipeline_config["type"] in ["cogvideox_fun_static_to_video", "cogvideox_fun_static_to_video_pose_concat", "cogvideox_fun_static_to_video_posmap_concat", "cogvideox_fun_static_to_video_raymap_pose_concat"]:
                     # For VideoX-Fun static-to-video pipelines, use standard transformer forward (conditions already concatenated)
                     model_output = transformer(
                         hidden_states=transformer_input,
@@ -3830,6 +4107,15 @@ def main():
                 transformer=transformer,
                 scheduler=scheduler,
                 compress_smpl_pos_map_temporal=compress_smpl_pos_map_temporal,
+            )
+        elif pipeline_config["type"] == "cogvideox_fun_static_to_video_raymap_pose_concat":
+            # For VideoX-Fun static-to-video raymap pose concat
+            pipeline = CogVideoXFunStaticToVideoPipeline(
+                tokenizer=tokenizer,
+                text_encoder=text_encoder,
+                vae=vae,
+                transformer=transformer,
+                scheduler=scheduler,
             )
         elif pipeline_config["type"] == "cogvideox_fun_static_to_video_posmap_adapter":
             # Get adapter parameters from data/pipeline config

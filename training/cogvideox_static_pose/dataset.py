@@ -347,6 +347,8 @@ class VideoDatasetWithConditions(VideoDataset):
     Extended VideoDataset that supports additional condition videos:
     - hand_videos: Egocentric hand mesh videos (automatically derived from main video paths)
     - static_videos: Static scene videos (automatically derived from main video paths)
+    - raymaps: Camera ray maps for 3D scene understanding
+    - image_goal_latents: Goal image latents for navigation tasks
     """
     
     def __init__(
@@ -369,6 +371,8 @@ class VideoDatasetWithConditions(VideoDataset):
         compress_smpl_pos_map_temporal: bool = False,
         vae_scale_factor_temporal: int = 4,
         vae_scale_factor_spatial: int = 8,
+        load_raymaps: bool = False,
+        load_image_goal: bool = False,
     ) -> None:
         # Initialize parent class with main video column
         super().__init__(
@@ -393,6 +397,8 @@ class VideoDatasetWithConditions(VideoDataset):
         self.compress_smpl_pos_map_temporal = compress_smpl_pos_map_temporal
         self.vae_scale_factor_temporal = vae_scale_factor_temporal
         self.vae_scale_factor_spatial = vae_scale_factor_spatial
+        self.load_raymaps = load_raymaps
+        self.load_image_goal = load_image_goal
         
         # Automatically derive hand video and static video paths from main video paths
         if self.split_hands:
@@ -539,6 +545,46 @@ class VideoDatasetWithConditions(VideoDataset):
                     main_data["smpl_pos_map"] = None
             else:
                 main_data["smpl_pos_map"] = None
+            
+            # Load raymaps if enabled
+            if self.load_raymaps:
+                try:
+                    name = self.video_paths[index].stem
+                    raymap = torch.load(
+                        self.video_paths[index].parent.parent / "raymaps" / f"{name}.pt",
+                        map_location="cpu",
+                        weights_only=True
+                    )
+                    main_data["raymap"] = raymap
+                except Exception as e:
+                    logger.warning(f"Failed to load raymap for index {index}: {e}")
+                    main_data["raymap"] = None
+            else:
+                main_data["raymap"] = None
+            
+            # Load image_goal_latents if enabled
+            if self.load_image_goal:
+                try:
+                    filename_without_ext = self.video_paths[index].name.split(".")[0]
+                    pt_filename = f"{filename_without_ext}.pt"
+                    image_goal_latents_path = self.video_paths[index].parent.parent.joinpath("image_goal_latents")
+                    image_goal_latent_filepath = image_goal_latents_path.joinpath(pt_filename)
+                    
+                    if image_goal_latent_filepath.is_file():
+                        image_goal_latents = torch.load(
+                            image_goal_latent_filepath,
+                            map_location="cpu",
+                            weights_only=True
+                        )
+                        main_data["image_goal"] = image_goal_latents
+                    else:
+                        logger.warning(f"Image goal latents not found: {image_goal_latent_filepath}")
+                        main_data["image_goal"] = None
+                except Exception as e:
+                    logger.warning(f"Failed to load image_goal_latents for index {index}: {e}")
+                    main_data["image_goal"] = None
+            else:
+                main_data["image_goal"] = None
         else:
             # Load raw videos for condition videos
             try:
@@ -574,6 +620,43 @@ class VideoDatasetWithConditions(VideoDataset):
                     main_data["smpl_pos_map"] = None
             else:
                 main_data["smpl_pos_map"] = None
+            
+            # Load raymaps if enabled (raw mode)
+            if self.load_raymaps:
+                try:
+                    name = self.video_paths[index].stem
+                    raymap = np.load(self.data_root / "raymaps" / f"{name}.npz")['raymap']
+                    main_data["raymap"] = torch.tensor(raymap, dtype=torch.float32)
+                    
+                    # Also load raymap_abs if available
+                    raymap_abs_file = self.data_root / "raymaps" / f"{name}_abs.npz"
+                    if raymap_abs_file.exists():
+                        raymap_abs = np.load(raymap_abs_file)['raymap']
+                        main_data["raymap_abs"] = torch.tensor(raymap_abs, dtype=torch.float32)
+                    else:
+                        main_data["raymap_abs"] = None
+                except Exception as e:
+                    logger.warning(f"Failed to load raymap for index {index}: {e}")
+                    main_data["raymap"] = None
+                    main_data["raymap_abs"] = None
+            else:
+                main_data["raymap"] = None
+                main_data["raymap_abs"] = None
+            
+            # Load image_goal if enabled (raw mode)
+            if self.load_image_goal:
+                try:
+                    # Get the last frame as image_goal from main video
+                    if main_data["video"] is not None:
+                        image_goal = main_data["video"][-1:].clone()
+                        main_data["image_goal"] = image_goal
+                    else:
+                        main_data["image_goal"] = None
+                except Exception as e:
+                    logger.warning(f"Failed to extract image_goal for index {index}: {e}")
+                    main_data["image_goal"] = None
+            else:
+                main_data["image_goal"] = None
 
         return main_data
 
@@ -937,6 +1020,8 @@ class VideoDatasetWithHumanMotions(VideoDatasetWithConditions):
     - prompt_embeds/*.pt: Text prompt embeddings  
     - image_latents/*.pt: Image latents (for image-to-video)
     - human_motions/*.pt: SMPL pose parameters for AdaLN conditioning
+    - raymaps/*.pt: Camera ray maps (optional)
+    - image_goal_latents/*.pt: Goal image latents (optional)
     """
     
     def __init__(
@@ -959,6 +1044,8 @@ class VideoDatasetWithHumanMotions(VideoDatasetWithConditions):
         compress_smpl_pos_map_temporal: bool = False,
         vae_scale_factor_temporal: int = 4,
         vae_scale_factor_spatial: int = 8,
+        load_raymaps: bool = False,
+        load_image_goal: bool = False,
     ) -> None:
         # Initialize parent class with main video column
         super().__init__(
@@ -980,6 +1067,8 @@ class VideoDatasetWithHumanMotions(VideoDatasetWithConditions):
             compress_smpl_pos_map_temporal=compress_smpl_pos_map_temporal,
             vae_scale_factor_temporal=vae_scale_factor_temporal,
             vae_scale_factor_spatial=vae_scale_factor_spatial,
+            load_raymaps=load_raymaps,
+            load_image_goal=load_image_goal,
         )
         
         # Automatically derive human_motions paths from main video paths

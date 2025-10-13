@@ -601,25 +601,18 @@ def find_files_by_path(data_root: Path, video_path: str) -> dict:
     """Find all related files for a given video path."""
     files = {}
     
-    # Parse video path: trumans/ego_render_fov90/{scene_name}/{action_name}/processed2/videos/{video_name}.mp4
-    path_parts = Path(video_path).parts
-    if len(path_parts) < 6:
-        raise ValueError(f"Invalid video path format: {video_path}")
-    
-    scene_name = path_parts[2]
-    action_name = path_parts[3]
-    video_name = path_parts[-1].replace('.mp4', '')
-    
-    # Construct base path - try processed2 first, then processed
-    base_path = data_root / 'trumans' / 'ego_render_fov90' / scene_name / action_name / 'processed2'
-    if not base_path.exists():
-        base_path = data_root / 'trumans' / 'ego_render_fov90' / scene_name / action_name / 'processed'
+    # Get base path from video_path parent directory
+    # video_path: .../processed2/videos/{video_name}.mp4
+    # base_path: .../processed2/
+    video_path_obj = Path(video_path)
+    video_name = video_path_obj.stem
+    base_path = data_root / video_path_obj.parent.parent  # videos/ -> processed2/
     
     # Define file paths based on pipeline type
     video_file = base_path / 'videos' / f"{video_name}.mp4"
     static_video_file = base_path / 'videos_static' / f"{video_name}.mp4"
     hand_video_file = base_path / 'videos_hands' / f"{video_name}.mp4"
-    prompt_file = base_path.parent / 'sequences' / 'prompts' / f"{video_name}.txt"
+    prompt_file = base_path / 'prompts' / f"{video_name}.txt"
     human_motions_file = base_path / 'human_motions' / f"{video_name}.pt"
     
     files = {
@@ -912,10 +905,15 @@ def save_inference_outputs(args, video_path, generated_video, gt_video, files, m
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # Create filename from video path
-    path_parts = Path(video_path).parts
-    scene_name = path_parts[2]
-    action_name = path_parts[3]
-    video_name = path_parts[-1].replace('.mp4', '')
+    video_path_obj = Path(video_path)
+    video_name = video_path_obj.stem
+    
+    # Extract scene and action names from path
+    # video_path: .../scene_name/action_name/processed2/videos/video_name.mp4
+    base_path = video_path_obj.parent.parent  # videos/ -> processed2/
+    action_name = base_path.parent.name
+    scene_name = base_path.parent.parent.name
+    
     base_name = f"{scene_name}_{action_name}_{video_name}"
     
     # Ensure videos have the same number of frames
