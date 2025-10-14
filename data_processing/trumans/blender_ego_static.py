@@ -132,10 +132,26 @@ def get_camera_to_world_matrix(camera_obj):
     return np.array(camera_obj.matrix_world, dtype=np.float32)
 
 def check_video_exists(video_idx, videos_output_path):
-    """Check if video already exists and has non-zero size."""
-    def file_ok(path): return os.path.isfile(path) and os.path.getsize(path) > 0
+    """
+    Check if video already exists and is complete.
+    Uses filesize threshold to detect incomplete files from interrupted renders.
+    """
+    def file_ok(path, min_size=10240):  # 10KB minimum for a valid video
+        """File must exist, have reasonable size, and not be too recent"""
+        if not os.path.isfile(path):
+            return False
+        size = os.path.getsize(path)
+        if size < min_size:  # Too small = likely incomplete
+            return False
+        # Check if file was modified very recently (< 2 seconds ago)
+        import time
+        mtime = os.path.getmtime(path)
+        if time.time() - mtime < 2.0:
+            return False  # File too fresh, might still be writing
+        return True
+    
     video_path = os.path.join(videos_output_path, f"{video_idx:05d}.mp4")
-    video_exists = file_ok(video_path)
+    video_exists = file_ok(video_path, min_size=10240)  # Videos should be at least 10KB
     needs_rendering = not video_exists
     return video_exists, needs_rendering
 

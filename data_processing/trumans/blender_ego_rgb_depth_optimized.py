@@ -131,13 +131,36 @@ def get_camera_to_world_matrix(camera_obj):
     return np.array(camera_obj.matrix_world, dtype=np.float32)
 
 def check_frame_exists(frame_num, images_output_path, depth_output_path, cam_params_path, no_depth=False):
-    def file_ok(path): return os.path.isfile(path) and os.path.getsize(path) > 0
+    """
+    Check if frame files exist and are complete.
+    Uses filesize thresholds to detect incomplete files from interrupted renders.
+    """
+    def file_ok(path, min_size=1024):
+        """File must exist, have reasonable size, and not be too recent (avoid race conditions)"""
+        if not os.path.isfile(path):
+            return False
+        size = os.path.getsize(path)
+        if size < min_size:  # Too small = likely incomplete
+            return False
+        # Check if file was modified very recently (< 2 seconds ago)
+        # This helps avoid race conditions during concurrent rendering
+        import time
+        mtime = os.path.getmtime(path)
+        if time.time() - mtime < 2.0:
+            return False  # File too fresh, might still be writing
+        return True
+    
     image_path = os.path.join(images_output_path, f"{frame_num:04d}.png")
     depth_path = os.path.join(depth_output_path,  f"{frame_num:04d}.exr")
     cam_param_path = os.path.join(cam_params_path, f"cam_{frame_num:04d}.npy")
-    rgb_exists = file_ok(image_path)
-    depth_exists = file_ok(depth_path) if not no_depth else True  # Skip depth check if no_depth
-    cam_param_exists = file_ok(cam_param_path)
+    
+    # PNG images should be at least ~10KB for 720x480
+    # EXR depth maps should be at least ~100KB
+    # NPY cam params should be at least ~200 bytes
+    rgb_exists = file_ok(image_path, min_size=10240)  # 10KB
+    depth_exists = file_ok(depth_path, min_size=102400) if not no_depth else True  # 100KB
+    cam_param_exists = file_ok(cam_param_path, min_size=200)  # 200 bytes
+    
     needs_rendering = not rgb_exists or (not depth_exists and not no_depth)
     needs_cam_param = not cam_param_exists
     return rgb_exists, depth_exists, cam_param_exists, needs_rendering, needs_cam_param

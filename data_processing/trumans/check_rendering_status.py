@@ -296,7 +296,24 @@ except Exception as e:
         return 2400  # Default fallback
 
 def check_animation_completeness(anim_path, expected_frames, no_depth=False):
-    """Check if an animation folder has all expected frames rendered."""
+    """
+    Check if an animation folder has all expected frames rendered.
+    Uses filesize thresholds to detect incomplete files from interrupted renders.
+    """
+    def is_valid_file(file_path, min_size=1024):
+        """File must exist, have reasonable size, and not be too recent"""
+        if not os.path.isfile(file_path):
+            return False
+        size = os.path.getsize(file_path)
+        if size < min_size:  # Too small = likely incomplete
+            return False
+        # Check if file was modified very recently (< 2 seconds ago)
+        import time
+        mtime = os.path.getmtime(file_path)
+        if time.time() - mtime < 2.0:
+            return False  # File too fresh, might still be writing
+        return True
+    
     rgb_path = os.path.join(anim_path, "images")
     depth_path = os.path.join(anim_path, "depth")
     cam_params_path = os.path.join(anim_path, "cam_params")
@@ -308,9 +325,21 @@ def check_animation_completeness(anim_path, expected_frames, no_depth=False):
         if not all(os.path.exists(p) for p in required_paths):
             return False, 0, 0, 0
         
-        # Count files in each folder
-        rgb_files = len([f for f in os.listdir(rgb_path) if f.endswith('.png')])
-        cam_files = len([f for f in os.listdir(cam_params_path) if f.startswith('cam')])
+        # Count valid files in each folder with size checks
+        rgb_files = 0
+        for f in os.listdir(rgb_path):
+            if f.endswith('.png'):
+                file_path = os.path.join(rgb_path, f)
+                if is_valid_file(file_path, min_size=10240):  # 10KB for PNG
+                    rgb_files += 1
+        
+        cam_files = 0
+        for f in os.listdir(cam_params_path):
+            if f.startswith('cam'):
+                file_path = os.path.join(cam_params_path, f)
+                if is_valid_file(file_path, min_size=200):  # 200 bytes for NPY
+                    cam_files += 1
+        
         depth_files = 0  # No depth files expected
         
         # Check if we have the expected number of files (RGB and cam only)
@@ -320,10 +349,27 @@ def check_animation_completeness(anim_path, expected_frames, no_depth=False):
         if not all(os.path.exists(p) for p in [rgb_path, depth_path, cam_params_path]):
             return False, 0, 0, 0
         
-        # Count files in each folder
-        rgb_files = len([f for f in os.listdir(rgb_path) if f.endswith('.png')])
-        depth_files = len([f for f in os.listdir(depth_path) if f.endswith('.exr')])
-        cam_files = len([f for f in os.listdir(cam_params_path) if f.startswith('cam')])
+        # Count valid files in each folder with size checks
+        rgb_files = 0
+        for f in os.listdir(rgb_path):
+            if f.endswith('.png'):
+                file_path = os.path.join(rgb_path, f)
+                if is_valid_file(file_path, min_size=10240):  # 10KB for PNG
+                    rgb_files += 1
+        
+        depth_files = 0
+        for f in os.listdir(depth_path):
+            if f.endswith('.exr'):
+                file_path = os.path.join(depth_path, f)
+                if is_valid_file(file_path, min_size=102400):  # 100KB for EXR
+                    depth_files += 1
+        
+        cam_files = 0
+        for f in os.listdir(cam_params_path):
+            if f.startswith('cam'):
+                file_path = os.path.join(cam_params_path, f)
+                if is_valid_file(file_path, min_size=200):  # 200 bytes for NPY
+                    cam_files += 1
         
         # Check if we have the expected number of files
         is_complete = (rgb_files == expected_frames and 

@@ -135,7 +135,24 @@ except Exception as e:
         return 10  # Default fallback
 
 def check_video_sequence_completeness(anim_path, expected_videos, video_type="static"):
-    """Check if an animation folder has all expected video sequences rendered."""
+    """
+    Check if an animation folder has all expected video sequences rendered.
+    Uses filesize threshold to detect incomplete files from interrupted renders.
+    """
+    def is_valid_video(video_path, min_size=10240):
+        """Video must exist, have reasonable size, and not be too recent"""
+        if not os.path.isfile(video_path):
+            return False
+        size = os.path.getsize(video_path)
+        if size < min_size:  # Too small = likely incomplete
+            return False
+        # Check if file was modified very recently (< 2 seconds ago)
+        import time
+        mtime = os.path.getmtime(video_path)
+        if time.time() - mtime < 2.0:
+            return False  # File too fresh, might still be writing
+        return True
+    
     sequences_path = os.path.join(anim_path, "sequences")
     videos_path = os.path.join(sequences_path, f"videos_{video_type}")
     
@@ -143,14 +160,18 @@ def check_video_sequence_completeness(anim_path, expected_videos, video_type="st
     if not os.path.exists(videos_path):
         return False, 0
     
-    # Count video files
+    # Count valid video files (with size check)
     video_files = [f for f in os.listdir(videos_path) if f.endswith('.mp4')]
-    video_count = len(video_files)
+    valid_video_count = 0
+    for video_file in video_files:
+        video_full_path = os.path.join(videos_path, video_file)
+        if is_valid_video(video_full_path, min_size=10240):  # 10KB minimum
+            valid_video_count += 1
     
-    # Check if we have the expected number of videos
-    is_complete = video_count >= expected_videos
+    # Check if we have the expected number of valid videos
+    is_complete = valid_video_count >= expected_videos
     
-    return is_complete, video_count
+    return is_complete, valid_video_count
 
 def get_animation_names(blend_file):
     """Get the names of animations from a blend file."""
@@ -238,7 +259,7 @@ def check_video_rendering_status(frame_skip=3, stride=25, clip_length=49, video_
     
     # Configuration
     recordings_path = "data/trumans/Recordings_blend"
-    output_base = "data/trumans/ego_render_fov90"
+    output_base = "data/trumans/ego_render_fov90_480p_s32"
     
     print(f"Checking video rendering status for {video_type} videos")
     print(f"Using frame skip: {frame_skip}, stride: {stride}, clip length: {clip_length}")
