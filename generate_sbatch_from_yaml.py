@@ -64,6 +64,33 @@ def generate_sbatch_script(yaml_file, output_script=None, aicomputing=False):
         # Remove gpus field if it exists to avoid conflict
         if 'gpus' in slurm:
             del slurm['gpus']
+        
+        # Convert paths from /virtual_lab/jhb_vclab/ to /fsx/
+        print("🔧 AICOMPUTING mode: Converting paths from /virtual_lab/jhb_vclab/ to /fsx/")
+        
+        # Update data paths
+        if 'data_root' in data:
+            data['data_root'] = data['data_root'].replace('/virtual_lab/jhb_vclab/', '/fsx/')
+        if 'dataset_file' in data:
+            data['dataset_file'] = data['dataset_file'].replace('/virtual_lab/jhb_vclab/', '/fsx/')
+        if 'validation_set' in data:
+            data['validation_set'] = data['validation_set'].replace('/virtual_lab/jhb_vclab/', '/fsx/')
+        
+        # Update model paths
+        if 'output_dir' in model:
+            model['output_dir'] = model['output_dir'].replace('/virtual_lab/jhb_vclab/', '/fsx/')
+        if 'base_model_name_or_path' in model:
+            model['base_model_name_or_path'] = model['base_model_name_or_path'].replace('/virtual_lab/jhb_vclab/', '/fsx/')
+        
+        # Update experiment output_dir
+        if 'output_dir' in experiment:
+            experiment['output_dir'] = experiment['output_dir'].replace('/virtual_lab/jhb_vclab/', '/fsx/')
+        
+        # Update SLURM output/error paths
+        if 'output' in slurm:
+            slurm['output'] = slurm['output'].replace('/virtual_lab/jhb_vclab/', '/fsx/')
+        if 'error' in slurm:
+            slurm['error'] = slurm['error'].replace('/virtual_lab/jhb_vclab/', '/fsx/')
     
     # Auto-update paths with extracted date and experiment name
     if date_match != "unknown":
@@ -165,9 +192,19 @@ source ~/.bashrc
 source $(conda info --base)/etc/profile.d/conda.sh
 conda activate world_model
 
-# Set PYTHONPATH to include the current directory for module imports
-export PYTHONPATH="${{PYTHONPATH}}:/virtual_lab/jhb_vclab/byungjun_vclab/world_model"
-
+# Set PYTHONPATH to include the current directory for module imports"""
+    
+    # Add PYTHONPATH based on aicomputing mode
+    if aicomputing:
+        script_content += """
+export PYTHONPATH="${PYTHONPATH}:/fsx/byungjun_vclab/world_model"
+"""
+    else:
+        script_content += """
+export PYTHONPATH="${PYTHONPATH}:/virtual_lab/jhb_vclab/byungjun_vclab/world_model"
+"""
+    
+    script_content += f"""
 # Environment variables from YAML config
 export TORCH_LOGS="{environment.get('torch_logs', '+dynamo,recompiles,graph_breaks')}"
 export TORCHDYNAMO_VERBOSE={environment.get('torchdynamo_verbose', 1)}
@@ -176,8 +213,15 @@ export TORCH_NCCL_ENABLE_MONITORING={environment.get('torch_nccl_enable_monitori
 export TOKENIZERS_PARALLELISM={str(environment.get('tokenizers_parallelism', True)).lower()}
 export OMP_NUM_THREADS={environment.get('omp_num_threads', 16)}
 
-# Configuration from YAML
-EXPERIMENT_CONFIG="{yaml_file}"
+# Configuration from YAML"""
+    
+    # Convert YAML path for aicomputing
+    yaml_file_for_script = yaml_file
+    if aicomputing:
+        yaml_file_for_script = yaml_file.replace('/virtual_lab/jhb_vclab/', '/fsx/')
+    
+    script_content += f"""
+EXPERIMENT_CONFIG="{yaml_file_for_script}"
 EXPERIMENT_NAME="{experiment.get('name', 'unknown')}"
 TRAINING_MODE="{training.get('mode', 'unknown')}"
 LEARNING_RATE={training.get('learning_rate', 'unknown')}
@@ -425,6 +469,15 @@ echo "   - SLURM error: {slurm.get('error', 'out/%j_default.err')}"
         print(f"")
         print(f"📝 To edit the script:")
         print(f"   nano {output_script}")
+        
+        # Print path conversion info for aicomputing
+        if aicomputing:
+            print(f"")
+            print(f"🔧 AICOMPUTING Path Conversions:")
+            print(f"   /virtual_lab/jhb_vclab/ → /fsx/")
+            print(f"   - Data root: {data.get('data_root', 'N/A')}")
+            print(f"   - PYTHONPATH: /fsx/byungjun_vclab/world_model")
+            print(f"   - YAML config: {yaml_file_for_script}")
         
         return True
         
