@@ -1155,7 +1155,7 @@ def main():
             cmd.extend(["--samples", str(args.samples)])
         
         # Add no-depth option if specified and using blender_ego_rgb_depth_optimized.py
-        if args.no_depth and 'blender_ego_rgb_depth_optimized.py' in args.script_path or 'blender_ego_static.py' in args.script_path:
+        if args.no_depth and 'blender_ego_rgb_depth_optimized.py' in args.script_path:
             cmd.append("--no-depth")
         
         # Add animation index or name for animation-based jobs
