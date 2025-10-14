@@ -14,8 +14,8 @@ from check_video_rendering_status import get_expected_video_count, check_video_s
 DEFAULT_RECORDINGS_PATH = "./data/trumans/Recordings_blend"
 # DEFAULT_RECORDINGS_PATH = "./Recordings_blend"
 DEFAULT_SAVE_PATH = "./data/trumans/ego_render_fov90"
-SCRIPT_PATH = "data_processing/trumans/blender_ego_rgb_depth_optimized.py"
-# SCRIPT_PATH = "data_processing/trumans/blender_ego_static.py"
+# SCRIPT_PATH = "data_processing/trumans/blender_ego_rgb_depth_optimized.py"
+SCRIPT_PATH = "data_processing/trumans/blender_ego_static.py"
 # SCRIPT_PATH = "data_processing/trumans/blender_ego_hand.py"
 NUM_GPUS = 8
 # ===========================
@@ -446,10 +446,51 @@ def main():
     parser.add_argument("--separate", action="store_true", help="Create separate videos for left and right hands (only works with --grayscale) - only applies to blender_ego_hand.py")
     parser.add_argument("--no-skip-existing", action="store_true", help="Force re-render even if files already exist - only applies to blender_ego_hand.py")
     parser.add_argument("--parallel-animations", action="store_true", help="Launch separate jobs for each animation (faster for single scenes, more blend file overhead)")
-    parser.add_argument("--scenes", type=str, nargs='+', help="Specific scene names (directory names) to render. If not specified, renders all scenes.")
+    parser.add_argument("--scenes", type=str, nargs='+', help="Specific scene names (directory names) to render. Can also be a path to a .txt file with scene names (one per line, prefix with @, e.g., @scenes.txt)")
     parser.add_argument("--scene-pattern", type=str, help="Pattern to match scene names (e.g., 'scene_*' or '*_walk')")
 
     args = parser.parse_args()
+    
+    # Process --scenes argument: check if it's a file path
+    if args.scenes:
+        processed_scenes = []
+        for scene_arg in args.scenes:
+            if scene_arg.startswith('@'):
+                # It's a file path (with @ prefix)
+                file_path = scene_arg[1:]  # Remove @ prefix
+                if os.path.exists(file_path):
+                    print(f"📄 Reading scene names from file: {file_path}")
+                    try:
+                        with open(file_path, 'r') as f:
+                            for line in f:
+                                line = line.strip()
+                                if line and not line.startswith('#'):  # Skip empty lines and comments
+                                    processed_scenes.append(line)
+                        print(f"   Loaded {len(processed_scenes)} scene names from file")
+                    except Exception as e:
+                        print(f"❌ Error reading scene file {file_path}: {e}")
+                        return
+                else:
+                    print(f"❌ Scene file not found: {file_path}")
+                    return
+            elif os.path.exists(scene_arg) and scene_arg.endswith('.txt'):
+                # It's a file path (without @ prefix, but ends with .txt)
+                print(f"📄 Reading scene names from file: {scene_arg}")
+                try:
+                    with open(scene_arg, 'r') as f:
+                        for line in f:
+                            line = line.strip()
+                            if line and not line.startswith('#'):  # Skip empty lines and comments
+                                processed_scenes.append(line)
+                    print(f"   Loaded {len(processed_scenes)} scene names from file")
+                except Exception as e:
+                    print(f"❌ Error reading scene file {scene_arg}: {e}")
+                    return
+            else:
+                # It's a direct scene name
+                processed_scenes.append(scene_arg)
+        
+        args.scenes = processed_scenes if processed_scenes else None
     
     # If status-only mode, just show current status
     if args.status_only:
@@ -1114,7 +1155,7 @@ def main():
             cmd.extend(["--samples", str(args.samples)])
         
         # Add no-depth option if specified and using blender_ego_rgb_depth_optimized.py
-        if args.no_depth and 'blender_ego_rgb_depth_optimized.py' in args.script_path or 'blender_ego_static.py' in args.script_path:
+        if args.no_depth and 'blender_ego_rgb_depth_optimized.py' in args.script_path:
             cmd.append("--no-depth")
         
         # Add animation index or name for animation-based jobs
