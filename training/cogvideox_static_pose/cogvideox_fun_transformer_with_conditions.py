@@ -1193,9 +1193,12 @@ class CogVideoXFunTransformer3DModelWithConcat(CogVideoXFunTransformer3DModel):
         original_in_channels = kwargs.get("in_channels", 16)
         self.original_in_channels = original_in_channels
         
-        self.add_noise_in_inpaint_model = kwargs.pop("add_noise_in_inpaint_model", False)
-        self.add_control_adapter = add_control_adapter
-        
+        # self.add_noise_in_inpaint_model = kwargs.pop("add_noise_in_inpaint_model", False)
+        # self.add_control_adapter = add_control_adapter
+        self.register_to_config(
+            add_noise_in_inpaint_model=kwargs.pop("add_noise_in_inpaint_model", False),
+            add_control_adapter=add_control_adapter,
+        )
         super().__init__(*args, **kwargs)
         
         # Setup conditional channels if specified
