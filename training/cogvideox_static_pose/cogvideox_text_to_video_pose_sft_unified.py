@@ -870,10 +870,11 @@ def run_validation(
         validation_videos = [Path(data_config["data_root"]) / video_path for video_path in validation_set]
         
         # Derive prompt paths from video paths
+        prompt_subdir = data_config.get("prompt_subdir", "prompts")
         for video_path in validation_set:
             # Convert video path to prompt path
             video_path_obj = Path(video_path)
-            prompt_path = video_path_obj.parent.parent / "prompts" / f"{video_path_obj.stem}.txt"
+            prompt_path = video_path_obj.parent.parent / prompt_subdir / f"{video_path_obj.stem}.txt"
             validation_prompts.append(Path(data_config["data_root"]) / prompt_path)
         
         # Derive hand and static video paths from main video paths
@@ -1805,11 +1806,13 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
                         # Save trainable parameters (non-LoRA weights) if trainable_parameter_patterns is specified
                         trainable_state_dict = None
                         if "trainable_parameter_patterns" in training_config:
+                            import re
                             trainable_state_dict = {}
                             for name, param in model.named_parameters():
-                                # Check if this parameter matches any trainable pattern using fnmatch for wildcard support
+                                # Check if this parameter matches any trainable pattern using regex
                                 for pattern in training_config["trainable_parameter_patterns"]:
-                                    if pattern in name:
+                                    regex = re.compile(pattern)
+                                    if regex.match(name):
                                         trainable_state_dict[name] = param.data
                                         break
                         
@@ -3014,6 +3017,8 @@ def main():
         "vae_scale_factor_spatial": data_config.get("vae_scale_factor_spatial", 8),
         "load_raymaps": data_config.get("load_raymaps", False),
         "load_image_goal": data_config.get("load_image_goal", False),
+        "prompt_subdir": data_config.get("prompt_subdir", "prompts"),
+        "prompt_embeds_subdir": data_config.get("prompt_embeds_subdir", "prompt_embeds"),
     }
     
     # Choose dataset class based on pipeline type
