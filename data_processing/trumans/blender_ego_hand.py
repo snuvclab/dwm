@@ -508,7 +508,7 @@ def get_hand_mesh_data(hand_obj):
 
 def render_hands_pytorch3d(camera_obj, hand_objects, render_shape=None, grayscale=False, separate_hands=False, target_hand=None):
     """
-    Render CC_Hand_L/CC_Hand_R with Soft Phong shading via PyTorch3D.
+    Render CC_Hand_L/CC_Hand_R with inverse-depth based color and normal shading.
     If grayscale=True, render in black & white with enhanced contrast.
     If separate_hands=True and target_hand is specified, render only that hand.
     """
@@ -538,7 +538,7 @@ def render_hands_pytorch3d(camera_obj, hand_objects, render_shape=None, grayscal
     R_p3d_t = torch.from_numpy(R_p3d).to(device)           # (3,3)
     t_p3d_t = torch.from_numpy(t_p3d).to(device)           # (3,)
 
-         # Camera setup complete
+    # Camera setup complete
 
     # Identity extrinsics for the camera; we already moved vertices into camera space
     cameras = PerspectiveCameras(
@@ -559,30 +559,21 @@ def render_hands_pytorch3d(camera_obj, hand_objects, render_shape=None, grayscal
     )
     rasterizer = MeshRasterizer(cameras=cameras, raster_settings=raster_settings).to(device)
 
-    # Lighting setup - enhanced for grayscale contrast if needed
-    if grayscale:
-        # Stronger directional lighting for better grayscale contrast
-        lights = DirectionalLights(
-            device=device,
-            direction=[[0.0, 0.0, -1.0]],        # pointing towards camera
-            ambient_color=((0.3, 0.3, 0.3),),     # reduced ambient
-            diffuse_color=((0.8, 0.8, 0.8),),     # stronger diffuse
-            specular_color=((0.2, 0.2, 0.2),),   # some specular for highlights
-        )
-    else:
-        # Gentle lighting so it never goes black (original)
-        lights = PointLights(
-            device=device,
-            location=[[0.0, 0.0, 0.0]],           # camera center
-            ambient_color=((0.7, 0.7, 0.7),),
-            diffuse_color=((0.6, 0.6, 0.6),),
-            specular_color=((0.0, 0.0, 0.0),),
-        )
+    # No lighting needed - we'll get normals directly from PyTorch3D
+    # Use a simple shader for basic rendering
+    lights = DirectionalLights(
+        device=device,
+        direction=[[0.0, 0.0, -1.0]],
+        ambient_color=((1.0, 1.0, 1.0),),
+        diffuse_color=((0.0, 0.0, 0.0),),
+        specular_color=((0.0, 0.0, 0.0),),
+    )
     shader = SoftPhongShader(device=device, cameras=cameras, lights=lights)
     renderer = MeshRendererWithFragments(rasterizer=rasterizer, shader=shader)
 
     final_rgb = torch.zeros((H, W, 3), device=device, dtype=torch.float32)
     final_z   = torch.full((H, W), float('inf'), device=device, dtype=torch.float32)
+    final_normals = torch.zeros((H, W, 3), device=device, dtype=torch.float32)
 
     for obj in hand_objects:
         if not obj.visible_get():
@@ -606,27 +597,14 @@ def render_hands_pytorch3d(camera_obj, hand_objects, render_shape=None, grayscal
         V = Vc.unsqueeze(0)                                        # (1,V,3)
         F = torch.from_numpy(F_np).to(device).unsqueeze(0).long()  # (1,F,3)
 
-        # Per-vertex color - different for grayscale vs color
-        if grayscale:
-            # For grayscale: use white/light gray for both hands
-            # In separate mode, use consistent white color
-            if separate_hands:
-                col = (1.0, 1.0, 1.0)  # Pure white for separate hand rendering
-            else:
-                # Left hand slightly brighter to distinguish when both hands are rendered
-                if "CC_Hand_L" in obj.name:
-                    col = (0.9, 0.9, 0.9)  # Slightly brighter for left hand
-                else:
-                    col = (0.8, 0.8, 0.8)  # Slightly darker for right hand
-        else:
-            # Original color scheme for color mode
-            if "CC_Hand_L" in obj.name:
-                col = (0.5, 0.8, 0.5)  # Vibrant green with slight blue tint
-            else:
-                col = (0.8, 0.4, 0.4)  # Deep, rich red
-        Cverts = torch.tensor(col, device=device).view(1, 1, 3).expand(1, V.shape[1], 3)
+        # Create mesh and get normals directly from PyTorch3D
+        Cverts = torch.ones(1, V.shape[1], 3, device=device)
         mesh = Meshes(verts=V, faces=F, textures=TexturesVertex(Cverts))
-
+        
+        # Get normals from mesh
+        normals = mesh.verts_normals_packed()  # [V,3]
+        
+        # Render normals in camera space
         with torch.no_grad():
             images, frags = renderer(mesh)     # images: (1,H,W,4)
 
@@ -634,29 +612,61 @@ def render_hands_pytorch3d(camera_obj, hand_objects, render_shape=None, grayscal
         zbuf = frags.zbuf[0, :, :, 0].float()  # (H,W)
         valid = frags.pix_to_face[0, :, :, 0] >= 0
 
+        # Get normal images by rendering normals
+        # Create normal texture from mesh normals
+        normal_texture = TexturesVertex(normals.unsqueeze(0))  # [1,V,3]
+        mesh_with_normals = Meshes(verts=V, faces=F, textures=normal_texture)
+        
+        with torch.no_grad():
+            normal_images, _ = renderer(mesh_with_normals)  # [1,H,W,3]
+        
+        normal_images = normal_images[0]  # [H,W,3]
+
         closer = valid & (zbuf < final_z)
         closer3 = closer.unsqueeze(-1)
         final_rgb = torch.where(closer3, rgb, final_rgb)
         final_z   = torch.where(closer,  zbuf, final_z)
+        final_normals = torch.where(closer3, normal_images, final_normals)
+
+    # Apply inverse-depth based color and normal shading
+    # zbuf: [H,W]
+    z_clamped = final_z.clamp(0.2, 1.2)
+    z_norm = (z_clamped - 0.2) / (1.0)
+    depth_inv = 1 - z_norm
+
+    # Determine hand side for color
+    hand_side = "left" if "CC_Hand_L" in [obj.name for obj in hand_objects if "CC_Hand_L" in obj.name] else "right"
+    
+    # Hue tint
+    left_color = torch.tensor([0.6, 0.8, 1.0], device=device)   # blue tone
+    right_color = torch.tensor([1.0, 0.7, 0.8], device=device)  # pink tone
+    base_color = left_color if hand_side == 'left' else right_color
+
+    # Fake shading: brightness = n·v (view vector)
+    view = torch.tensor([0, 0, 1.0], device=device)
+    shade = (final_normals * view.view(1, 1, 3)).sum(dim=-1, keepdim=True).clamp(0, 1)  # [H,W,1]
+    
+    # Blend depth and normal shading
+    depth_shaded = 0.5 * depth_inv.unsqueeze(-1) + 0.5 * shade
+    hand_rgb = base_color.view(1,1,3) * depth_shaded
 
     # Convert to grayscale if needed
     if grayscale:
         # Convert RGB to grayscale using luminance weights
-        gray = 0.299 * final_rgb[:, :, 0] + 0.587 * final_rgb[:, :, 1] + 0.114 * final_rgb[:, :, 2]
+        gray = 0.299 * hand_rgb[:, :, 0] + 0.587 * hand_rgb[:, :, 1] + 0.114 * hand_rgb[:, :, 2]
         # Enhance contrast for better grayscale appearance
         gray = torch.clamp((gray - 0.3) * 1.5 + 0.3, 0, 1)
         # Convert back to RGB format (grayscale)
         out = (gray.unsqueeze(-1).expand(-1, -1, 3).clamp(0, 1) * 255.0).byte().cpu().numpy()
     else:
-        out = (final_rgb.clamp(0, 1) * 255.0).byte().cpu().numpy()
+        out = (hand_rgb.clamp(0, 1) * 255.0).byte().cpu().numpy()
     
     return out, final_z.cpu().numpy()
 
 
 def render_hands_pytorch3d_channel_separated(camera_obj, hand_objects, render_shape=None, grayscale=False):
     """
-    Render CC_Hand_L/CC_Hand_R with channel separation for efficient separate hand rendering.
-    Left hand: Red channel (1,0,0), Right hand: Green channel (0,1,0)
+    Render CC_Hand_L/CC_Hand_R with inverse-depth based color and normal shading.
     Returns the combined image and separate left/right hand images.
     """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -685,7 +695,7 @@ def render_hands_pytorch3d_channel_separated(camera_obj, hand_objects, render_sh
     R_p3d_t = torch.from_numpy(R_p3d).to(device)           # (3,3)
     t_p3d_t = torch.from_numpy(t_p3d).to(device)           # (3,)
 
-         # Camera setup complete
+    # Camera setup complete
 
     # Identity extrinsics for the camera; we already moved vertices into camera space
     cameras = PerspectiveCameras(
@@ -706,30 +716,21 @@ def render_hands_pytorch3d_channel_separated(camera_obj, hand_objects, render_sh
     )
     rasterizer = MeshRasterizer(cameras=cameras, raster_settings=raster_settings).to(device)
 
-    # Lighting setup - enhanced for grayscale contrast if needed
-    if grayscale:
-        # Stronger directional lighting for better grayscale contrast
-        lights = DirectionalLights(
-            device=device,
-            direction=[[0.0, 0.0, -1.0]],        # pointing towards camera
-            ambient_color=((0.3, 0.3, 0.3),),     # reduced ambient
-            diffuse_color=((0.8, 0.8, 0.8),),     # stronger diffuse
-            specular_color=((0.2, 0.2, 0.2),),   # some specular for highlights
-        )
-    else:
-        # Gentle lighting so it never goes black (original)
-        lights = PointLights(
-            device=device,
-            location=[[0.0, 0.0, 0.0]],           # camera center
-            ambient_color=((0.7, 0.7, 0.7),),
-            diffuse_color=((0.6, 0.6, 0.6),),
-            specular_color=((0.0, 0.0, 0.0),),
-        )
+    # No lighting needed - we'll get normals directly from PyTorch3D
+    # Use a simple shader for basic rendering
+    lights = DirectionalLights(
+        device=device,
+        direction=[[0.0, 0.0, -1.0]],
+        ambient_color=((1.0, 1.0, 1.0),),
+        diffuse_color=((0.0, 0.0, 0.0),),
+        specular_color=((0.0, 0.0, 0.0),),
+    )
     shader = SoftPhongShader(device=device, cameras=cameras, lights=lights)
     renderer = MeshRendererWithFragments(rasterizer=rasterizer, shader=shader)
 
     final_rgb = torch.zeros((H, W, 3), device=device, dtype=torch.float32)
     final_z   = torch.full((H, W), float('inf'), device=device, dtype=torch.float32)
+    final_normals = torch.zeros((H, W, 3), device=device, dtype=torch.float32)
 
     for obj in hand_objects:
         if not obj.visible_get():
@@ -746,15 +747,14 @@ def render_hands_pytorch3d_channel_separated(camera_obj, hand_objects, render_sh
         V = Vc.unsqueeze(0)                                        # (1,V,3)
         F = torch.from_numpy(F_np).to(device).unsqueeze(0).long()  # (1,F,3)
 
-        # Per-vertex color - channel separation for left/right hands
-        if "CC_Hand_L" in obj.name:
-            col = (1.0, 0.0, 0.0)  # Red channel for left hand
-        else:
-            col = (0.0, 1.0, 0.0)  # Green channel for right hand
-            
-        Cverts = torch.tensor(col, device=device).view(1, 1, 3).expand(1, V.shape[1], 3)
+        # Create mesh and get normals directly from PyTorch3D
+        Cverts = torch.ones(1, V.shape[1], 3, device=device)
         mesh = Meshes(verts=V, faces=F, textures=TexturesVertex(Cverts))
-
+        
+        # Get normals from mesh
+        normals = mesh.verts_normals_packed()  # [V,3]
+        
+        # Render normals in camera space
         with torch.no_grad():
             images, frags = renderer(mesh)     # images: (1,H,W,4)
 
@@ -762,38 +762,62 @@ def render_hands_pytorch3d_channel_separated(camera_obj, hand_objects, render_sh
         zbuf = frags.zbuf[0, :, :, 0].float()  # (H,W)
         valid = frags.pix_to_face[0, :, :, 0] >= 0
 
+        # Get normal images by rendering normals
+        # Create normal texture from mesh normals
+        normal_texture = TexturesVertex(normals.unsqueeze(0))  # [1,V,3]
+        mesh_with_normals = Meshes(verts=V, faces=F, textures=normal_texture)
+        
+        with torch.no_grad():
+            normal_images, _ = renderer(mesh_with_normals)  # [1,H,W,3]
+        
+        normal_images = normal_images[0]  # [H,W,3]
+
         closer = valid & (zbuf < final_z)
         closer3 = closer.unsqueeze(-1)
         final_rgb = torch.where(closer3, rgb, final_rgb)
         final_z   = torch.where(closer,  zbuf, final_z)
+        final_normals = torch.where(closer3, normal_images, final_normals)
 
-    # Convert to numpy
-    combined_image = (final_rgb.clamp(0, 1) * 255.0).byte().cpu().numpy()
+    # Apply inverse-depth based color and normal shading
+    # zbuf: [H,W]
+    z_clamped = final_z.clamp(0.2, 1.2)
+    z_norm = (z_clamped - 0.2) / (1.0)
+    depth_inv = 1 - z_norm
+
+    # Fake shading: brightness = n·v (view vector)
+    view = torch.tensor([0, 0, 1.0], device=device)
+    shade = (final_normals * view.view(1, 1, 3)).sum(dim=-1, keepdim=True).clamp(0, 1)  # [H,W,1]
     
-    # Extract separate channels
-    left_hand_image = combined_image[:, :, 0:1]  # Red channel only
-    right_hand_image = combined_image[:, :, 1:2]  # Green channel only
+    # Blend depth and normal shading
+    depth_shaded = 0.5 * depth_inv.unsqueeze(-1) + 0.5 * shade
+    
+    # Create separate left and right hand images
+    left_color = torch.tensor([0.6, 0.8, 1.0], device=device)   # blue tone
+    right_color = torch.tensor([1.0, 0.7, 0.8], device=device)  # pink tone
+    
+    # Apply shading to both colors
+    left_hand_rgb = left_color.view(1,1,3) * depth_shaded
+    right_hand_rgb = right_color.view(1,1,3) * depth_shaded
     
     # Convert to grayscale if needed
     if grayscale:
-        # Convert single channel to grayscale RGB
-        left_hand_gray = np.repeat(left_hand_image, 3, axis=2)
-        right_hand_gray = np.repeat(right_hand_image, 3, axis=2)
+        # Convert RGB to grayscale using luminance weights
+        left_gray = 0.299 * left_hand_rgb[:, :, 0] + 0.587 * left_hand_rgb[:, :, 1] + 0.114 * left_hand_rgb[:, :, 2]
+        right_gray = 0.299 * right_hand_rgb[:, :, 0] + 0.587 * right_hand_rgb[:, :, 1] + 0.114 * right_hand_rgb[:, :, 2]
         
-        # Apply grayscale conversion and contrast enhancement
-        left_hand_gray = (left_hand_gray.astype(np.float32) / 255.0)
-        left_hand_gray = np.clip((left_hand_gray - 0.3) * 1.5 + 0.3, 0, 1)
-        left_hand_gray = (left_hand_gray * 255.0).astype(np.uint8)
+        # Enhance contrast for better grayscale appearance
+        left_gray = torch.clamp((left_gray - 0.3) * 1.5 + 0.3, 0, 1)
+        right_gray = torch.clamp((right_gray - 0.3) * 1.5 + 0.3, 0, 1)
         
-        right_hand_gray = (right_hand_gray.astype(np.float32) / 255.0)
-        right_hand_gray = np.clip((right_hand_gray - 0.3) * 1.5 + 0.3, 0, 1)
-        right_hand_gray = (right_hand_gray * 255.0).astype(np.uint8)
+        # Convert back to RGB format (grayscale)
+        left_hand_gray = (left_gray.unsqueeze(-1).expand(-1, -1, 3).clamp(0, 1) * 255.0).byte().cpu().numpy()
+        right_hand_gray = (right_gray.unsqueeze(-1).expand(-1, -1, 3).clamp(0, 1) * 255.0).byte().cpu().numpy()
         
         return left_hand_gray, right_hand_gray, final_z.cpu().numpy()
     else:
-        # For color mode, just return the single channels as RGB
-        left_hand_rgb = np.repeat(left_hand_image, 3, axis=2)
-        right_hand_rgb = np.repeat(right_hand_image, 3, axis=2)
+        # For color mode, return the colored images
+        left_hand_rgb = (left_hand_rgb.clamp(0, 1) * 255.0).byte().cpu().numpy()
+        right_hand_rgb = (right_hand_rgb.clamp(0, 1) * 255.0).byte().cpu().numpy()
         
         return left_hand_rgb, right_hand_rgb, final_z.cpu().numpy()
 
