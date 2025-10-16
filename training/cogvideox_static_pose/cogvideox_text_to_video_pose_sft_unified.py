@@ -870,10 +870,11 @@ def run_validation(
         validation_videos = [Path(data_config["data_root"]) / video_path for video_path in validation_set]
         
         # Derive prompt paths from video paths
+        prompt_subdir = data_config.get("prompt_subdir", "prompts")
         for video_path in validation_set:
             # Convert video path to prompt path
             video_path_obj = Path(video_path)
-            prompt_path = video_path_obj.parent.parent / "prompts" / f"{video_path_obj.stem}.txt"
+            prompt_path = video_path_obj.parent.parent / prompt_subdir / f"{video_path_obj.stem}.txt"
             validation_prompts.append(Path(data_config["data_root"]) / prompt_path)
         
         # Derive hand and static video paths from main video paths
@@ -1805,11 +1806,13 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
                         # Save trainable parameters (non-LoRA weights) if trainable_parameter_patterns is specified
                         trainable_state_dict = None
                         if "trainable_parameter_patterns" in training_config:
+                            import re
                             trainable_state_dict = {}
                             for name, param in model.named_parameters():
-                                # Check if this parameter matches any trainable pattern using fnmatch for wildcard support
+                                # Check if this parameter matches any trainable pattern using regex
                                 for pattern in training_config["trainable_parameter_patterns"]:
-                                    if pattern in name:
+                                    regex = re.compile(pattern)
+                                    if regex.match(name):
                                         trainable_state_dict[name] = param.data
                                         break
                         
@@ -2687,6 +2690,88 @@ def _create_fun_mask_input(noisy_model_input, vae_scaling_factor=None):
         return torch.ones_like(noisy_model_input[:, :, :1])
 
 
+def _blur_condition_latent(latent: torch.Tensor, strength: float = 0.2) -> torch.Tensor:
+    """Apply Gaussian blur to condition latent in spatial dimensions.
+    
+    This simulates degraded condition videos (e.g., Gaussian rendering artifacts, low-resolution)
+    to improve model robustness during training.
+    
+    Args:
+        latent: Condition latent tensor [B, F, C, H, W]
+        strength: Blur strength (0.1 = subtle, 0.2 = moderate, 0.5 = strong)
+    
+    Returns:
+        Blurred latent tensor with same shape
+    """
+    import torch.nn.functional as F
+    
+    # Determine kernel size based on strength
+    kernel_size = int(3 + strength * 10)
+    if kernel_size % 2 == 0:
+        kernel_size += 1  # Make sure it's odd
+    
+    # Create Gaussian kernel
+    sigma = strength * 3
+    kernel_1d = torch.exp(-torch.arange(-(kernel_size//2), kernel_size//2 + 1, dtype=latent.dtype, device=latent.device)**2 / (2 * sigma**2))
+    kernel_1d = kernel_1d / kernel_1d.sum()
+    
+    # Create 2D kernel
+    kernel_2d = kernel_1d[:, None] * kernel_1d[None, :]
+    kernel = kernel_2d[None, None, :, :].to(latent.device, latent.dtype)
+    
+    # Apply blur: [B, F, C, H, W] -> reshape to [B*F*C, 1, H, W]
+    b, f, c, h, w = latent.shape
+    latent_reshaped = latent.reshape(b * f * c, 1, h, w)
+    blurred = F.conv2d(latent_reshaped, kernel, padding=kernel_size//2)
+    
+    return blurred.reshape(b, f, c, h, w)
+
+
+# Copied from diffusers.pipelines.cogvideo.pipeline_cogvideox.CogVideoXPipeline._get_t5_prompt_embeds
+def get_t5_prompt_embeds(
+    prompt = None,
+    num_videos_per_prompt = 1,
+    max_sequence_length = 226,
+    device = None,
+    dtype = None,
+    tokenizer = None,
+    text_encoder = None,
+):
+    device = device or text_encoder.device
+    dtype = dtype or text_encoder.dtype
+
+    prompt = [prompt] if isinstance(prompt, str) else prompt
+    batch_size = len(prompt)
+
+    text_inputs = tokenizer(
+        prompt,
+        padding="max_length",
+        max_length=max_sequence_length,
+        truncation=True,
+        add_special_tokens=True,
+        return_tensors="pt",
+    )
+    text_input_ids = text_inputs.input_ids
+    untruncated_ids = tokenizer(prompt, padding="longest", return_tensors="pt").input_ids
+
+    if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(text_input_ids, untruncated_ids):
+        removed_text = tokenizer.batch_decode(untruncated_ids[:, max_sequence_length - 1 : -1])
+        logger.warning(
+            "The following part of your input was truncated because `max_sequence_length` is set to "
+            f" {max_sequence_length} tokens: {removed_text}"
+        )
+
+    prompt_embeds = text_encoder(text_input_ids.to(device))[0]
+    prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
+
+    # duplicate text embeddings for each generation per prompt, using mps friendly method
+    _, seq_len, _ = prompt_embeds.shape
+    prompt_embeds = prompt_embeds.repeat(1, num_videos_per_prompt, 1)
+    prompt_embeds = prompt_embeds.view(batch_size * num_videos_per_prompt, seq_len, -1)
+
+    return prompt_embeds
+
+
 def main():
     parser = argparse.ArgumentParser(description="Unified CogVideoX Pose Training Script")
     parser.add_argument("--experiment_config", type=str, required=True,
@@ -2932,6 +3017,8 @@ def main():
         "vae_scale_factor_spatial": data_config.get("vae_scale_factor_spatial", 8),
         "load_raymaps": data_config.get("load_raymaps", False),
         "load_image_goal": data_config.get("load_image_goal", False),
+        "prompt_subdir": data_config.get("prompt_subdir", "prompts"),
+        "prompt_embeds_subdir": data_config.get("prompt_embeds_subdir", "prompt_embeds"),
     }
     
     # Choose dataset class based on pipeline type
@@ -3127,7 +3214,10 @@ def main():
                 "batch_size": training_config.get("batch_size"),
                 "max_train_steps": training_config.get("max_train_steps"),
                 "optimizer": training_config.get("optimizer"),
-                "lr_scheduler": training_config.get("lr_scheduler")
+                "lr_scheduler": training_config.get("lr_scheduler"),
+                "prompt_dropout_prob": training_config.get("prompt_dropout_prob", 0.0),
+                "condition_blur_prob": training_config.get("condition_blur_prob", 0.0),
+                "condition_blur_strength": training_config.get("condition_blur_strength", 0.2),
             },
             "data": {
                 "dataset_file": data_config.get("dataset_file"),
@@ -3190,6 +3280,16 @@ def main():
     accelerator.print(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
     accelerator.print(f"  Gradient accumulation steps = {training_config['gradient_accumulation_steps']}")
     accelerator.print(f"  Total optimization steps = {max_train_steps}")
+    
+    # Print augmentation settings
+    prompt_dropout_prob = training_config.get("prompt_dropout_prob", 0.0)
+    condition_blur_prob = training_config.get("condition_blur_prob", 0.0)
+    condition_blur_strength = training_config.get("condition_blur_strength", 0.2)
+    
+    if prompt_dropout_prob > 0:
+        accelerator.print(f"  🎲 Prompt dropout: {prompt_dropout_prob * 100:.1f}%")
+    if condition_blur_prob > 0:
+        accelerator.print(f"  🎨 Condition blur: {condition_blur_prob * 100:.1f}% (strength: {condition_blur_strength})")
     
     print(f"🚀 Starting training for {max_train_steps} steps...")
     
@@ -3348,6 +3448,26 @@ def main():
             should_run_max_validation=False
         )
 
+    # Generate empty prompt embedding for prompt dropout (classifier-free guidance training)
+    EMPTY_PROMPT_EMBED = None
+    prompt_dropout_prob = training_config.get("prompt_dropout_prob", 0.0)
+    
+    load_tensors = training_config.get("custom_settings", {}).get("load_tensors", False)
+    
+    if prompt_dropout_prob > 0 and not load_tensors:
+        # Only generate when text_encoder is available (not in load_tensors mode)
+        EMPTY_PROMPT_EMBED = get_t5_prompt_embeds(
+            prompt="",
+            tokenizer=tokenizer,
+            text_encoder=text_encoder,
+            device=accelerator.device,
+            dtype=weight_dtype,
+        )
+        logger.info(f"🎲 Prompt dropout enabled: {prompt_dropout_prob * 100:.1f}% probability")
+        logger.info(f"   EMPTY_PROMPT_EMBED shape: {EMPTY_PROMPT_EMBED.shape}")
+    elif prompt_dropout_prob > 0 and load_tensors:
+        logger.warning("⚠️  Prompt dropout is not supported in load_tensors mode (text_encoder not available)")
+
     # Training loop - epoch based (like original CogVideoX)
     transformer.train()
 
@@ -3371,12 +3491,25 @@ def main():
                 image_goal = batch.get("image_goal")  # For planning mode (future use)
                 
                 # Process condition videos once for all pipelines
-                load_tensors = training_config.get("custom_settings", {}).get("load_tensors", False)
+                
                 split_hands = data_config.get("split_hands", False)
                 hand_videos_latents, static_videos_latents, smpl_pos_map_latents = _process_condition_videos(
                     hand_videos, static_videos, smpl_pos_map, vae, VAE_SCALING_FACTOR, 
                     accelerator.device, weight_dtype, load_tensors, split_hands
                 )
+                
+                # Apply condition blur augmentation for robustness to degraded Gaussian rendering
+                condition_blur_prob = training_config.get("condition_blur_prob", 0.0)
+                condition_blur_strength = training_config.get("condition_blur_strength", 0.2)
+                
+                if condition_blur_prob > 0 and random.random() < condition_blur_prob:
+                    # Apply blur to static video latents (simulates Gaussian rendering artifacts)
+                    if static_videos_latents is not None:
+                        static_videos_latents = _blur_condition_latent(static_videos_latents, condition_blur_strength)
+                    
+                    # Log augmentation (only occasionally to avoid spam)
+                    if global_step % 100 == 0:
+                        logs["condition_blur_applied"] = 1
 
                 # Encode videos
                 if not training_config.get("custom_settings", {}).get("load_tensors", False):
@@ -3420,6 +3553,25 @@ def main():
                 else:
                     # When load_tensors=True, prompts is already a batched tensor
                     prompt_embeds = prompts.to(dtype=weight_dtype)
+                
+                # Apply prompt dropout for classifier-free guidance training
+                if prompt_dropout_prob > 0 and EMPTY_PROMPT_EMBED is not None:
+                    # Sample dropout mask: each sample in batch has independent dropout probability
+                    dropout_mask = torch.rand(batch_size, device=accelerator.device) < prompt_dropout_prob
+                    
+                    if dropout_mask.any():
+                        # Replace dropped prompts with empty prompt embedding
+                        # EMPTY_PROMPT_EMBED shape: [1, seq_len, hidden_dim]
+                        # prompt_embeds shape: [batch_size, seq_len, hidden_dim]
+                        prompt_embeds[dropout_mask] = EMPTY_PROMPT_EMBED.to(
+                            device=prompt_embeds.device, 
+                            dtype=prompt_embeds.dtype
+                        )
+                        
+                        # Log dropout statistics (only occasionally to avoid spam)
+                        if global_step % 100 == 0:
+                            num_dropped = dropout_mask.sum().item()
+                            logs["prompt_dropout_count"] = num_dropped
 
                 # Sample noise that will be added to the latents
                 noise = torch.randn_like(model_input)

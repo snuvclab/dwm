@@ -49,6 +49,8 @@ class VideoDataset(Dataset):
         random_flip: Optional[float] = None,
         image_to_video: bool = False,
         use_gray_hand_videos: bool = False,
+        prompt_subdir: str = "prompts",
+        prompt_embeds_subdir: str = "prompt_embeds",
     ) -> None:
         super().__init__()
 
@@ -64,6 +66,8 @@ class VideoDataset(Dataset):
         self.load_tensors = load_tensors
         self.random_flip = random_flip
         self.image_to_video = image_to_video
+        self.prompt_subdir = prompt_subdir
+        self.prompt_embeds_subdir = prompt_embeds_subdir
         
         # Ensure buckets are lists
         if not isinstance(self.height_buckets, list):
@@ -207,8 +211,8 @@ class VideoDataset(Dataset):
         with open(video_path, "r", encoding="utf-8") as file:
             video_paths = [self.data_root.joinpath(line.strip()) for line in file.readlines() if len(line.strip()) > 0]
 
-        # Derive prompt paths from video paths (same as _load_dataset_from_datafile)
-        prompt_paths = [path.parent.parent.joinpath("prompts", path.name.replace(".mp4", ".txt")) for path in video_paths]
+        # Derive prompt paths from video paths using configurable prompt_subdir
+        prompt_paths = [path.parent.parent.joinpath(self.prompt_subdir, path.name.replace(".mp4", ".txt")) for path in video_paths]
         # prompts = [path.read_text().strip() for path in prompt_paths]
         prompts = ["" for path in prompt_paths]
 
@@ -235,7 +239,8 @@ class VideoDataset(Dataset):
     def _load_dataset_from_datafile(self) -> Tuple[List[str], List[str]]:
         with open(self.data_root / self.dataset_file, "r") as f:
             video_paths = [self.data_root.joinpath(line.strip()) for line in f.readlines() if len(line.strip()) > 0]
-        prompt_paths = [path.parent.parent.joinpath("prompts", path.name.replace(".mp4", ".txt")) for path in video_paths]
+        # Use configurable prompt_subdir
+        prompt_paths = [path.parent.parent.joinpath(self.prompt_subdir, path.name.replace(".mp4", ".txt")) for path in video_paths]
         prompts = [path.read_text() for path in prompt_paths]
 
         return prompts, video_paths
@@ -289,7 +294,8 @@ class VideoDataset(Dataset):
             # We need to reach: /a/b/c/d/video_latents/00001.pt
             image_latents_path = path.parent.parent.joinpath("image_latents")
             video_latents_path = path.parent.parent.joinpath("video_latents")
-            embeds_path = path.parent.parent.joinpath("prompt_embeds")
+            # Use configurable prompt_embeds_subdir
+            embeds_path = path.parent.parent.joinpath(self.prompt_embeds_subdir)
 
             if (
                 not video_latents_path.exists()
@@ -373,6 +379,8 @@ class VideoDatasetWithConditions(VideoDataset):
         vae_scale_factor_spatial: int = 8,
         load_raymaps: bool = False,
         load_image_goal: bool = False,
+        prompt_subdir: str = "prompts",
+        prompt_embeds_subdir: str = "prompt_embeds",
     ) -> None:
         # Initialize parent class with main video column
         super().__init__(
@@ -388,6 +396,8 @@ class VideoDatasetWithConditions(VideoDataset):
             load_tensors=load_tensors,
             random_flip=random_flip,
             image_to_video=image_to_video,
+            prompt_subdir=prompt_subdir,
+            prompt_embeds_subdir=prompt_embeds_subdir,
         )
         
         # Store the flags
@@ -1046,6 +1056,8 @@ class VideoDatasetWithHumanMotions(VideoDatasetWithConditions):
         vae_scale_factor_spatial: int = 8,
         load_raymaps: bool = False,
         load_image_goal: bool = False,
+        prompt_subdir: str = "prompts",
+        prompt_embeds_subdir: str = "prompt_embeds",
     ) -> None:
         # Initialize parent class with main video column
         super().__init__(
@@ -1069,6 +1081,8 @@ class VideoDatasetWithHumanMotions(VideoDatasetWithConditions):
             vae_scale_factor_spatial=vae_scale_factor_spatial,
             load_raymaps=load_raymaps,
             load_image_goal=load_image_goal,
+            prompt_subdir=prompt_subdir,
+            prompt_embeds_subdir=prompt_embeds_subdir,
         )
         
         # Automatically derive human_motions paths from main video paths
