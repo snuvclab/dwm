@@ -10,7 +10,7 @@ import argparse
 import time
 import traceback
 from datetime import datetime
-
+from pathlib import Path
 # ---------------------------
 # CLI args
 # ---------------------------
@@ -21,7 +21,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--start_frame", type=int, default=None)
 parser.add_argument("--end_frame", type=int, default=None)
 parser.add_argument("--animation_index", type=int, default=None, help="Specific animation index (else: all)")
-parser.add_argument("--samples", type=int, default=64, help="Cycles samples")
+parser.add_argument("--samples", type=int, default=32, help="Cycles samples")
 parser.add_argument("--save-path", type=str, default="/home/byungjun/workspace/trumans_ego/ego_render_new",
                     help="Root output dir")
 parser.add_argument("--skip-existing", action="store_true", default=True, help="Skip frames that already exist")
@@ -318,7 +318,6 @@ def restore_animations(camera_obj):
 scene = bpy.context.scene
 render = scene.render
 render.engine = 'CYCLES'
-optimize_scene_for_rendering()
 
 # Show AugmentAreaCollection if it exists
 if "AugmentAreaCollection" in bpy.data.collections:
@@ -357,7 +356,7 @@ render.resolution_percentage = 100
 render.image_settings.file_format = 'PNG'
 render.image_settings.color_mode = 'RGBA'
 
-# Removed depth view layer setup - no longer needed for static video rendering
+optimize_scene_for_rendering()
 
 # ---------------------------
 # Compositor nodes
@@ -465,9 +464,23 @@ def render_animation_sequence(animation_index, animation_name):
     sequences_folder = os.path.join(anim_output_folder, "sequences")
     videos_output_path = os.path.join(sequences_folder, "videos_static")
     os.makedirs(videos_output_path, exist_ok=True)
+    
+    # Create temp directory using scene name and animation info
+    # Extract scene code from output_folder (first 8 characters)
+    scene_code = os.path.basename(output_folder)
+    
+    # Simple temp directory naming
+    base_temp_dir = Path.cwd() / "temp_static_images"
+    base_temp_dir.mkdir(exist_ok=True)
+    
+    temp_dir = base_temp_dir / f"{scene_code}_{animation_name}"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Temporary directory for images: {temp_dir}")
+    print(f"  Scene code: {scene_code}, Animation: {animation_name}")
 
     print(f"Rendering animation {animation_index}: {animation_name}")
     print(f"  Videos: {videos_output_path}")
+    print(f"  Temp images: {temp_dir}")
 
     # Frame range and video sequence parameters
     scene = bpy.context.scene
@@ -535,16 +548,18 @@ def render_animation_sequence(animation_index, animation_name):
         print(f"\n========== VIDEO {video_idx + 1}/{len(video_start_frames)} ==========")
         print(f"Frames: {start_frame_num}..{video_end_frame} (step {frame_skip}) -> {len(frames_to_render)} frames")
 
-        # 출력 경로/노드 설정
-        video_temp_dir = os.path.join(videos_output_path, f"temp_{video_idx:05d}")
-        os.makedirs(video_temp_dir, exist_ok=True)
-        rgb_output_node.base_path = video_temp_dir
+        # Create local temp directory for this video's frames
+        video_temp_dir = temp_dir / f"video_{video_idx:05d}"
+        video_temp_dir.mkdir(exist_ok=True)
+        
+        # Set Blender output to local temp directory
+        rgb_output_node.base_path = str(video_temp_dir)
         rgb_output_node.file_slots[0].path = "####"
 
         # 정지 씬 렌더링이니 배우 숨김
         hide_actor_from_rendering()
         
-        # Render all frames for this video
+        # Render all frames for this video to local temp directory
         video_start_time = time.time()
         frames_rendered = 0
         
@@ -556,7 +571,7 @@ def render_animation_sequence(animation_index, animation_name):
             camera_obj.rotation_mode = 'QUATERNION'
             camera_obj.rotation_quaternion = cam_rots[frame_idx]
 
-            # Render
+            # Render to local temp directory
             frame_render_start = time.time()
             bpy.ops.render.render(write_still=True)
             frame_time = time.time() - frame_render_start
@@ -569,16 +584,16 @@ def render_animation_sequence(animation_index, animation_name):
                 avg_frame_time = total_render_time / frames_rendered if frames_rendered > 0 else 0
                 print(f"  Frame {frame_idx + 1}/{len(frames_to_render)} ({progress:.1f}%) - {frame_time:.1f}s")
         
-        # Convert frames to video using ffmpeg
+        # Convert frames to video using ffmpeg (from local temp to NAS)
         video_output_path = os.path.join(videos_output_path, f"{video_idx:05d}.mp4")
         
         try:
             import subprocess
             
-            # Create RGB video
+            # Create RGB video from local temp frames
             rgb_cmd = [
                 'ffmpeg', '-y', '-framerate', str(fps),
-                '-pattern_type', 'glob', '-i', os.path.join(video_temp_dir, '*.png'),
+                '-pattern_type', 'glob', '-i', str(video_temp_dir / '*.png'),
                 '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
                 '-crf', '18', video_output_path
             ]
@@ -593,12 +608,12 @@ def render_animation_sequence(animation_index, animation_name):
             print(f"  ❌ ffmpeg not found. Please install ffmpeg to create videos.")
             print(f"  Rendered frames saved in: {video_temp_dir}")
         
-        # # Clean up temporary files
-        # try:
-        #     import shutil
-        #     shutil.rmtree(video_temp_dir)
-        # except Exception as e:
-        #     print(f"  Warning: Could not clean up temp files: {e}")
+        # Clean up temporary files for this video
+        try:
+            import shutil
+            shutil.rmtree(video_temp_dir)
+        except Exception as e:
+            print(f"  Warning: Could not clean up temp files: {e}")
         
         videos_completed += 1
         
@@ -618,6 +633,15 @@ def render_animation_sequence(animation_index, animation_name):
 
     total_time = time.time() - start_time
     avg_fps = (videos_completed * clip_length) / total_time if total_time > 0 else 0
+
+    # Final cleanup of temporary directory
+    print(f"\n🧹 Final cleanup of temporary directory: {temp_dir}")
+    try:
+        import shutil
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        print(f"  ✅ Cleaned up temporary directory")
+    except Exception as e:
+        print(f"  ⚠️  Cleanup warning: {e}")
 
     print("\n" + "="*50)
     print(f"COMPLETED: Animation {animation_index} ({animation_name})")

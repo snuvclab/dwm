@@ -819,10 +819,17 @@ def render_animation_sequence(animation_index, animation_name):
     # Create local temporary directory for images (only for video mode)
     temp_dir = None
     if not args.save_images:
-        # Video mode: create temp directory in current working directory
-        temp_dir = Path.cwd() / "temp_hand_images" / f"temp_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        # Video mode: create temp directory using scene name and animation info
+        scene_code = os.path.basename(output_folder)
+        
+        # Simple temp directory naming
+        base_temp_dir = Path.cwd() / "temp_hand_images"
+        base_temp_dir.mkdir(exist_ok=True)
+        
+        temp_dir = base_temp_dir / f"{scene_code}_{animation_name}"
         temp_dir.mkdir(parents=True, exist_ok=True)
         print(f"Temporary directory for images: {temp_dir}")
+        print(f"  Scene code: {scene_code}, Animation: {animation_name}")
         print(f"Directory exists: {temp_dir.exists()}")
         print(f"Directory is writable: {temp_dir.is_dir() and os.access(temp_dir, os.W_OK)}")
     
@@ -1208,9 +1215,9 @@ def render_animation_sequence(animation_index, animation_name):
                 if len(frames_for_video) != clip_length:
                     print(f"  ⚠️  WARNING: Expected {clip_length} frames but got {len(frames_for_video)}!")
                 
-                # Create symlinks with sequential numbering for ffmpeg
-                video_temp_left = temp_dir / f"video_{video_idx:05d}_left"
-                video_temp_right = temp_dir / f"video_{video_idx:05d}_right"
+                # Create symlinks with sequential numbering for ffmpeg (no separate video folders)
+                video_temp_left = temp_dir / f"left_hand_frames"
+                video_temp_right = temp_dir / f"right_hand_frames"
                 video_temp_left.mkdir(exist_ok=True)
                 video_temp_right.mkdir(exist_ok=True)
                 
