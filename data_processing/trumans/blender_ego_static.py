@@ -155,27 +155,38 @@ def check_video_exists(video_idx, videos_output_path):
     needs_rendering = not video_exists
     return video_exists, needs_rendering
 
-def check_frame_exists(frame_num, images_output_path):
-    def file_ok(path): return os.path.isfile(path) and os.path.getsize(path) > 0
-    image_path = os.path.join(images_output_path, f"{frame_num:04d}.png")
-    image_exists = file_ok(image_path)
-    needs_rendering = not image_exists
-    return image_exists, needs_rendering
-
 def optimize_scene_for_rendering():
     scene = bpy.context.scene
     scene.cycles.samples = cycles_samples
+    scene.cycles.device = 'GPU'
+
+    # Persistent data caching (Blender 4.x)
+    if hasattr(scene.render, "use_persistent_data"):
+        scene.render.use_persistent_data = True
+
+    # Adaptive sampling
+    if hasattr(scene.cycles, "use_adaptive_sampling"):
+        scene.cycles.use_adaptive_sampling = True
+        scene.cycles.adaptive_threshold = 0.05
+    if hasattr(scene.cycles, "tile_size"):
+        scene.cycles.tile_size = 256
+
+    # ✅ Denoising ON (OptiX GPU based)
     scene.cycles.use_denoising = True
-    if hasattr(scene.cycles, 'denoiser'):
+    if hasattr(scene.cycles, "denoiser"):
         keys = scene.cycles.bl_rna.properties['denoiser'].enum_items.keys()
-        if 'OPTIX' in keys: scene.cycles.denoiser = 'OPTIX'
-        elif 'OPENIMAGEDENOISE' in keys: scene.cycles.denoiser = 'OPENIMAGEDENOISE'
+        if "OPTIX" in keys:
+            scene.cycles.denoiser = "OPTIX"
+            scene.cycles.use_preview_denoising = True
+        elif "OPENIMAGEDENOISE" in keys:
+            scene.cycles.denoiser = "OPENIMAGEDENOISE"  # CPU fallback
+    scene.cycles.preview_denoising = True
+
+    # Other settings
     scene.render.resolution_percentage = 100
     scene.render.use_border = False
     scene.render.use_crop_to_border = False
-    if hasattr(scene.render, 'use_free_unused_nodes'): scene.render.use_free_unused_nodes = True
-    if hasattr(scene.render, 'use_free_image_textures'): scene.render.use_free_image_textures = True
-    print(f"Optimized scene: {scene.render.resolution_x}x{scene.render.resolution_y}, {cycles_samples} samples")
+    scene.render.use_motion_blur = False
 
 def hide_actor_from_rendering():
     """Hide the actor (armature and its children) from rendering for static scenes."""
@@ -310,6 +321,50 @@ def restore_animations(camera_obj):
     _original_animation_state = {"camera_parent": None, "actions": {}}
     bpy.context.view_layer.update()
 
+def bake_camera_keys(camera_obj, frames, locs, rots):
+    """Bake camera transform keys based on frames/locs/rots."""
+    # Prepare action
+    if not camera_obj.animation_data:
+        camera_obj.animation_data_create()
+    if not camera_obj.animation_data.action:
+        camera_obj.animation_data.action = bpy.data.actions.new(name="POV_Camera_Baked")
+    action = camera_obj.animation_data.action
+
+    # Clear existing FCurves
+    for fc in list(action.fcurves):
+        action.fcurves.remove(fc)
+
+    # Create location/rotation fcurves
+    loc_curves = [action.fcurves.new(data_path="location", index=i) for i in range(3)]
+    rot_curves = [action.fcurves.new(data_path="rotation_quaternion", index=i) for i in range(4)]
+
+    # Insert keys
+    for f, loc, rot in zip(frames, locs, rots):
+        # Set values
+        camera_obj.location = loc
+        camera_obj.rotation_mode = 'QUATERNION'
+        camera_obj.rotation_quaternion = rot
+        # Keyframe
+        for i, c in enumerate(loc_curves):
+            c.keyframe_points.insert(frame=f, value=camera_obj.location[i], options={'FAST'})
+        for i, c in enumerate(rot_curves):
+            c.keyframe_points.insert(frame=f, value=camera_obj.rotation_quaternion[i], options={'FAST'})
+
+    # Set interpolation to Linear (if desired)
+    for fc in action.fcurves:
+        for kp in fc.keyframe_points:
+            kp.interpolation = 'LINEAR'
+
+
+def clear_camera_keys(camera_obj):
+    """Clean up baked camera keys (delete action)."""
+    if camera_obj.animation_data and camera_obj.animation_data.action:
+        act = camera_obj.animation_data.action
+        camera_obj.animation_data_clear()
+        try:
+            bpy.data.actions.remove(act)
+        except Exception:
+            pass
 
 
 # ---------------------------
@@ -358,26 +413,14 @@ render.image_settings.color_mode = 'RGBA'
 
 optimize_scene_for_rendering()
 
-# ---------------------------
-# Compositor nodes
-# ---------------------------
-scene.use_nodes = True
-tree = scene.node_tree
-for node in list(tree.nodes):
-    tree.nodes.remove(node)
+# Direct video output (H.264 MP4)
+render.image_settings.file_format = 'FFMPEG'
+render.ffmpeg.format = 'MPEG4'
+render.ffmpeg.codec = 'H264'
+render.ffmpeg.constant_rate_factor = 'MEDIUM'   # Quality/speed balance: 18~23 range
+render.ffmpeg.ffmpeg_preset = 'REALTIME'       # Speed up in light I/O environments
+render.fps = 8
 
-# Default ViewLayer (RGB only, no Depth)
-rl_rgb = tree.nodes.new(type='CompositorNodeRLayers')
-rl_rgb.location = 0, 0
-rl_rgb.layer = bpy.context.view_layer.name  # usually "ViewLayer"
-
-# RGB output node (will be configured per video sequence)
-rgb_output_node = tree.nodes.new(type='CompositorNodeOutputFile')
-rgb_output_node.label = "RGB Output"
-rgb_output_node.format.file_format = 'PNG'
-rgb_output_node.format.color_mode = 'RGBA'
-rgb_output_node.location = 400, 200
-tree.links.new(rl_rgb.outputs['Image'], rgb_output_node.inputs[0])
 
 # ---------------------------
 # Locate objects & camera setup
@@ -523,113 +566,78 @@ def render_animation_sequence(animation_index, animation_name):
             videos_completed += 1
             continue
 
-        # === (A) 루프 시작: 깨끗한 상태로 되돌리기 ===
-        restore_animations(camera_obj)    # 이전 클립에서 분리했던 것 되돌림
-        show_actor_in_rendering()         # 배우(암) 다시 보이게
+        # === (A) Loop start: restore clean state ===
+        restore_animations(camera_obj)    # Restore what was separated from previous clip
+        show_actor_in_rendering()         # Show actor (armature) again
 
-        # 현재 클립용 애니메이션 적용 (동적인 상태에서)
+        # Apply animation for current clip (in dynamic state)
         if not apply_animation_set(animation_index):
             print(f"Failed to apply animation set for video {video_idx}")
             continue
 
-        # === (B) 이 클립의 카메라 포즈 샘플 ===
+        # === (B) Sample camera poses for this clip ===
         cam_locs, cam_rots = sample_camera_world_transforms(camera_obj, frames_to_render)
 
-        # 씬을 클립의 시작 프레임으로 맞춘 뒤,
+        # Set scene to start frame of clip
         scene.frame_set(start_frame_num)
 
-        # === (C) 이제 씬 고정: 카메라 제외 모든 애니메이션 분리 & 카메라 부모 해제 ===
+        # === (C) Freeze scene: separate all animations except camera & unparent camera ===
         disable_animations_except_camera(camera_obj)
 
-        # (권장) 모션블러 끄기
-        if hasattr(scene.render, "use_motion_blur"):
-            scene.render.use_motion_blur = False
+        # Hide actor (static scene)
+        hide_actor_from_rendering()
 
         print(f"\n========== VIDEO {video_idx + 1}/{len(video_start_frames)} ==========")
         print(f"Frames: {start_frame_num}..{video_end_frame} (step {frame_skip}) -> {len(frames_to_render)} frames")
 
-        # Create local temp directory for this video's frames
-        video_temp_dir = temp_dir / f"video_{video_idx:05d}"
-        video_temp_dir.mkdir(exist_ok=True)
-        
-        # Set Blender output to local temp directory
-        rgb_output_node.base_path = str(video_temp_dir)
-        rgb_output_node.file_slots[0].path = "####"
+        # ---- Camera key baking followed by animation render ----
+        # 1) Bake camera keys
+        bake_camera_keys(camera_obj, frames_to_render, cam_locs, cam_rots)
 
-        # 정지 씬 렌더링이니 배우 숨김
-        hide_actor_from_rendering()
-        
-        # Render all frames for this video to local temp directory
-        video_start_time = time.time()
-        frames_rendered = 0
-        
-        for frame_idx, frame_num in enumerate(frames_to_render):
-            scene.frame_set(frame_num)
+        # 2) Set frame range/step
+        orig_frame_step = getattr(scene, "frame_step", 1)
+        if hasattr(scene, "frame_step"):
+            scene.frame_step = frame_skip  # Render as 0,3,6,... if 3
 
-            # Drive only the camera from the cached poses
-            camera_obj.location = cam_locs[frame_idx]
-            camera_obj.rotation_mode = 'QUATERNION'
-            camera_obj.rotation_quaternion = cam_rots[frame_idx]
+        scene.frame_start = start_frame_num
+        scene.frame_end   = video_end_frame
 
-            # Render to local temp directory
-            frame_render_start = time.time()
-            bpy.ops.render.render(write_still=True)
-            frame_time = time.time() - frame_render_start
-
-            frames_rendered += 1
-            total_render_time += frame_time
-
-            if frame_idx % 10 == 0 or frame_idx == len(frames_to_render) - 1:
-                progress = (frame_idx + 1) / len(frames_to_render) * 100.0
-                avg_frame_time = total_render_time / frames_rendered if frames_rendered > 0 else 0
-                print(f"  Frame {frame_idx + 1}/{len(frames_to_render)} ({progress:.1f}%) - {frame_time:.1f}s")
-        
-        # Convert frames to video using ffmpeg (from local temp to NAS)
+        # 3) Output file path (direct mp4)
         video_output_path = os.path.join(videos_output_path, f"{video_idx:05d}.mp4")
-        
-        try:
-            import subprocess
-            
-            # Create RGB video from local temp frames
-            rgb_cmd = [
-                'ffmpeg', '-y', '-framerate', str(fps),
-                '-pattern_type', 'glob', '-i', str(video_temp_dir / '*.png'),
-                '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
-                '-crf', '18', video_output_path
-            ]
-            subprocess.run(rgb_cmd, check=True, capture_output=True)
-            
-            print(f"  ✅ Created video: {os.path.basename(video_output_path)}")
-            
-        except subprocess.CalledProcessError as e:
-            print(f"  ❌ Failed to create video: {e}")
-            print(f"  Command output: {e.stderr.decode()}")
-        except FileNotFoundError:
-            print(f"  ❌ ffmpeg not found. Please install ffmpeg to create videos.")
-            print(f"  Rendered frames saved in: {video_temp_dir}")
-        
-        # Clean up temporary files for this video
-        try:
-            import shutil
-            shutil.rmtree(video_temp_dir)
-        except Exception as e:
-            print(f"  Warning: Could not clean up temp files: {e}")
-        
-        videos_completed += 1
-        
-        # Restore animations for the next video sequence
+        render.filepath = os.path.splitext(video_output_path)[0]  # Blender adds extension
+
+        # 4) Render (continuous)
+        video_start_time = time.time()
+        bpy.ops.render.render(animation=True)
+        final_path = os.path.join(videos_output_path, f"{video_idx:05d}.mp4")
+        # Search for actual file name created by Blender
+        for f in os.listdir(videos_output_path):
+            if f.startswith(f"{video_idx:05d}") and f.endswith(".mp4") and "-" in f:
+                os.rename(os.path.join(videos_output_path, f), final_path)
+                print(f"Renamed {f} -> {os.path.basename(final_path)}")
+                break
+        clip_time = time.time() - video_start_time
+        print(f"  ✅ Created video: {os.path.basename(video_output_path)} ({clip_time:.1f}s)")
+
+        # 5) Cleanup (camera keys, restore frame_step)
+        clear_camera_keys(camera_obj)
+        if hasattr(scene, "frame_step"):
+            scene.frame_step = orig_frame_step
+
+        # 6) Restore for next clip
         restore_animations(camera_obj)
         show_actor_in_rendering()
-        
-        # Overall progress
+
+        videos_completed += 1
+
+        # Progress output
         total_elapsed = time.time() - start_time
-        if videos_completed > 1:
-            avg_video_time = total_elapsed / videos_completed
-            remaining_videos = len(video_start_frames) - videos_completed
-            eta = remaining_videos * avg_video_time
-            print(f"  📊 Progress: {videos_completed}/{len(video_start_frames)} videos")
-            print(f"  ⏱️  Video time: {time.time() - video_start_time:.1f}s | Avg: {avg_video_time:.1f}s")
-            print(f"  🎯 ETA: {eta/60:.1f} min | Elapsed: {total_elapsed/60:.1f} min")
+        avg_video_time = total_elapsed / max(1, videos_completed)
+        remaining_videos = len(video_start_frames) - videos_completed
+        eta = remaining_videos * avg_video_time
+        print(f"  📊 Progress: {videos_completed}/{len(video_start_frames)} videos")
+        print(f"  ⏱️  Video time: {clip_time:.1f}s | Avg: {avg_video_time:.1f}s")
+        print(f"  🎯 ETA: {eta/60:.1f} min | Elapsed: {total_elapsed/60:.1f} min")
 
     total_time = time.time() - start_time
     avg_fps = (videos_completed * clip_length) / total_time if total_time > 0 else 0
