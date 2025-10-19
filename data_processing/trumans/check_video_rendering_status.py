@@ -107,7 +107,7 @@ except Exception as e:
             temp_script = f.name
         
         cmd = ["blender", "--background", blend_file, "--python", temp_script]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         
         # Clean up temp file
         try:
@@ -225,7 +225,7 @@ except Exception as e:
             temp_script = f.name
         
         cmd = ["blender", "--background", blend_file, "--python", temp_script]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         
         # Clean up temp file
         try:
@@ -590,7 +590,7 @@ if __name__ == "__main__":
                        help="Stride value used during video rendering (default: 25)")
     parser.add_argument("--clip-length", type=int, default=49,
                        help="Clip length used during video rendering (default: 49)")
-    parser.add_argument("--video-type", type=str, choices=["static", "hands"], default="static",
+    parser.add_argument("--video-type", type=str, choices=["static", "hands", "hands_new"], default="static",
                        help="Type of rendering to check: 'static' for blender_ego_static.py, 'hands' for blender_ego_hand.py (default: static)")
     
     args = parser.parse_args()
