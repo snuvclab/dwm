@@ -391,7 +391,7 @@ class CogVideoXFunInpaintPipeline(DiffusionPipeline):
             mask = mask * self.vae.config.scaling_factor
 
         if masked_image is not None:
-            if self.transformer.config.add_noise_in_inpaint_model:
+            if self.transformer.config.get("add_noise_in_inpaint_model", False):
                 masked_image = add_noise_to_reference_video(masked_image, ratio=noise_aug_strength)
             masked_image = masked_image.to(device=device, dtype=self.vae.dtype)
             bs = 1

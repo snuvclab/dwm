@@ -110,6 +110,8 @@ def log_validation_with_dataset(
     step: int = 0,
     pipeline_type: str = None,
     validation_mode: str = None,
+    apply_blur_to_static: bool = False,
+    blur_strength: float = 0.2,
 ):
     """Log validation results with side-by-side comparison of generated and ground truth videos."""
     logger.info(
@@ -176,6 +178,25 @@ def log_validation_with_dataset(
             static_video = iio.imread(validation_static_video_path).astype(np.float32) / 255.0
             static_video = static_video.transpose(3, 0, 1, 2)  # [F, H, W, C] -> [C, F, H, W]
             static_video = static_video[np.newaxis, :]  # Add batch dimension: [C, F, H, W] -> [1, C, F, H, W]
+            
+            # Apply blur to static video if requested (for robustness testing)
+            if apply_blur_to_static:
+                # For validation, use stronger blur than training (pixel space needs more blur than latent space)
+                # Training uses blur on latents (strength), but validation uses blur on pixels (needs ~2-3x stronger)
+                validation_blur_strength = blur_strength * 2.5  # Amplify for visibility in pixel space
+                
+                print(f"🎨 Applying Gaussian blur to static video")
+                print(f"   Training blur strength (latent): {blur_strength}")
+                print(f"   Validation blur strength (pixel): {validation_blur_strength}")
+                print(f"   Static video shape: {static_video.shape}")
+                print(f"   Value range before blur: [{static_video.min():.3f}, {static_video.max():.3f}]")
+                
+                static_video_tensor = torch.from_numpy(static_video).float()
+                static_video_tensor = _apply_gaussian_blur_to_video(static_video_tensor, validation_blur_strength)
+                static_video = static_video_tensor.numpy()
+                
+                print(f"   Value range after blur: [{static_video.min():.3f}, {static_video.max():.3f}]")
+                print(f"   ✅ Blur applied successfully (pixel blur is {validation_blur_strength/blur_strength:.1f}x stronger than latent blur)")
         else:
             static_video = None
         
@@ -467,6 +488,10 @@ def log_validation_with_dataset(
     
     # Add validation mode suffix for static-to-video pipelines
     mode_suffix = f"_{validation_mode}" if validation_mode else ""
+    
+    # Add blur suffix if blur was applied
+    if apply_blur_to_static:
+        mode_suffix += "_blurred"
     
     # Ensure output directory exists
     output_dir = config["experiment"]["output_dir"]
@@ -888,6 +913,7 @@ def run_validation(
         split_hands = data_config.get("split_hands", False)
         use_smpl_pos_map = pipeline_config["type"] in ["cogvideox_fun_static_to_video_posmap_concat", "cogvideox_fun_static_to_video_posmap_adapter"]
         use_raymap = pipeline_config["type"] in ["cogvideox_fun_static_to_video_raymap_pose_concat"]
+        hand_video_subdir = data_config.get("hand_video_subdir", "videos_hands")
         
         for video_path in validation_set:
             # Convert video path to hand and static video paths
@@ -905,7 +931,8 @@ def run_validation(
                 if data_config.get("use_gray_hand_videos", False):
                     hand_path = video_path_obj.parent.parent / "videos_hands_gray" / video_path_obj.name
                 else:
-                    hand_path = video_path_obj.parent.parent / "videos_hands" / video_path_obj.name
+                    # Use configurable hand_video_subdir for default mode
+                    hand_path = video_path_obj.parent.parent / hand_video_subdir / video_path_obj.name
                 validation_hand_videos.append(Path(data_config["data_root"]) / hand_path)
                 validation_hand_videos_left.append(None)  # Not used in regular mode
                 validation_hand_videos_right.append(None)  # Not used in regular mode
@@ -1018,9 +1045,11 @@ def run_validation(
                     validation_mode="image_to_video",
                 )
             elif pipeline_config["type"] in ["cogvideox_fun_static_to_video", "cogvideox_fun_static_to_video_pose_concat"]:
-                # For VideoX-Fun static-to-video pipelines, only test static-to-video mode
+                # For VideoX-Fun static-to-video pipelines, test static-to-video mode
                 print(f"🎬 Testing VideoX-Fun static-to-video pipeline for {validation_video.name}")
                 
+                # Mode 1: Clean static video (baseline)
+                print("   Mode 1: Static-to-Video (clean condition)")
                 log_validation_with_dataset(
                     pipe=pipe,
                     config=config,
@@ -1035,7 +1064,31 @@ def run_validation(
                     step=step,
                     pipeline_type=config["pipeline"]["type"],
                     validation_mode="static_to_video",
+                    apply_blur_to_static=False,
                 )
+                
+                # Mode 2: Blurred static video (robustness test) - only if blur augmentation is enabled
+                condition_blur_prob = config.get("training", {}).get("condition_blur_prob", 0.0)
+                if condition_blur_prob > 0:
+                    condition_blur_strength = config.get("training", {}).get("condition_blur_strength", 0.2)
+                    print(f"   Mode 2: Static-to-Video (blurred condition, strength={condition_blur_strength})")
+                    log_validation_with_dataset(
+                        pipe=pipe,
+                        config=config,
+                        accelerator=accelerator,
+                        validation_video_path=validation_video,
+                        validation_prompt=prompt_text,
+                        validation_hand_video_path=validation_hand_video,
+                        validation_static_video_path=validation_static_video,
+                        validation_human_motions_path=None,
+                        validation_hand_video_left_path=validation_hand_video_left,
+                        validation_hand_video_right_path=validation_hand_video_right,
+                        step=step,
+                        pipeline_type=config["pipeline"]["type"],
+                        validation_mode="static_to_video",
+                        apply_blur_to_static=True,
+                        blur_strength=condition_blur_strength,
+                    )
             elif config["pipeline"]["type"] == "cogvideox_static_to_video_cross_pose_adapter":
                 # For VideoX-Fun CrossPipeline, test static-to-video mode with cross-attention
                 print(f"🎬 Testing VideoX-Fun CrossPipeline for {validation_video.name}")
@@ -1097,6 +1150,8 @@ def run_validation(
                 # For VideoX-Fun Pipeline with SMPL pos map concat, test static-to-video mode
                 print(f"🎬 Testing VideoX-Fun Pipeline with SMPL pos map concat for {validation_video.name}")
                 
+                # Mode 1: Clean static video
+                print("   Mode 1: Static-to-Video (clean condition)")
                 log_validation_with_dataset(
                     pipe=pipe,
                     config=config,
@@ -1112,11 +1167,38 @@ def run_validation(
                     step=step,
                     pipeline_type=config["pipeline"]["type"],
                     validation_mode="static_to_video",
+                    apply_blur_to_static=False,
                 )
+                
+                # Mode 2: Blurred static video (if blur augmentation enabled)
+                condition_blur_prob = config.get("training", {}).get("condition_blur_prob", 0.0)
+                if condition_blur_prob > 0:
+                    condition_blur_strength = config.get("training", {}).get("condition_blur_strength", 0.2)
+                    print(f"   Mode 2: Static-to-Video (blurred condition, strength={condition_blur_strength})")
+                    log_validation_with_dataset(
+                        pipe=pipe,
+                        config=config,
+                        accelerator=accelerator,
+                        validation_video_path=validation_video,
+                        validation_prompt=prompt_text,
+                        validation_hand_video_path=None,
+                        validation_static_video_path=validation_static_video,
+                        validation_human_motions_path=None,
+                        validation_hand_video_left_path=None,
+                        validation_hand_video_right_path=None,
+                        validation_smpl_pos_map_path=validation_smpl_pos_map,
+                        step=step,
+                        pipeline_type=config["pipeline"]["type"],
+                        validation_mode="static_to_video",
+                        apply_blur_to_static=True,
+                        blur_strength=condition_blur_strength,
+                    )
             elif config["pipeline"]["type"] == "cogvideox_fun_static_to_video_posmap_adapter":
                 # For VideoX-Fun Pipeline with SMPL pos map adapter, test static-to-video mode
                 print(f"🎬 Testing VideoX-Fun Pipeline with SMPL pos map adapter for {validation_video.name}")
                 
+                # Mode 1: Clean static video
+                print("   Mode 1: Static-to-Video (clean condition)")
                 log_validation_with_dataset(
                     pipe=pipe,
                     config=config,
@@ -1132,11 +1214,38 @@ def run_validation(
                     step=step,
                     pipeline_type=config["pipeline"]["type"],
                     validation_mode="static_to_video",
+                    apply_blur_to_static=False,
                 )
+                
+                # Mode 2: Blurred static video (if blur augmentation enabled)
+                condition_blur_prob = config.get("training", {}).get("condition_blur_prob", 0.0)
+                if condition_blur_prob > 0:
+                    condition_blur_strength = config.get("training", {}).get("condition_blur_strength", 0.2)
+                    print(f"   Mode 2: Static-to-Video (blurred condition, strength={condition_blur_strength})")
+                    log_validation_with_dataset(
+                        pipe=pipe,
+                        config=config,
+                        accelerator=accelerator,
+                        validation_video_path=validation_video,
+                        validation_prompt=prompt_text,
+                        validation_hand_video_path=None,
+                        validation_static_video_path=validation_static_video,
+                        validation_human_motions_path=None,
+                        validation_hand_video_left_path=None,
+                        validation_hand_video_right_path=None,
+                        validation_smpl_pos_map_path=validation_smpl_pos_map,
+                        step=step,
+                        pipeline_type=config["pipeline"]["type"],
+                        validation_mode="static_to_video",
+                        apply_blur_to_static=True,
+                        blur_strength=condition_blur_strength,
+                    )
             elif config["pipeline"]["type"] == "cogvideox_fun_static_to_video_pose_cond_token":
                 # For VideoX-Fun Pipeline with cond token, test static-to-video mode
                 print(f"🎬 Testing VideoX-Fun Pipeline with cond token for {validation_video.name}")
                 
+                # Mode 1: Clean static video
+                print("   Mode 1: Static-to-Video (clean condition)")
                 log_validation_with_dataset(
                     pipe=pipe,
                     config=config,
@@ -1151,13 +1260,37 @@ def run_validation(
                     step=step,
                     pipeline_type=config["pipeline"]["type"],
                     validation_mode="static_to_video",
+                    apply_blur_to_static=False,
                 )
-            elif config["pipeline"]["type"] == "cogvideox_fun_static_to_video_raymap_pose_concat":
-                # For VideoX-Fun Raymap + Hand Pose Concat pipeline, test both modes
-                print(f"🎬 Testing VideoX-Fun Raymap + Hand Pose Concat pipeline with two modes for {validation_video.name}")
                 
-                # Mode 1: Static Video-to-Video (use full static video)
-                print("   Mode 1: Static Video-to-Video (full static video)")
+                # Mode 2: Blurred static video (if blur augmentation enabled)
+                condition_blur_prob = config.get("training", {}).get("condition_blur_prob", 0.0)
+                if condition_blur_prob > 0:
+                    condition_blur_strength = config.get("training", {}).get("condition_blur_strength", 0.2)
+                    print(f"   Mode 2: Static-to-Video (blurred condition, strength={condition_blur_strength})")
+                    log_validation_with_dataset(
+                        pipe=pipe,
+                        config=config,
+                        accelerator=accelerator,
+                        validation_video_path=validation_video,
+                        validation_prompt=prompt_text,
+                        validation_hand_video_path=validation_hand_video,
+                        validation_static_video_path=validation_static_video,
+                        validation_human_motions_path=None,
+                        validation_hand_video_left_path=validation_hand_video_left,
+                        validation_hand_video_right_path=validation_hand_video_right,
+                        step=step,
+                        pipeline_type=config["pipeline"]["type"],
+                        validation_mode="static_to_video",
+                        apply_blur_to_static=True,
+                        blur_strength=condition_blur_strength,
+                    )
+            elif config["pipeline"]["type"] == "cogvideox_fun_static_to_video_raymap_pose_concat":
+                # For VideoX-Fun Raymap + Hand Pose Concat pipeline, test multiple modes
+                print(f"🎬 Testing VideoX-Fun Raymap + Hand Pose Concat pipeline for {validation_video.name}")
+                
+                # Mode 1: Static Video-to-Video (clean condition)
+                print("   Mode 1: Static Video-to-Video (clean condition)")
                 log_validation_with_dataset(
                     pipe=pipe,
                     config=config,
@@ -1173,10 +1306,35 @@ def run_validation(
                     step=step,
                     pipeline_type=config["pipeline"]["type"],
                     validation_mode="static_to_video",
+                    apply_blur_to_static=False,
                 )
                 
-                # Mode 2: Image-to-Video (prediction mode - use first frame only)
-                print("   Mode 2: Image-to-Video / Prediction (first frame only)")
+                # Mode 2: Blurred static video (if blur augmentation enabled)
+                condition_blur_prob = config.get("training", {}).get("condition_blur_prob", 0.0)
+                if condition_blur_prob > 0:
+                    condition_blur_strength = config.get("training", {}).get("condition_blur_strength", 0.2)
+                    print(f"   Mode 2: Static Video-to-Video (blurred condition, strength={condition_blur_strength})")
+                    log_validation_with_dataset(
+                        pipe=pipe,
+                        config=config,
+                        accelerator=accelerator,
+                        validation_video_path=validation_video,
+                        validation_prompt=prompt_text,
+                        validation_hand_video_path=validation_hand_video,
+                        validation_static_video_path=validation_static_video,
+                        validation_human_motions_path=None,
+                        validation_hand_video_left_path=validation_hand_video_left,
+                        validation_hand_video_right_path=validation_hand_video_right,
+                        validation_raymap_path=validation_raymap,
+                        step=step,
+                        pipeline_type=config["pipeline"]["type"],
+                        validation_mode="static_to_video",
+                        apply_blur_to_static=True,
+                        blur_strength=condition_blur_strength,
+                    )
+                
+                # Mode 3: Image-to-Video (prediction mode - use first frame only)
+                print("   Mode 3: Image-to-Video / Prediction (first frame only)")
                 log_validation_with_dataset(
                     pipe=pipe,
                     config=config,
@@ -1192,9 +1350,14 @@ def run_validation(
                     step=step,
                     pipeline_type=config["pipeline"]["type"],
                     validation_mode="image_to_video",
+                    apply_blur_to_static=False,
                 )
             else:
-                # For concat/adapter, pass hand/static video paths
+                # For other pipelines (concat/adapter/cross), test static-to-video mode
+                print(f"🎬 Testing {config['pipeline']['type']} pipeline for {validation_video.name}")
+                
+                # Mode 1: Clean static video
+                print("   Mode 1: Static-to-Video (clean condition)")
                 log_validation_with_dataset(
                     pipe=pipe,
                     config=config,
@@ -1208,7 +1371,30 @@ def run_validation(
                     validation_hand_video_right_path=validation_hand_video_right,
                     step=step,
                     pipeline_type=config["pipeline"]["type"],
+                    apply_blur_to_static=False,
                 )
+                
+                # Mode 2: Blurred static video (if blur augmentation enabled and static video is used)
+                condition_blur_prob = config.get("training", {}).get("condition_blur_prob", 0.0)
+                if condition_blur_prob > 0 and validation_static_video is not None:
+                    condition_blur_strength = config.get("training", {}).get("condition_blur_strength", 0.2)
+                    print(f"   Mode 2: Static-to-Video (blurred condition, strength={condition_blur_strength})")
+                    log_validation_with_dataset(
+                        pipe=pipe,
+                        config=config,
+                        accelerator=accelerator,
+                        validation_video_path=validation_video,
+                        validation_prompt=prompt_text,
+                        validation_hand_video_path=validation_hand_video,
+                        validation_static_video_path=validation_static_video,
+                        validation_human_motions_path=None,
+                        validation_hand_video_left_path=validation_hand_video_left,
+                        validation_hand_video_right_path=validation_hand_video_right,
+                        step=step,
+                        pipeline_type=config["pipeline"]["type"],
+                        apply_blur_to_static=True,
+                        blur_strength=condition_blur_strength,
+                    )
 
     accelerator.print("===== Memory after validation =====")
     print_memory(accelerator.device)
@@ -2727,6 +2913,47 @@ def _blur_condition_latent(latent: torch.Tensor, strength: float = 0.2) -> torch
     return blurred.reshape(b, f, c, h, w)
 
 
+def _apply_gaussian_blur_to_video(video: torch.Tensor, strength: float = 0.2) -> torch.Tensor:
+    """Apply Gaussian blur to raw video in spatial dimensions.
+    
+    This is used for validation to test model robustness with blurred condition videos.
+    
+    Args:
+        video: Video tensor [B, C, F, H, W] (raw video format, values in [0, 1])
+        strength: Blur strength (0.1 = subtle, 0.2 = moderate, 0.5 = strong, 1.0 = very strong)
+    
+    Returns:
+        Blurred video tensor with same shape
+    """
+    import torch.nn.functional as F
+    
+    # Determine kernel size based on strength (more aggressive scaling for visibility)
+    kernel_size = int(5 + strength * 20)  # Increased from 3 + strength*10
+    if kernel_size % 2 == 0:
+        kernel_size += 1  # Make sure it's odd
+    
+    # Create Gaussian kernel with more aggressive sigma for stronger blur
+    sigma = strength * 5  # Increased from strength * 3
+    kernel_1d = torch.exp(-torch.arange(-(kernel_size//2), kernel_size//2 + 1, dtype=video.dtype, device=video.device)**2 / (2 * sigma**2))
+    kernel_1d = kernel_1d / kernel_1d.sum()
+    
+    # Create 2D kernel
+    kernel_2d = kernel_1d[:, None] * kernel_1d[None, :]
+    kernel = kernel_2d[None, None, :, :].to(video.device, video.dtype)
+    
+    print(f"   🔧 Blur kernel: size={kernel_size}, sigma={sigma:.2f}")
+    
+    # Apply blur: [B, C, F, H, W] -> reshape to [B*C*F, 1, H, W]
+    b, c, f, h, w = video.shape
+    video_reshaped = video.reshape(b * c * f, 1, h, w)
+    blurred = F.conv2d(video_reshaped, kernel, padding=kernel_size//2)
+    
+    # Clamp to valid range
+    blurred = torch.clamp(blurred, 0.0, 1.0)
+    
+    return blurred.reshape(b, c, f, h, w)
+
+
 # Copied from diffusers.pipelines.cogvideo.pipeline_cogvideox.CogVideoXPipeline._get_t5_prompt_embeds
 def get_t5_prompt_embeds(
     prompt = None,
@@ -3019,6 +3246,8 @@ def main():
         "load_image_goal": data_config.get("load_image_goal", False),
         "prompt_subdir": data_config.get("prompt_subdir", "prompts"),
         "prompt_embeds_subdir": data_config.get("prompt_embeds_subdir", "prompt_embeds"),
+        "hand_video_subdir": data_config.get("hand_video_subdir", "videos_hands"),
+        "hand_video_latents_subdir": data_config.get("hand_video_latents_subdir", "hand_video_latents"),
     }
     
     # Choose dataset class based on pipeline type

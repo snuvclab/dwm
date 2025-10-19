@@ -51,6 +51,8 @@ class VideoDataset(Dataset):
         use_gray_hand_videos: bool = False,
         prompt_subdir: str = "prompts",
         prompt_embeds_subdir: str = "prompt_embeds",
+        hand_video_subdir: str = "videos_hands",
+        hand_video_latents_subdir: str = "hand_video_latents",
     ) -> None:
         super().__init__()
 
@@ -68,6 +70,8 @@ class VideoDataset(Dataset):
         self.image_to_video = image_to_video
         self.prompt_subdir = prompt_subdir
         self.prompt_embeds_subdir = prompt_embeds_subdir
+        # Note: hand_video_subdir and hand_video_latents_subdir are only used in subclasses
+        # but we need to accept them here for compatibility
         
         # Ensure buckets are lists
         if not isinstance(self.height_buckets, list):
@@ -381,6 +385,8 @@ class VideoDatasetWithConditions(VideoDataset):
         load_image_goal: bool = False,
         prompt_subdir: str = "prompts",
         prompt_embeds_subdir: str = "prompt_embeds",
+        hand_video_subdir: str = "videos_hands",
+        hand_video_latents_subdir: str = "hand_video_latents",
     ) -> None:
         # Initialize parent class with main video column
         super().__init__(
@@ -398,6 +404,8 @@ class VideoDatasetWithConditions(VideoDataset):
             image_to_video=image_to_video,
             prompt_subdir=prompt_subdir,
             prompt_embeds_subdir=prompt_embeds_subdir,
+            hand_video_subdir=hand_video_subdir,
+            hand_video_latents_subdir=hand_video_latents_subdir,
         )
         
         # Store the flags
@@ -409,6 +417,8 @@ class VideoDatasetWithConditions(VideoDataset):
         self.vae_scale_factor_spatial = vae_scale_factor_spatial
         self.load_raymaps = load_raymaps
         self.load_image_goal = load_image_goal
+        self.hand_video_subdir = hand_video_subdir
+        self.hand_video_latents_subdir = hand_video_latents_subdir
         
         # Automatically derive hand video and static video paths from main video paths
         if self.split_hands:
@@ -422,7 +432,8 @@ class VideoDatasetWithConditions(VideoDataset):
             if self.use_gray_hand_videos:
                 self.hand_video_paths = self._derive_condition_video_paths("videos_hands_gray")
             else:
-                self.hand_video_paths = self._derive_condition_video_paths("videos_hands")
+                # Use configurable hand_video_subdir for default mode
+                self.hand_video_paths = self._derive_condition_video_paths(self.hand_video_subdir)
             self.hand_video_left_paths = None
             self.hand_video_right_paths = None
         
@@ -520,7 +531,8 @@ class VideoDatasetWithConditions(VideoDataset):
                     if self.use_gray_hand_videos:
                         hand_video_latents = self._load_condition_video_latents_or_encode(self.hand_video_paths[index], "hand_video_gray_latents")
                     else:
-                        hand_video_latents = self._load_condition_video_latents_or_encode(self.hand_video_paths[index], "hand_video_latents")
+                        # Use configurable hand_video_latents_subdir for default mode
+                        hand_video_latents = self._load_condition_video_latents_or_encode(self.hand_video_paths[index], self.hand_video_latents_subdir)
                     main_data["hand_videos"] = hand_video_latents
             except Exception as e:
                 logger.warning(f"Failed to load hand video latents for index {index}: {e}")
@@ -1058,6 +1070,8 @@ class VideoDatasetWithHumanMotions(VideoDatasetWithConditions):
         load_image_goal: bool = False,
         prompt_subdir: str = "prompts",
         prompt_embeds_subdir: str = "prompt_embeds",
+        hand_video_subdir: str = "videos_hands",
+        hand_video_latents_subdir: str = "hand_video_latents",
     ) -> None:
         # Initialize parent class with main video column
         super().__init__(
@@ -1083,6 +1097,8 @@ class VideoDatasetWithHumanMotions(VideoDatasetWithConditions):
             load_image_goal=load_image_goal,
             prompt_subdir=prompt_subdir,
             prompt_embeds_subdir=prompt_embeds_subdir,
+            hand_video_subdir=hand_video_subdir,
+            hand_video_latents_subdir=hand_video_latents_subdir,
         )
         
         # Automatically derive human_motions paths from main video paths
