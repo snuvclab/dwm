@@ -207,6 +207,11 @@ def get_args() -> argparse.Namespace:
         help="Skip processing if output files already exist.",
     )
     parser.add_argument(
+        "--check_only",
+        action="store_true",
+        help="Only check which files are missing, do not process anything. Useful for seeing what needs to be generated.",
+    )
+    parser.add_argument(
         "--model_type",
         type=str,
         choices=["aether", "cogvideox_pose", "custom"],
@@ -218,7 +223,7 @@ def get_args() -> argparse.Namespace:
         nargs="+",
         type=str,
         default=None,
-        help="Only check these specific file types when using --skip_existing. If --model_type is not 'custom', this argument is ignored. Options: videos, images, images_goal, image_latents, image_goal_latents, video_latents, disparity, disparity_latents, raymaps, raymaps_abs, prompts, prompt_embeds, human_motions, hand_videos, hand_video_latents, hand_mask_videos, static_videos, static_video_latents",
+        help="Only check these specific file types when using --skip_existing. If --model_type is not 'custom', this argument is ignored. Options: videos, images, images_goal, image_latents, image_goal_latents, video_latents, disparity, disparity_latents, raymaps, raymaps_abs, prompts, prompt_embeds, human_motions, videos_hands, hand_video_latents, videos_hands_gray, hand_video_gray_latents, videos_hands_gray_left, hand_video_gray_left_latents, videos_hands_gray_right, hand_video_gray_right_latents, videos_hands_mask, videos_static, static_video_latents",
     )
     parser.add_argument(
         "--scene_filter",
@@ -228,11 +233,61 @@ def get_args() -> argparse.Namespace:
         help="Only process scenes that match these filter patterns. If not specified, all scenes are processed.",
     )
     parser.add_argument(
+        "--scene_filter_file",
+        type=str,
+        default=None,
+        help="Path to a text file containing scene names (one per line) to filter. Will be combined with --scene_filter if both are provided.",
+    )
+    parser.add_argument(
         "--save_prompt_embeds",
         action="store_true",
         help="Whether to save prompt embeddings. This is automatically enabled for cogvideox_pose model type.",
     )
+    parser.add_argument(
+        "--use_gray_hand_videos",
+        action="store_true",
+        help="Use gray hand videos instead of colored hand videos for CogVideoX pose model type.",
+    )
+    parser.add_argument(
+        "--split_hands",
+        action="store_true",
+        help="Split hands into left and right hand videos for CogVideoX pose model type.",
+    )
+    parser.add_argument(
+        "--hand_video_subdir",
+        type=str,
+        default="videos_hands",
+        help="Subdirectory name for hand videos in default mode (not gray, not split). Default: 'videos_hands'",
+    )
+    parser.add_argument(
+        "--hand_video_latents_subdir",
+        type=str,
+        default="hand_video_latents",
+        help="Subdirectory name for hand video latents in default mode (not gray, not split). Default: 'hand_video_latents'",
+    )
     return parser.parse_args()
+
+
+def map_file_type_to_subdir(file_type: str, args: argparse.Namespace) -> str:
+    """Map logical file_type to actual subdirectory name based on args.
+    
+    This handles configurable subdirectories like hand_video_subdir and hand_video_latents_subdir.
+    
+    Args:
+        file_type: Logical file type (e.g., "videos_hands", "hand_video_latents")
+        args: Command-line arguments containing subdirectory configurations
+    
+    Returns:
+        Actual subdirectory name to use
+    """
+    # Handle configurable subdirectories for default mode (not gray, not split)
+    if file_type == "videos_hands" and not args.use_gray_hand_videos and not args.split_hands:
+        return args.hand_video_subdir
+    elif file_type == "hand_video_latents" and not args.use_gray_hand_videos and not args.split_hands:
+        return args.hand_video_latents_subdir
+    else:
+        # Use file_type as-is for other cases (gray, split, static, etc.)
+        return file_type
 
 
 def get_model_file_types(model_type: str) -> List[str]:
@@ -246,7 +301,9 @@ def get_model_file_types(model_type: str) -> List[str]:
     elif model_type == "cogvideox_pose":
         return [
             "videos", "video_latents", "prompts", "prompt_embeds",
-            "hand_videos", "hand_video_latents", "hand_mask_videos", "static_videos", "static_video_latents"
+            "videos_hands", "hand_video_latents", "videos_hands_gray", "hand_video_gray_latents", 
+            "videos_hands_gray_left", "hand_video_gray_left_latents", "videos_hands_gray_right", "hand_video_gray_right_latents",
+            "videos_hands_mask", "videos_static", "static_video_latents"
         ]
     else:  # custom
         return []
@@ -270,6 +327,12 @@ def find_scene_action_pairs(data_root: pathlib.Path, sequences_dir: str, scene_f
             continue
             
         scene_name = scene_dir.name
+        
+        # Skip fancy scene
+        if scene_name == "fancy":
+            if rank == 0:
+                print(f"Skipping scene {scene_name} (excluded)")
+            continue
         
         # Apply scene filter if specified
         if scene_filter is not None:
@@ -378,50 +441,75 @@ def process_single_scene_action(
     if hasattr(args, 'skip_existing') and args.skip_existing:
         cmd_parts.append("--skip_existing")
     
-            # Add selective processing flags based on missing file types
-        if missing_file_types:
-            # Map file types to their corresponding flags
-            file_type_to_flag = {
-                "images": "--save_image_latents",
-                "image_latents": "--save_image_latents",
-                "images_goal": "--save_image_latents", 
-                "image_goal_latents": "--save_image_latents",
-                "video_latents": "--save_latents_and_embeddings",
-                "disparity_latents": "--save_latents_and_embeddings",
-                "prompt_embeds": "--save_latents_and_embeddings",
-                            "hand_videos": "--save_latents_and_embeddings",
+    # Add use_gray_hand_videos flag if provided
+    if hasattr(args, 'use_gray_hand_videos') and args.use_gray_hand_videos:
+        cmd_parts.append("--use_gray_hand_videos")
+    
+    # Add split_hands flag if provided
+    if hasattr(args, 'split_hands') and args.split_hands:
+        cmd_parts.append("--split_hands")
+    
+    # Add hand_video_subdir if provided
+    if hasattr(args, 'hand_video_subdir') and args.hand_video_subdir != "videos_hands":
+        cmd_parts.extend(["--hand_video_subdir", args.hand_video_subdir])
+    
+    # Add hand_video_latents_subdir if provided
+    if hasattr(args, 'hand_video_latents_subdir') and args.hand_video_latents_subdir != "hand_video_latents":
+        cmd_parts.extend(["--hand_video_latents_subdir", args.hand_video_latents_subdir])
+    
+    # Add selective processing flags based on missing file types
+    if missing_file_types:
+        # Map file types to their corresponding flags
+        file_type_to_flag = {
+            "images": "--save_image_latents",
+            "image_latents": "--save_image_latents",
+            "images_goal": "--save_image_latents", 
+            "image_goal_latents": "--save_image_latents",
+            "video_latents": "--save_latents_and_embeddings",
+            "disparity_latents": "--save_latents_and_embeddings",
+            "prompt_embeds": "--save_latents_and_embeddings",
+            "videos_hands": "--save_latents_and_embeddings",
             "hand_video_latents": "--save_latents_and_embeddings",
-            "hand_mask_videos": "--save_latents_and_embeddings",
-            "static_videos": "--save_latents_and_embeddings",
+            "videos_hands_gray": "--save_latents_and_embeddings",
+            "hand_video_gray_latents": "--save_latents_and_embeddings",
+            "videos_hands_gray_left": "--save_latents_and_embeddings",
+            "hand_video_gray_left_latents": "--save_latents_and_embeddings",
+            "videos_hands_gray_right": "--save_latents_and_embeddings",
+            "hand_video_gray_right_latents": "--save_latents_and_embeddings",
+            "videos_hands_mask": "--save_latents_and_embeddings",
+            "videos_static": "--save_latents_and_embeddings",
             "static_video_latents": "--save_latents_and_embeddings",
-            }
-            
-            # Add flags for missing file types
-            for file_type in missing_file_types:
-                if file_type in file_type_to_flag:
-                    flag = file_type_to_flag[file_type]
-                    if flag not in cmd_parts:
-                        cmd_parts.append(flag)
-            
-            # Always include basic processing flags for required file types
-            # (videos, disparity, raymaps, prompts are always processed)
-            if "images" in missing_file_types or "image_latents" in missing_file_types:
-                if "--save_image_latents" not in cmd_parts:
-                    cmd_parts.append("--save_image_latents")
-            if ("video_latents" in missing_file_types or "disparity_latents" in missing_file_types or 
-                "prompt_embeds" in missing_file_types or "hand_videos" in missing_file_types or
-                "hand_video_latents" in missing_file_types or "hand_mask_videos" in missing_file_types or
-                "static_videos" in missing_file_types or "static_video_latents" in missing_file_types):
-                if "--save_latents_and_embeddings" not in cmd_parts:
-                    cmd_parts.append("--save_latents_and_embeddings")
-            
-            # Add prompt embeddings flag for aether and cogvideox_pose model types or if explicitly requested
-            if (args.model_type in ["aether", "cogvideox_pose"] or args.save_prompt_embeds) and "prompt_embeds" in missing_file_types:
-                if "--save_prompt_embeds" not in cmd_parts:
-                    cmd_parts.append("--save_prompt_embeds")
-            
-            # Add selective processing argument to only process missing file types
-            cmd_parts.extend(["--selective_processing"] + missing_file_types)
+        }
+        
+        # Add flags for missing file types
+        for file_type in missing_file_types:
+            if file_type in file_type_to_flag:
+                flag = file_type_to_flag[file_type]
+                if flag not in cmd_parts:
+                    cmd_parts.append(flag)
+        
+        # Always include basic processing flags for required file types
+        # (videos, disparity, raymaps, prompts are always processed)
+        if "images" in missing_file_types or "image_latents" in missing_file_types:
+            if "--save_image_latents" not in cmd_parts:
+                cmd_parts.append("--save_image_latents")
+        if ("video_latents" in missing_file_types or "disparity_latents" in missing_file_types or 
+            "prompt_embeds" in missing_file_types or "videos_hands" in missing_file_types or
+            "hand_video_latents" in missing_file_types or "videos_hands_gray" in missing_file_types or
+            "hand_video_gray_latents" in missing_file_types or "videos_hands_gray_left" in missing_file_types or
+            "hand_video_gray_left_latents" in missing_file_types or "videos_hands_gray_right" in missing_file_types or
+            "hand_video_gray_right_latents" in missing_file_types or "videos_hands_mask" in missing_file_types or
+            "videos_static" in missing_file_types or "static_video_latents" in missing_file_types):
+            if "--save_latents_and_embeddings" not in cmd_parts:
+                cmd_parts.append("--save_latents_and_embeddings")
+        
+        # Add prompt embeddings flag for aether and cogvideox_pose model types or if explicitly requested
+        if (args.model_type in ["aether", "cogvideox_pose"] or args.save_prompt_embeds) and "prompt_embeds" in missing_file_types:
+            if "--save_prompt_embeds" not in cmd_parts:
+                cmd_parts.append("--save_prompt_embeds")
+        
+        # Add selective processing argument to only process missing file types
+        cmd_parts.extend(["--selective_processing"] + missing_file_types)
     
     if args.id_token:
         cmd_parts.extend(["--id_token", args.id_token])
@@ -475,19 +563,40 @@ def process_single_scene_action(
                 print(f"Warning: Rank {rank} >= num_gpus {num_gpus}, using rank {rank % num_gpus}")
                 rank = rank % num_gpus
             
-            # Set the environment variables to force this subprocess to use the current GPU
-            env["CUDA_VISIBLE_DEVICES"] = str(rank)
-            print(f"Setting CUDA_VISIBLE_DEVICES={rank} for subprocess")
+            # Get the actual physical GPU IDs from CUDA_VISIBLE_DEVICES
+            visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+            if visible_devices:
+                # Parse the visible devices (e.g., "2,3,4,5,6,7")
+                physical_gpu_ids = [int(x.strip()) for x in visible_devices.split(",")]
+                if rank < len(physical_gpu_ids):
+                    # Map rank to actual physical GPU ID
+                    physical_gpu_id = physical_gpu_ids[rank]
+                    env["CUDA_VISIBLE_DEVICES"] = str(physical_gpu_id)
+                    print(f"Rank {rank} -> Physical GPU {physical_gpu_id} (CUDA_VISIBLE_DEVICES={physical_gpu_id})")
+                else:
+                    print(f"Warning: Rank {rank} >= len(physical_gpu_ids) {len(physical_gpu_ids)}")
+                    env["CUDA_VISIBLE_DEVICES"] = str(physical_gpu_ids[0])  # Fallback to first GPU
+            else:
+                # No CUDA_VISIBLE_DEVICES set, use rank directly
+                env["CUDA_VISIBLE_DEVICES"] = str(rank)
+                print(f"Setting CUDA_VISIBLE_DEVICES={rank} for subprocess (no parent restriction)")
         else:
             print("Warning: CUDA not available, using CPU")
             env["CUDA_VISIBLE_DEVICES"] = ""
         
-        # Don't set LOCAL_RANK to prevent distributed initialization in subprocess
-        # This forces the subprocess to use single-GPU mode
-        # env["LOCAL_RANK"] = "0"  # Force single-GPU mode within the subprocess
-        env["RANK"] = "0"
-        env["WORLD_SIZE"] = "1"
-        
+        # Remove all distributed environment variables to force single-GPU mode in subprocess
+        # The subprocess should run independently without distributed initialization
+        if "LOCAL_RANK" in env:
+            del env["LOCAL_RANK"]
+        if "RANK" in env:
+            del env["RANK"]
+        if "WORLD_SIZE" in env:
+            del env["WORLD_SIZE"]
+        if "MASTER_ADDR" in env:
+            del env["MASTER_ADDR"]
+        if "MASTER_PORT" in env:
+            del env["MASTER_PORT"]
+
         result = subprocess.run(cmd_parts, check=True, text=True, env=env)
         print(f"Successfully processed {scene_name}/{action_name}")
         
@@ -516,6 +625,29 @@ def process_single_scene_action(
 def main():
     args = get_args()
     set_seed(args.seed)
+    
+    # Load scene filter from file if provided
+    if args.scene_filter_file:
+        scene_filter_file = pathlib.Path(args.scene_filter_file)
+        if not scene_filter_file.exists():
+            raise FileNotFoundError(f"Scene filter file not found: {args.scene_filter_file}")
+        
+        with open(scene_filter_file, 'r') as f:
+            # Read lines, strip whitespace, and filter out empty lines and comments
+            scenes_from_file = [
+                line.strip() 
+                for line in f.readlines() 
+                if line.strip() and not line.strip().startswith('#')
+            ]
+        
+        # Combine with existing scene_filter if provided
+        if args.scene_filter is None:
+            args.scene_filter = scenes_from_file
+        else:
+            args.scene_filter.extend(scenes_from_file)
+        
+        print(f"Loaded {len(scenes_from_file)} scene names from {args.scene_filter_file}")
+        print(f"Total scene filters: {len(args.scene_filter)}")
     
     # Dynamically import dataset classes based on model_type
     if args.model_type == "aether":
@@ -546,6 +678,7 @@ def main():
         torch.cuda.set_device(local_rank)
         dist.init_process_group(backend="nccl")
         world_size = dist.get_world_size()
+        print(f"World size: {world_size}")
         rank = dist.get_rank()
     else:
         # Single GPU
@@ -562,28 +695,45 @@ def main():
     scene_action_pairs = find_scene_action_pairs(data_root, args.sequences_dir, args.scene_filter, rank)
     
     # Filter out already processed scene-action pairs if skip_existing is enabled
+    completed_pairs = []  # Track completed pairs
+    
+    # Convert scene_action_pairs to format with missing_file_types
+    # Format: (scene_name, action_name, sequences_path, missing_file_types)
+    # where missing_file_types=None means "process all file types"
+    pairs_with_status = []
+    
     if args.skip_existing:
-        unprocessed_pairs = []
+        if rank == 0:
+            print(f"\n🔍 Skip existing mode enabled")
+            print(f"   Model type: {args.model_type}")
+            print(f"   Check file types argument: {args.check_file_types}")
+        
+        # Determine which file types to check (same for all pairs)
+        # Priority: explicit check_file_types > model_type presets > all file types
+        if args.check_file_types:
+            # Use only the specified file types (highest priority)
+            file_types_to_check = args.check_file_types
+            if rank == 0:
+                print(f"   Will check only: {file_types_to_check}")
+        elif args.model_type != "custom":
+            # Use predefined file types based on model type
+            file_types_to_check = get_model_file_types(args.model_type)
+            if rank == 0:
+                print(f"   Will check types for {args.model_type}: {file_types_to_check}")
+        else:
+            # Check all file types that the script generates
+            file_types_to_check = [
+                "videos", "images", "images_goal", "image_latents", "image_goal_latents",
+                "video_latents", "disparity", "disparity_latents", "raymaps", "raymaps_abs",
+                "prompts", "prompt_embeds", "human_motions", "videos_hands", "hand_video_latents",
+                "videos_hands_gray", "hand_video_gray_latents", "videos_hands_gray_left", 
+                "hand_video_gray_left_latents", "videos_hands_gray_right", "hand_video_gray_right_latents",
+                "videos_hands_mask", "videos_static", "static_video_latents"
+            ]
+            if rank == 0:
+                print(f"   Will check all file types")
+        
         for scene_name, action_name, sequences_path in scene_action_pairs:
-            # Check if files have been processed in the sequences directory
-            
-            # Determine which file types to check
-            if args.model_type != "custom":
-                # Use predefined file types based on model type
-                file_types_to_check = get_model_file_types(args.model_type)
-                print(f"Using predefined file types for {args.model_type}: {file_types_to_check}")
-            elif args.check_file_types:
-                # Use only the specified file types
-                file_types_to_check = args.check_file_types
-                print(f"Checking only specified file types: {file_types_to_check}")
-            else:
-                # Check all file types that the script generates
-                file_types_to_check = [
-                    "videos", "images", "images_goal", "image_latents", "image_goal_latents",
-                    "video_latents", "disparity", "disparity_latents", "raymaps", "raymaps_abs",
-                    "prompts", "prompt_embeds", "human_motions"
-                ]
-            
             missing_file_types = []
             has_all_files = True
             
@@ -591,21 +741,53 @@ def main():
             expected_file_count = get_expected_file_count(sequences_path)
             
             for file_type in file_types_to_check:
+                # Map file_type to actual subdirectory name (handles configurable subdirs)
+                actual_subdir = map_file_type_to_subdir(file_type, args)
+                
                 # Check in the appropriate processed directory based on model_type
                 if args.model_type == "aether":
-                    processed_dir = sequences_path.parent / "processed" / file_type
+                    processed_dir = sequences_path.parent / "processed" / actual_subdir
                 else:
-                    processed_dir = sequences_path.parent / "processed2" / file_type
+                    processed_dir = sequences_path.parent / "processed2" / actual_subdir
                 
                 if not processed_dir.exists():
                     missing_file_types.append(file_type)
                     has_all_files = False
                     continue
                 
-                # Look for files in the processed directory
+                # Look for files in the processed directory with appropriate extensions
                 found_files = []
+                # Define expected extensions for each file type
+                file_type_extensions = {
+                    "videos": ".mp4",
+                    "video_latents": ".pt",
+                    "images": ".png",
+                    "image_latents": ".pt",
+                    "images_goal": ".png",
+                    "image_goal_latents": ".pt",
+                    "disparity": ".mp4",
+                    "disparity_latents": ".pt",
+                    "raymaps": ".pt",
+                    "raymaps_abs": ".pt",
+                    "prompts": ".txt",
+                    "prompt_embeds": ".pt",
+                    "human_motions": ".pt",
+                    "videos_hands": ".mp4",
+                    "hand_video_latents": ".pt",
+                    "videos_hands_gray": ".mp4",
+                    "hand_video_gray_latents": ".pt",
+                    "videos_hands_gray_left": ".mp4",
+                    "hand_video_gray_left_latents": ".pt",
+                    "videos_hands_gray_right": ".mp4",
+                    "hand_video_gray_right_latents": ".pt",
+                    "videos_hands_mask": ".mp4",
+                    "videos_static": ".mp4",
+                    "static_video_latents": ".pt",
+                }
+                
+                expected_extension = file_type_extensions.get(file_type, "")
                 for file_item in processed_dir.iterdir():
-                    if file_item.is_file():
+                    if file_item.is_file() and file_item.suffix == expected_extension:
                         found_files.append(file_item.name)
                 
                 # Check if we have the expected number of files
@@ -620,25 +802,51 @@ def main():
             
             if has_all_files:
                 print(f"Skipping {scene_name}/{action_name}: Already processed (all checked file types found with expected counts)")
+                completed_pairs.append((scene_name, action_name, sequences_path))
             else:
                 if len(missing_file_types) <= 3:  # Show missing types if not too many
                     print(f"Processing {scene_name}/{action_name}: Missing {missing_file_types}")
                 else:
                     print(f"Processing {scene_name}/{action_name}: Missing {len(missing_file_types)} file types")
-                # Store missing file types with the pair for selective processing
-                unprocessed_pairs.append((scene_name, action_name, sequences_path, missing_file_types))
+                # Store as 4-tuple with missing_file_types for selective processing
+                pairs_with_status.append((scene_name, action_name, sequences_path, missing_file_types))
+    else:
+        # No skip_existing: reprocess specified file types (or all if not specified)
+        if rank == 0:
+            print(f"\n🔄 Reprocessing mode (no skip_existing)")
+            print(f"   Model type: {args.model_type}")
+            print(f"   Check file types argument: {args.check_file_types}")
         
-        scene_action_pairs = unprocessed_pairs
+        # Determine what to reprocess (same for all pairs in this mode)
+        if args.check_file_types:
+            # User wants to reprocess only specific file types
+            reprocess_types = args.check_file_types
+            if rank == 0:
+                print(f"   Will reprocess only: {reprocess_types}")
+        elif args.model_type != "custom":
+            # Use model type presets
+            reprocess_types = get_model_file_types(args.model_type)
+            if rank == 0:
+                print(f"   Will reprocess all types for {args.model_type}: {reprocess_types}")
+        else:
+            # Reprocess everything
+            reprocess_types = None
+            if rank == 0:
+                print(f"   Will reprocess all file types")
+        
+        for scene_name, action_name, sequences_path in scene_action_pairs:
+            pairs_with_status.append((scene_name, action_name, sequences_path, reprocess_types))
+    
+    # Now all pairs are in consistent 4-tuple format
+    scene_action_pairs = pairs_with_status
     
     if rank == 0:
         print(f"Found {len(scene_action_pairs)} scene-action pairs to process")
-        for pair_data in scene_action_pairs:
-            # Handle both 3-tuple and 4-tuple formats
-            if len(pair_data) == 3:
-                scene_name, action_name, _ = pair_data
+        for scene_name, action_name, _, missing_file_types in scene_action_pairs:
+            if missing_file_types:
+                print(f"  - {scene_name}/{action_name} (selective: {len(missing_file_types)} types)")
             else:
-                scene_name, action_name, _, missing_file_types = pair_data
-            print(f"  - {scene_name}/{action_name}")
+                print(f"  - {scene_name}/{action_name} (full processing)")
 
     # Split scene-action pairs among GPUs
     if world_size > 1:
@@ -655,19 +863,153 @@ def main():
         gpu_pairs = scene_action_pairs
         print(f"Single GPU: Processing {len(gpu_pairs)} scene-action pairs")
 
+    # Check if we're only doing a check (not processing)
+    if args.check_only:
+        # Collect check results from all GPUs
+        if world_size > 1:
+            # Gather all pairs from all GPUs
+            all_gpu_pairs = [None] * world_size
+            all_completed_pairs = [None] * world_size
+            dist.gather_object(gpu_pairs, all_gpu_pairs if rank == 0 else None, dst=0)
+            dist.gather_object(completed_pairs, all_completed_pairs if rank == 0 else None, dst=0)
+            
+            # Complete distributed processing
+            try:
+                dist.destroy_process_group()
+            except Exception as e:
+                print(f"Warning: Failed to destroy process group: {e}")
+                pass
+            
+            # Print comprehensive summary on rank 0
+            if rank == 0:
+                # Combine all results
+                total_pairs = []
+                total_completed_pairs = []
+                for gpu_rank in range(world_size):
+                    if all_gpu_pairs[gpu_rank] is not None:
+                        total_pairs.extend(all_gpu_pairs[gpu_rank])
+                    if all_completed_pairs[gpu_rank] is not None:
+                        total_completed_pairs.extend(all_completed_pairs[gpu_rank])
+                
+                print(f"\n{'='*80}")
+                print(f"COMPREHENSIVE CHECK SUMMARY")
+                print(f"{'='*80}")
+                
+                if total_completed_pairs:
+                    print(f"✅ ALREADY COMPLETED ({len(total_completed_pairs)} pairs):")
+                    for i, (scene_name, action_name, sequences_path) in enumerate(total_completed_pairs, 1):
+                        print(f"  {i:3d}. {scene_name}/{action_name}")
+                    print()
+                
+                print(f"🔧 NEEDS PROCESSING ({len(total_pairs)} pairs):")
+                print()
+                
+                total_missing_files = 0
+                for i, (scene_name, action_name, sequences_path, missing_file_types) in enumerate(total_pairs):
+                    print(f"{i+1:3d}. {scene_name}/{action_name}")
+                    if missing_file_types:
+                        if len(missing_file_types) <= 5:
+                            print(f"     Missing: {', '.join(missing_file_types)}")
+                        else:
+                            print(f"     Missing: {len(missing_file_types)} file types")
+                        total_missing_files += len(missing_file_types)
+                    else:
+                        print(f"     Missing: All file types")
+                        # Count total expected file types
+                        # Priority: explicit check_file_types > model_type presets > all file types
+                        if args.check_file_types:
+                            file_types_to_check = args.check_file_types
+                        elif args.model_type != "custom":
+                            file_types_to_check = get_model_file_types(args.model_type)
+                        else:
+                            file_types_to_check = [
+                                "videos", "images", "images_goal", "image_latents", "image_goal_latents",
+                                "video_latents", "disparity", "disparity_latents", "raymaps", "raymaps_abs",
+                                "prompts", "prompt_embeds", "human_motions", "videos_hands", "hand_video_latents",
+                                "videos_hands_gray", "hand_video_gray_latents", "videos_hands_gray_left", 
+                                "hand_video_gray_left_latents", "videos_hands_gray_right", "hand_video_gray_right_latents",
+                                "videos_hands_mask", "videos_static", "static_video_latents"
+                            ]
+                        total_missing_files += len(file_types_to_check)
+                    print()
+                
+                print(f"{'='*80}")
+                print(f"SUMMARY:")
+                print(f"  - Already completed pairs: {len(total_completed_pairs)}")
+                print(f"  - Pairs needing processing: {len(total_pairs)}")
+                print(f"  - Total scene-action pairs: {len(total_completed_pairs) + len(total_pairs)}")
+                print(f"  - Total missing file types: {total_missing_files}")
+                print(f"  - Model type: {args.model_type}")
+                if args.model_type == "custom" and args.check_file_types:
+                    print(f"  - Checking file types: {', '.join(args.check_file_types)}")
+                print(f"{'='*80}")
+                print(f"To process these files, run without --check_only flag")
+        else:
+            # Single GPU mode
+            print(f"\n{'='*60}")
+            print(f"CHECK ONLY MODE - No processing will be performed")
+            print(f"{'='*60}")
+            
+            if completed_pairs:
+                print(f"✅ ALREADY COMPLETED ({len(completed_pairs)} pairs):")
+                for i, (scene_name, action_name, sequences_path) in enumerate(completed_pairs, 1):
+                    print(f"  {i:3d}. {scene_name}/{action_name}")
+                print()
+            
+            print(f"🔧 NEEDS PROCESSING ({len(gpu_pairs)} pairs):")
+            print()
+            
+            total_missing_files = 0
+            for i, (scene_name, action_name, sequences_path, missing_file_types) in enumerate(gpu_pairs):
+                print(f"{i+1:3d}. {scene_name}/{action_name}")
+                if missing_file_types:
+                    if len(missing_file_types) <= 5:
+                        print(f"     Missing: {', '.join(missing_file_types)}")
+                    else:
+                        print(f"     Missing: {len(missing_file_types)} file types")
+                    total_missing_files += len(missing_file_types)
+                else:
+                    print(f"     Missing: All file types")
+                    # Count total expected file types
+                    # Priority: explicit check_file_types > model_type presets > all file types
+                    if args.check_file_types:
+                        file_types_to_check = args.check_file_types
+                    elif args.model_type != "custom":
+                        file_types_to_check = get_model_file_types(args.model_type)
+                    else:
+                        file_types_to_check = [
+                            "videos", "images", "images_goal", "image_latents", "image_goal_latents",
+                            "video_latents", "disparity", "disparity_latents", "raymaps", "raymaps_abs",
+                            "prompts", "prompt_embeds", "human_motions", "videos_hands", "hand_video_latents",
+                            "videos_hands_gray", "hand_video_gray_latents", "videos_hands_gray_left", 
+                            "hand_video_gray_left_latents", "videos_hands_gray_right", "hand_video_gray_right_latents",
+                            "videos_hands_mask", "videos_static", "static_video_latents"
+                        ]
+                    total_missing_files += len(file_types_to_check)
+                print()
+            
+            print(f"{'='*60}")
+            print(f"SUMMARY:")
+            print(f"  - Already completed pairs: {len(completed_pairs)}")
+            print(f"  - Pairs needing processing: {len(gpu_pairs)}")
+            print(f"  - Total scene-action pairs: {len(completed_pairs) + len(gpu_pairs)}")
+            print(f"  - Total missing file types: {total_missing_files}")
+            print(f"  - Model type: {args.model_type}")
+            if args.model_type == "custom" and args.check_file_types:
+                print(f"  - Checking file types: {', '.join(args.check_file_types)}")
+            print(f"{'='*60}")
+            print(f"To process these files, run without --check_only flag")
+        return
+    
     # Process scene-action pairs assigned to this GPU
     print(f"\nStarting batch processing of {len(gpu_pairs)} scene-action pairs on GPU {rank}...")
     
     successful_pairs = []
     failed_pairs = []
     
-    for i, pair_data in enumerate(gpu_pairs):
-        # Handle both old format (3-tuple) and new format (4-tuple with missing file types)
-        if len(pair_data) == 3:
-            scene_name, action_name, sequences_path = pair_data
-            missing_file_types = None  # Process everything
-        else:
-            scene_name, action_name, sequences_path, missing_file_types = pair_data
+    for i, (scene_name, action_name, sequences_path, missing_file_types) in enumerate(gpu_pairs):
+        # missing_file_types=None means "process all file types"
+        # missing_file_types=[...] means "process only these file types"
         
         # Create processed directory within this action's sequences directory based on model_type
         if args.model_type == "aether":
@@ -690,22 +1032,86 @@ def main():
             print(f"  - Failed to process {scene_name}/{action_name}")
             continue
 
-    # Complete distributed processing
+    # Collect results from all GPUs
     if world_size > 1:
+        # Gather successful pairs from all GPUs
+        all_successful_pairs = [None] * world_size
+        all_failed_pairs = [None] * world_size
+        
+        # Gather successful pairs
+        dist.gather_object(successful_pairs, all_successful_pairs if rank == 0 else None, dst=0)
+        # Gather failed pairs
+        dist.gather_object(failed_pairs, all_failed_pairs if rank == 0 else None, dst=0)
+        
+        # Complete distributed processing
         try:
             dist.destroy_process_group()
         except Exception as e:
             print(f"Warning: Failed to destroy process group: {e}")
             pass
-
-    if rank == 0:
-        print(f"\nCompleted batch processing.")
-        print(f"Successful pairs: {len(successful_pairs)}")
-        print(f"Failed pairs: {len(failed_pairs)}")
-        print(f"All processed files have been saved to 'processed' directories within each action's sequences folder.")
-        print(f"Each action now has a structure like: sequences/processed/[file_types]/")
+        
+        # Print comprehensive summary on rank 0
+        if rank == 0:
+            # Combine all results
+            total_successful = []
+            total_failed = []
+            
+            for gpu_rank in range(world_size):
+                if all_successful_pairs[gpu_rank] is not None:
+                    total_successful.extend(all_successful_pairs[gpu_rank])
+                if all_failed_pairs[gpu_rank] is not None:
+                    total_failed.extend(all_failed_pairs[gpu_rank])
+            
+            print(f"\n{'='*80}")
+            print(f"COMPREHENSIVE PROCESSING SUMMARY")
+            print(f"{'='*80}")
+            print(f"Total successful pairs: {len(total_successful)}")
+            print(f"Total failed pairs: {len(total_failed)}")
+            print(f"Total processed pairs: {len(total_successful) + len(total_failed)}")
+            print()
+            
+            if total_successful:
+                print(f"✅ SUCCESSFULLY PROCESSED ({len(total_successful)} pairs):")
+                for i, (scene_name, action_name, processed_dir) in enumerate(total_successful, 1):
+                    print(f"  {i:3d}. {scene_name}/{action_name}")
+                print()
+            
+            if total_failed:
+                print(f"❌ FAILED TO PROCESS ({len(total_failed)} pairs):")
+                for i, (scene_name, action_name, processed_dir) in enumerate(total_failed, 1):
+                    print(f"  {i:3d}. {scene_name}/{action_name}")
+                print()
+            
+            print(f"📁 All processed files have been saved to 'processed' directories within each action's sequences folder.")
+            print(f"📁 Each action now has a structure like: sequences/processed/[file_types]/")
+            print(f"{'='*80}")
+        else:
+            print(f"\nGPU {rank} completed processing.")
     else:
-        print(f"\nGPU {rank} completed processing.")
+        # Single GPU mode
+        print(f"\n{'='*80}")
+        print(f"PROCESSING SUMMARY")
+        print(f"{'='*80}")
+        print(f"Total successful pairs: {len(successful_pairs)}")
+        print(f"Total failed pairs: {len(failed_pairs)}")
+        print(f"Total processed pairs: {len(successful_pairs) + len(failed_pairs)}")
+        print()
+        
+        if successful_pairs:
+            print(f"✅ SUCCESSFULLY PROCESSED ({len(successful_pairs)} pairs):")
+            for i, (scene_name, action_name, processed_dir) in enumerate(successful_pairs, 1):
+                print(f"  {i:3d}. {scene_name}/{action_name}")
+            print()
+        
+        if failed_pairs:
+            print(f"❌ FAILED TO PROCESS ({len(failed_pairs)} pairs):")
+            for i, (scene_name, action_name, processed_dir) in enumerate(failed_pairs, 1):
+                print(f"  {i:3d}. {scene_name}/{action_name}")
+            print()
+        
+        print(f"📁 All processed files have been saved to 'processed' directories within each action's sequences folder.")
+        print(f"📁 Each action now has a structure like: sequences/processed/[file_types]/")
+        print(f"{'='*80}")
 
 
 if __name__ == "__main__":
