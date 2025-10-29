@@ -73,55 +73,55 @@ if ! conda activate nerfstudio >/dev/null 2>&1; then
   fi
 fi
 
-# # --- 1) Data processing ---
-# echo "Running ns-process-data..."
-# ns-process-data aria \
-#   --vrs-file "$VRS_PATH" \
-#   --mps-data-dir "$MPS_DATA_DIR" \
-#   --output-dir "$DATA_DIR" \
-#   --max-frames 10000
+# --- 1) Data processing ---
+echo "Running ns-process-data..."
+ns-process-data aria \
+  --vrs-file "$VRS_PATH" \
+  --mps-data-dir "$MPS_DATA_DIR" \
+  --output-dir "$DATA_DIR" \
+  --max-frames 10000
 
-# # --- 2) Edit transforms.json to keep only the first NUM_FRAMES ---
-# TRANSFORMS_SRC="$DATA_DIR/transforms.json"
-# TRANSFORMS_SRC_="$DATA_DIR/transforms_full.json"
-# TRANSFORMS_DST="$DATA_DIR/transforms_.json"
+# --- 2) Edit transforms.json to keep only the first NUM_FRAMES ---
+TRANSFORMS_SRC="$DATA_DIR/transforms.json"
+TRANSFORMS_SRC_="$DATA_DIR/transforms_full.json"
+TRANSFORMS_DST="$DATA_DIR/transforms_.json"
 
-# cp "$TRANSFORMS_SRC" "$TRANSFORMS_SRC_"
+cp "$TRANSFORMS_SRC" "$TRANSFORMS_SRC_"
 
-# if [[ ! -f "$TRANSFORMS_SRC" ]]; then
-#   echo "ERROR: transforms.json not found at $TRANSFORMS_SRC" >&2
-#   exit 1
-# fi
+if [[ ! -f "$TRANSFORMS_SRC" ]]; then
+  echo "ERROR: transforms.json not found at $TRANSFORMS_SRC" >&2
+  exit 1
+fi
 
-# echo "Trimming frames to first $NUM_FRAMES entries..."
-# jq --argjson n "$NUM_FRAMES" '.frames = (.frames[:$n])' "$TRANSFORMS_SRC" > "$TRANSFORMS_DST"
-# rm "$TRANSFORMS_SRC"
-# mv "$TRANSFORMS_DST" "$TRANSFORMS_SRC"
+echo "Trimming frames to first $NUM_FRAMES entries..."
+jq --argjson n "$NUM_FRAMES" '.frames = (.frames[:$n])' "$TRANSFORMS_SRC" > "$TRANSFORMS_DST"
+rm "$TRANSFORMS_SRC"
+mv "$TRANSFORMS_DST" "$TRANSFORMS_SRC"
 
-# # --- 3) Train gsplat ---
-# echo "Starting training with ns-train splatfacto..."
-# ns-train splatfacto \
-#   --data "$DATA_DIR" \
-#   --output-dir "$OUTPUT_DIR" \
-#   --max-num-iterations 30000 \
-#   --viewer.quit-on-train-completion True \
-#   nerfstudio-data --train-split-fraction 1 --orientation-method none --center-method none --auto-scale-poses False 
-# echo "Done."
+# --- 3) Train gsplat ---
+echo "Starting training with ns-train splatfacto..."
+ns-train splatfacto \
+  --data "$DATA_DIR" \
+  --output-dir "$OUTPUT_DIR" \
+  --max-num-iterations 30000 \
+  --viewer.quit-on-train-completion True \
+  nerfstudio-data --train-split-fraction 1 --orientation-method none --center-method none --auto-scale-poses False 
+echo "Done."
 
-# # --- 4) Rendering ---
-# rm "$TRANSFORMS_SRC"
-# mv "$TRANSFORMS_SRC_" "$TRANSFORMS_SRC"
-# echo "Starting rendering with ns-render gsplat..."
-# LATEST_CONFIG=$(ls -dt "$OUTPUT_DIR"/data/splatfacto/*/ | head -n 1)config.yml
-# echo "$LATEST_CONFIG"
+# --- 4) Rendering ---
+rm "$TRANSFORMS_SRC"
+mv "$TRANSFORMS_SRC_" "$TRANSFORMS_SRC"
+echo "Starting rendering with ns-render gsplat..."
+LATEST_CONFIG=$(ls -dt "$OUTPUT_DIR"/data/splatfacto/*/ | head -n 1)config.yml
+echo "$LATEST_CONFIG"
 
-# # modify camera parameters of transforms.json
-# python tests/gsplat/modify_transforms.py "$TRANSFORMS_SRC"
+# modify camera parameters of transforms.json
+python tests/gsplat/modify_transforms.py "$TRANSFORMS_SRC"
 
-# ns-render dataset \
-#   --load-config "$LATEST_CONFIG" \
-#   --output-path "$OUTPUT_DIR/static" \
-#   --split=train --rendered-output-names=rgb
+ns-render dataset \
+  --load-config "$LATEST_CONFIG" \
+  --output-path "$OUTPUT_DIR/static" \
+  --split=train --rendered-output-names=rgb
 
 # crop to 720x480
 echo "Cropping renderings to 720x480..."
