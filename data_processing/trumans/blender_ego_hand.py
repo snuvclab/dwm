@@ -509,8 +509,8 @@ def get_hand_mesh_data(hand_obj):
 @torch.no_grad()
 def render_hands_pytorch3d(camera_obj, hand_objects, render_shape=None, grayscale=False):
     """
-    Render both CC_Hand_L and CC_Hand_R together (occlusion-correct),
-    using depth-normal based pseudo shading with hue-separated tinting.
+    Render CC_Hand_L/CC_Hand_R with simplified lighting for stable conditioning.
+    Uses backup version's approach with improved color stability.
     """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -522,19 +522,23 @@ def render_hands_pytorch3d(camera_obj, hand_objects, render_shape=None, grayscal
     fov_rad = camera_obj.data.angle
     fx = fy = (W / 2.0) / math.tan(fov_rad / 2.0)
     cx, cy = W / 2.0, H / 2.0
-    focal = torch.tensor([[fx, fy]], device=device)
-    princpt = torch.tensor([[cx, cy]], device=device)
-    image_size = torch.tensor([[H, W]], device=device)
+    focal = torch.tensor([[fx, fy]], device=device, dtype=torch.float32)
+    princpt = torch.tensor([[cx, cy]], device=device, dtype=torch.float32)
+    image_size = torch.tensor([[H, W]], device=device, dtype=torch.int64)
 
-    # --- Extrinsics (Blender → PyTorch3D coords) ---
-    M_wc = np.array(camera_obj.matrix_world.inverted(), dtype=np.float32)
-    R_wc, t_wc = M_wc[:3, :3], M_wc[:3, 3]
+    # --- World->Camera from Blender, then to PyTorch3D coords (+Z forward) ---
+    M_wc = np.array(camera_obj.matrix_world.inverted(), dtype=np.float32)  # world->blenderCam
+    R_wc = M_wc[:3, :3]
+    t_wc = M_wc[:3, 3]
+    # Convert Blender -> PyTorch3D
     C = np.diag([-1.0, 1.0, -1.0]).astype(np.float32)
     R_p3d = C @ R_wc
     t_p3d = C @ t_wc
-    R_p3d_t, t_p3d_t = torch.from_numpy(R_p3d).to(device), torch.from_numpy(t_p3d).to(device)
+    R_p3d_t = torch.from_numpy(R_p3d).to(device)           # (3,3)
+    t_p3d_t = torch.from_numpy(t_p3d).to(device)           # (3,)
 
-    # Camera setup
+    # Camera setup complete
+    # Identity extrinsics for the camera; we already moved vertices into camera space
     cameras = PerspectiveCameras(
         R=torch.eye(3, device=device).unsqueeze(0),
         T=torch.zeros(1, 3, device=device),
@@ -544,100 +548,72 @@ def render_hands_pytorch3d(camera_obj, hand_objects, render_shape=None, grayscal
         image_size=image_size,
         device=device,
     )
+
     raster_settings = RasterizationSettings(
-        image_size=(H, W), blur_radius=0.0, faces_per_pixel=8, perspective_correct=True
+        image_size=(H, W),
+        blur_radius=0.0,
+        faces_per_pixel=1,  # Use backup version's simpler setting
+        perspective_correct=True,
     )
     rasterizer = MeshRasterizer(cameras=cameras, raster_settings=raster_settings).to(device)
-    lights = DirectionalLights(device=device, direction=[[0.0, 0.0, -1.0]])
+
+    # Simplified lighting (backup version approach)
+    lights = PointLights(
+        device=device,
+        location=[[0.0, 0.0, 0.0]],           # camera center
+        ambient_color=((0.7, 0.7, 0.7),),
+        diffuse_color=((0.6, 0.6, 0.6),),
+        specular_color=((0.0, 0.0, 0.0),),
+    )
     shader = SoftPhongShader(device=device, cameras=cameras, lights=lights)
     renderer = MeshRendererWithFragments(rasterizer=rasterizer, shader=shader)
 
-    # --- Render each hand separately for perfect occlusion ---
     final_rgb = torch.zeros((H, W, 3), device=device, dtype=torch.float32)
-    final_z = torch.full((H, W), float('inf'), device=device, dtype=torch.float32)
-    final_normals = torch.zeros((H, W, 3), device=device, dtype=torch.float32)
-    
-    left_col, right_col = torch.tensor([0.6, 0.8, 1.0], device=device), torch.tensor([1.0, 0.7, 0.8], device=device)
+    final_z   = torch.full((H, W), float('inf'), device=device, dtype=torch.float32)
 
     for obj in hand_objects:
         if not obj.visible_get():
             continue
 
-        V_np, F_np = get_hand_mesh_data(obj)
+        V_np, F_np = get_hand_mesh_data(obj)  # world space (after modifiers)
         if V_np.size == 0 or F_np.size == 0:
             continue
 
-        Vw = torch.from_numpy(V_np).to(device)
-        Vc = (Vw @ R_p3d_t.t()) + t_p3d_t
-        V = Vc.unsqueeze(0)  # (1, V, 3)
-        F = torch.from_numpy(F_np).to(device).long().unsqueeze(0)  # (1, F, 3)
+        # --- Explicit world->camera transform ---
+        # V_cam = R_p3d @ V_world + t_p3d
+        Vw = torch.from_numpy(V_np).to(device)                     # (V,3)
+        Vc = (Vw @ R_p3d_t.t()) + t_p3d_t                          # (V,3)  z should be > 0 if in front
+        V = Vc.unsqueeze(0)                                        # (1,V,3)
+        F = torch.from_numpy(F_np).to(device).unsqueeze(0).long()  # (1,F,3)
 
-        # Determine hand color
-        base_color = left_col if "CC_Hand_L" in obj.name else right_col
-        Cverts = base_color.view(1, 3).expand(V.shape[1], 3).unsqueeze(0)  # (1, V, 3)
-        
-        # Create mesh for this hand
+        # Improved color scheme (3-channel balanced, diffusion-friendly)
+        if "CC_Hand_L" in obj.name:
+            col = (0.65, 0.80, 0.75)  # soft turquoise green - balanced channels
+        else:
+            col = (0.82, 0.68, 0.70)  # light rose - balanced channels
+        Cverts = torch.tensor(col, device=device).view(1, 1, 3).expand(1, V.shape[1], 3)
         mesh = Meshes(verts=V, faces=F, textures=TexturesVertex(Cverts))
-        
-        # Render this hand
-        img, frags = renderer(mesh)
-        rgb = img[0, :, :, :3]  # (H, W, 3)
-        zbuf = frags.zbuf[0, :, :, 0].float()  # (H, W)
+
+        with torch.no_grad():
+            images, frags = renderer(mesh)     # images: (1,H,W,4)
+
+        rgb  = images[0, :, :, :3]             # (H,W,3)
+        zbuf = frags.zbuf[0, :, :, 0].float()  # (H,W)
         valid = frags.pix_to_face[0, :, :, 0] >= 0
-        
-        # Get normals for this hand
-        mesh_tmp = Meshes(verts=V, faces=F, textures=TexturesVertex(torch.ones_like(Cverts)))
-        n = mesh_tmp.verts_normals_packed()
-        mesh_norm = Meshes(verts=V, faces=F, textures=TexturesVertex(n.unsqueeze(0)))
-        n_img, _ = renderer(mesh_norm)
-        normals = n_img[0, :, :, :3]
-        alpha = n_img[0, :, :, 3:4]
-        normals = normals * alpha
-        normals = torch.nn.functional.normalize(normals, dim=-1, eps=1e-6)
-        
-        # Perfect occlusion: only update pixels where this hand is closer
+
         closer = valid & (zbuf < final_z)
         closer3 = closer.unsqueeze(-1)
-        
-        # Update final buffers only where this hand is closer
         final_rgb = torch.where(closer3, rgb, final_rgb)
-        final_z = torch.where(closer, zbuf, final_z)
-        final_normals = torch.where(closer3, normals, final_normals)
-    
-    # Use the composited result
-    rgb = final_rgb
-    zbuf = final_z
-    valid = final_z < float('inf')
-
-    # --- Depth-normal shading (using composited normals) ---
-    # normals are already computed and composited above
-
-    # Depth normalization
-    zbuf[~valid] = float('inf')
-    z_clamped = torch.clamp(zbuf, 0.2, 1.2)
-    depth_inv = 1 - (z_clamped - 0.2)
-
-    # Shading
-    view = torch.tensor([0, 0, -1.0], device=device)
-    shade = (final_normals * view).sum(-1, keepdim=True).clamp(0, 1)
-    
-    # Stronger depth influence for better 3D perception
-    shaded = 0.5 * depth_inv.unsqueeze(-1) + 0.5 * shade  # 70% depth, 30% normal
-    shaded = torch.pow(shaded, 0.7)  # More contrast
-    shaded = torch.clamp(shaded * 1.3 + 0.1, 0, 1)  # Stronger brightening
-
-    valid_mask = valid.unsqueeze(-1).float()
-    shaded = shaded * valid_mask
-    rgb_out = rgb * shaded
+        final_z   = torch.where(closer,  zbuf, final_z)
 
     # --- Grayscale option ---
     if grayscale:
-        gray = (0.299*rgb_out[...,0] + 0.587*rgb_out[...,1] + 0.114*rgb_out[...,2]).unsqueeze(-1)
+        gray = (0.299*final_rgb[...,0] + 0.587*final_rgb[...,1] + 0.114*final_rgb[...,2]).unsqueeze(-1)
         gray = torch.clamp((gray - 0.3)*1.5 + 0.3, 0, 1)
-        rgb_out = gray.expand_as(rgb_out)
+        final_rgb = gray.expand_as(final_rgb)
 
-    out = (rgb_out.clamp(0,1)*255).byte().cpu().numpy()
-    depth = zbuf.cpu().numpy()
+    out = (final_rgb.clamp(0,1)*255.0).byte().cpu().numpy()
+    depth = final_z.cpu().numpy()
     return out, depth
 
 
@@ -872,7 +848,7 @@ def render_animation_sequence(animation_index, animation_name):
             print(f"  Temp images: {temp_dir}")
         else:
             # Use different path for grayscale vs color videos
-            video_folder_suffix = "hands_gray" if args.grayscale else "hands_new"
+            video_folder_suffix = "hands_gray" if args.grayscale else "hands_new2"
             videos_output_path = os.path.join(sequences_folder, f"videos_{video_folder_suffix}")
             os.makedirs(videos_output_path, exist_ok=True)
             print(f"Rendering animation {animation_index}: {animation_name}")
@@ -1404,33 +1380,51 @@ def render_animation_sequence(animation_index, animation_name):
                 
                 # Collect frame files for this video
                 video_frame_files = []
+                missing_frames = []
                 for frame_num in frames_for_video:
                     frame_path = frames_temp_dir / f"frame_{frame_num:06d}.png"
                     if frame_path.exists():
                         video_frame_files.append(frame_path)
                     else:
+                        missing_frames.append(frame_num)
                         print(f"    ⚠️  Missing frame: {frame_path}")
                 
                 if not video_frame_files:
                     print(f"    ❌ No frame files found for video {video_idx}")
                     continue
                 
+                # Check if we have the expected number of frames
+                expected_frames = len(frames_for_video)
+                actual_frames = len(video_frame_files)
+                if actual_frames != expected_frames:
+                    print(f"    ⚠️  WARNING: Expected {expected_frames} frames but got {actual_frames}")
+                    print(f"    Missing frames: {missing_frames}")
+                    if actual_frames < 40:  # Too few frames, skip this video
+                        print(f"    ❌ Too few frames ({actual_frames}), skipping video {video_idx}")
+                        continue
+                
                 # Create video from frame files
                 try:
                     import subprocess
                     
-                    # Create sequence file for ffmpeg
-                    sequence_file = frames_temp_dir / f"video_{video_idx}_sequence.txt"
-                    with open(sequence_file, 'w') as f:
-                        for frame_file in video_frame_files:
-                            f.write(f"file '{frame_file.absolute()}'\n")
-                            f.write("duration 0.125\n")  # 1/8 fps = 0.125 seconds per frame
+                    # Create video using direct frame input (more reliable than concat)
+                    # Copy frames to sequential naming for ffmpeg
+                    video_temp_dir = frames_temp_dir / f"video_{video_idx}_temp"
+                    video_temp_dir.mkdir(exist_ok=True)
+                    
+                    # Copy frames with sequential naming
+                    for seq_idx, frame_file in enumerate(video_frame_files):
+                        if frame_file.exists():
+                            import shutil
+                            target_file = video_temp_dir / f"frame_{seq_idx + 1:04d}.png"
+                            shutil.copy2(frame_file, target_file)
                     
                     rgb_cmd = [
                         'ffmpeg', '-y',
-                        '-f', 'concat',
-                        '-safe', '0',
-                        '-i', str(sequence_file),
+                        '-start_number', '1',
+                        '-framerate', str(fps),
+                        '-i', str(video_temp_dir / 'frame_%04d.png'),
+                        '-frames:v', str(len(video_frame_files)),  # Exact frame count
                         '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
                         '-crf', '18', '-preset', 'medium',
                         video_output_path
@@ -1449,8 +1443,9 @@ def render_animation_sequence(animation_index, animation_name):
                     else:
                         print(f"    ❌ Video file not created: {video_output_path}")
                     
-                    # Clean up sequence file
-                    sequence_file.unlink()
+                    # Clean up temp directory
+                    import shutil
+                    shutil.rmtree(video_temp_dir, ignore_errors=True)
                     
                 except subprocess.TimeoutExpired:
                     print(f"    ❌ FFmpeg timed out after 5 minutes")
