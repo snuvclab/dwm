@@ -943,7 +943,7 @@ def main():
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=True,
+        shuffle=False,
         collate_fn=collate_fn,
         num_workers=args.dataloader_num_workers,
         pin_memory=args.pin_memory,
@@ -1207,67 +1207,65 @@ def main():
                 
                 # Process hand_videos if needed
                 if need_hand_videos and hand_videos is not None:
-                    # Already in [-1, 1]; only permute to [B, C, F, H, W]
-                    hand_videos_processed = hand_videos.permute(0, 2, 1, 3, 4)
-                    
-                    # Create hand mask from hand videos
+                    hand_videos_save = (hand_videos.permute(0, 2, 1, 3, 4) + 1) / 2  # 저장용
+                    hand_videos_encode = hand_videos.permute(0, 2, 1, 3, 4)           # [-1,1] encode용
                     if should_process_hand_masks:
-                        hand_mask_videos = create_hand_mask(hand_videos_processed)
+                        hand_mask_videos = create_hand_mask(hand_videos_save)
                         print(f"Created hand mask videos with shape: {hand_mask_videos.shape}")
                     else:
                         hand_mask_videos = None
-                    
-                    # Keep hand_videos_processed for later use (left/right splitting)
                     if should_process_hand_videos:
-                        hand_videos = hand_videos_processed
+                        hand_videos = hand_videos_encode
+                        hand_videos_save_final = hand_videos_save
                     else:
-                        # Don't save hand_videos, but keep it for left/right splitting
-                        hand_videos_for_splitting = hand_videos
+                        hand_videos_for_splitting = hand_videos_encode
                         hand_videos = None
+                        hand_videos_save_final = None
                 else:
                     hand_videos = None
                     hand_videos_for_splitting = None
+                    hand_videos_save_final = None
                     hand_mask_videos = None
                 
                 # Process left/right gray hand videos if requested (additional to regular gray videos)
                 # Use hand_videos if it's available, otherwise use hand_videos_for_splitting
                 source_hand_videos = hand_videos if hand_videos is not None else hand_videos_for_splitting
                 if should_process_hand_gray_left and source_hand_videos is not None:
-                    # Split the concatenated hand videos back into left and right
                     batch_size, frames, total_channels, height, width = source_hand_videos.shape
                     channels_per_hand = total_channels // 2
-                    
-                    # Left hand videos (first half of channels)
-                    hand_videos_gray_left = source_hand_videos[:, :, :channels_per_hand, :, :]
-                    # Already in [-1, 1]; only permute to [B, C, F, H, W]
-                    hand_videos_gray_left = hand_videos_gray_left.permute(0, 2, 1, 3, 4)
+                    hand_videos_gray_left = source_hand_videos[:, :, :channels_per_hand, :, :].permute(0, 2, 1, 3, 4)  # encode용
+                    hand_videos_gray_left_save = (hand_videos_gray_left + 1) / 2                                      # 저장용
                     print(f"Created left hand videos with shape: {hand_videos_gray_left.shape}")
                 else:
                     hand_videos_gray_left = None
+                    hand_videos_gray_left_save = None
                 
                 if should_process_hand_gray_right and source_hand_videos is not None:
-                    # Right hand videos (second half of channels)
-                    hand_videos_gray_right = source_hand_videos[:, :, channels_per_hand:, :, :]
-                    # Already in [-1, 1]; only permute to [B, C, F, H, W]
-                    hand_videos_gray_right = hand_videos_gray_right.permute(0, 2, 1, 3, 4)
+                    batch_size, frames, total_channels, height, width = source_hand_videos.shape
+                    channels_per_hand = total_channels // 2
+                    hand_videos_gray_right = source_hand_videos[:, :, channels_per_hand:, :, :].permute(0, 2, 1, 3, 4)
+                    hand_videos_gray_right_save = (hand_videos_gray_right + 1) / 2
                     print(f"Created right hand videos with shape: {hand_videos_gray_right.shape}")
                 else:
                     hand_videos_gray_right = None
+                    hand_videos_gray_right_save = None
                     
                 # Process static_videos if requested
                 if should_process_static_videos and static_videos is not None:
-                    # Already in [-1, 1]; only permute to [B, C, F, H, W]
-                    static_videos = static_videos.permute(0, 2, 1, 3, 4)
+                    static_videos_encode = static_videos.permute(0, 2, 1, 3, 4)
+                    static_videos_save = (static_videos_encode + 1) / 2
                 else:
-                    static_videos = None
+                    static_videos_encode = None
+                    static_videos_save = None
                 
                 # Process smpl_pos_map if requested
                 if should_process_smpl_pos_map and smpl_pos_map is not None:
-                    # Already in [-1, 1]; only permute to [B, C, F, H, W]
-                    smpl_pos_map = smpl_pos_map.permute(0, 2, 1, 3, 4)
-                    print(f"Processed SMPL pos map with shape: {smpl_pos_map.shape}")
+                    smpl_pos_map_encode = smpl_pos_map.permute(0, 2, 1, 3, 4)
+                    smpl_pos_map_save = (smpl_pos_map_encode + 1) / 2
+                    print(f"Processed SMPL pos map with shape: {smpl_pos_map_encode.shape}")
                 else:
-                    smpl_pos_map = None
+                    smpl_pos_map_encode = None
+                    smpl_pos_map_save = None
 
             # Encode videos for CogVideoX pose (after data processing so hand_videos_gray_left/right are available)
             if args.model_type == "cogvideox_pose" and args.save_latents_and_embeddings:
@@ -1488,7 +1486,7 @@ def main():
                         output_data.update({
                             "hand_videos_dir": hand_videos_dir,  # Uses args.hand_video_subdir
                             "hand_video_latents_dir": hand_video_latents_dir,  # Uses args.hand_video_latents_subdir
-                            "hand_videos": hand_videos.permute(0, 2, 1, 3, 4),
+                            "hand_videos": hand_videos_save_final.permute(0, 2, 1, 3, 4),
                             "hand_video_latents": hand_video_latents,
                         })
                 
