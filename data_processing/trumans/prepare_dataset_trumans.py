@@ -1207,7 +1207,8 @@ def main():
                 
                 # Process hand_videos if needed
                 if need_hand_videos and hand_videos is not None:
-                    hand_videos_processed = (hand_videos.permute(0, 2, 1, 3, 4) + 1) / 2
+                    # Already in [-1, 1]; only permute to [B, C, F, H, W]
+                    hand_videos_processed = hand_videos.permute(0, 2, 1, 3, 4)
                     
                     # Create hand mask from hand videos
                     if should_process_hand_masks:
@@ -1238,7 +1239,8 @@ def main():
                     
                     # Left hand videos (first half of channels)
                     hand_videos_gray_left = source_hand_videos[:, :, :channels_per_hand, :, :]
-                    hand_videos_gray_left = (hand_videos_gray_left.permute(0, 2, 1, 3, 4) + 1) / 2
+                    # Already in [-1, 1]; only permute to [B, C, F, H, W]
+                    hand_videos_gray_left = hand_videos_gray_left.permute(0, 2, 1, 3, 4)
                     print(f"Created left hand videos with shape: {hand_videos_gray_left.shape}")
                 else:
                     hand_videos_gray_left = None
@@ -1246,20 +1248,23 @@ def main():
                 if should_process_hand_gray_right and source_hand_videos is not None:
                     # Right hand videos (second half of channels)
                     hand_videos_gray_right = source_hand_videos[:, :, channels_per_hand:, :, :]
-                    hand_videos_gray_right = (hand_videos_gray_right.permute(0, 2, 1, 3, 4) + 1) / 2
+                    # Already in [-1, 1]; only permute to [B, C, F, H, W]
+                    hand_videos_gray_right = hand_videos_gray_right.permute(0, 2, 1, 3, 4)
                     print(f"Created right hand videos with shape: {hand_videos_gray_right.shape}")
                 else:
                     hand_videos_gray_right = None
                     
                 # Process static_videos if requested
                 if should_process_static_videos and static_videos is not None:
-                    static_videos = (static_videos.permute(0, 2, 1, 3, 4) + 1) / 2
+                    # Already in [-1, 1]; only permute to [B, C, F, H, W]
+                    static_videos = static_videos.permute(0, 2, 1, 3, 4)
                 else:
                     static_videos = None
                 
                 # Process smpl_pos_map if requested
                 if should_process_smpl_pos_map and smpl_pos_map is not None:
-                    smpl_pos_map = (smpl_pos_map.permute(0, 2, 1, 3, 4) + 1) / 2
+                    # Already in [-1, 1]; only permute to [B, C, F, H, W]
+                    smpl_pos_map = smpl_pos_map.permute(0, 2, 1, 3, 4)
                     print(f"Processed SMPL pos map with shape: {smpl_pos_map.shape}")
                 else:
                     smpl_pos_map = None
