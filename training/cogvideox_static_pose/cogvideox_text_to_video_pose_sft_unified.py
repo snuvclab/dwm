@@ -3340,6 +3340,7 @@ def main():
         train_dataset,
         batch_size=training_config["batch_size"],
         shuffle=True,
+        drop_last=True,  # Drop last incomplete batch to ensure consistent batch size
         collate_fn=lambda batch: {
             "videos": torch.stack([item["video"] for item in batch]),
             "prompts": (
@@ -3764,6 +3765,13 @@ def main():
     elif prompt_dropout_prob > 0 and load_tensors:
         logger.warning("⚠️  Prompt dropout is not supported in load_tensors mode (text_encoder not available)")
 
+    # Free up memory by deleting vae and text_encoder when using preprocessed tensors
+    if load_tensors:
+        del vae, text_encoder
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize(accelerator.device)
+
     # Training loop - epoch based (like original CogVideoX)
     transformer.train()
 
@@ -3787,12 +3795,73 @@ def main():
                 image_goal = batch.get("image_goal")  # For planning mode (future use)
                 
                 # Process condition videos once for all pipelines
-                
                 split_hands = data_config.get("split_hands", False)
-                hand_videos_latents, static_videos_latents, smpl_pos_map_latents = _process_condition_videos(
-                    hand_videos, static_videos, smpl_pos_map, vae, VAE_SCALING_FACTOR, 
-                    accelerator.device, weight_dtype, load_tensors, split_hands
-                )
+                
+                if load_tensors:
+                    # When load_tensors=True, VAE is already deleted and videos are already latents
+                    # Dataset returns latents in [C, F, H, W] format, collate_fn makes [B, C, F, H, W]
+                    # Stored latents are distribution parameters (mean and logvar), need to sample
+                    
+                    # Process hand videos (already latents)
+                    if hand_videos is not None:
+                        hand_videos = hand_videos.to(device=accelerator.device, dtype=weight_dtype)
+                        # Already latents: [B, C, F, H, W] format (distribution parameters)
+                        
+                        if split_hands:
+                            # Split hands mode: hand_videos has doubled channels (left + right)
+                            # Split into left and right hand latents
+                            batch_size, channels, frames, height, width = hand_videos.shape
+                            half_channels = channels // 2
+                            
+                            hand_left = hand_videos[:, :half_channels, :, :, :]  # [B, C/2, F, H, W]
+                            hand_right = hand_videos[:, half_channels:, :, :, :]  # [B, C/2, F, H, W]
+                            
+                            # Sample from distribution separately
+                            hand_left_latent_dist = DiagonalGaussianDistribution(hand_left)
+                            hand_left_latents = hand_left_latent_dist.sample() * VAE_SCALING_FACTOR
+                            
+                            hand_right_latent_dist = DiagonalGaussianDistribution(hand_right)
+                            hand_right_latents = hand_right_latent_dist.sample() * VAE_SCALING_FACTOR
+                            
+                            # Concatenate along channel dimension
+                            hand_videos_latents = torch.cat([hand_left_latents, hand_right_latents], dim=1)  # [B, C1+C2, F, H, W]
+                        else:
+                            # Regular mode: sample from distribution (same as _process_condition_videos)
+                            hand_latent_dist = DiagonalGaussianDistribution(hand_videos)
+                            hand_videos_latents = hand_latent_dist.sample() * VAE_SCALING_FACTOR
+                        
+                        # Convert to [B, F, C, H, W] format
+                        hand_videos_latents = hand_videos_latents.permute(0, 2, 1, 3, 4)  # [B, F, C, H, W]
+                        hand_videos_latents = hand_videos_latents.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
+                    else:
+                        hand_videos_latents = None
+                    
+                    # Process static videos (already latents)
+                    if static_videos is not None:
+                        static_videos = static_videos.to(device=accelerator.device, dtype=weight_dtype)
+                        # Already latents: [B, C, F, H, W] format (distribution parameters)
+                        # Sample from distribution (same as _process_condition_videos)
+                        static_latent_dist = DiagonalGaussianDistribution(static_videos)
+                        static_videos_latents = static_latent_dist.sample() * VAE_SCALING_FACTOR
+                        static_videos_latents = static_videos_latents.permute(0, 2, 1, 3, 4)  # [B, F, C, H, W]
+                        static_videos_latents = static_videos_latents.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
+                    else:
+                        static_videos_latents = None
+                    
+                    # Process SMPL pos map (already processed)
+                    if smpl_pos_map is not None:
+                        smpl_pos_map_latents = smpl_pos_map.to(device=accelerator.device, dtype=weight_dtype)
+                        if smpl_pos_map_latents.ndim == 4:  # [F, C, H, W] -> add batch dim
+                            smpl_pos_map_latents = smpl_pos_map_latents.unsqueeze(0)  # [1, F, C, H, W]
+                        smpl_pos_map_latents = smpl_pos_map_latents.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
+                    else:
+                        smpl_pos_map_latents = None
+                else:
+                    # When load_tensors=False, VAE is available for encoding
+                    hand_videos_latents, static_videos_latents, smpl_pos_map_latents = _process_condition_videos(
+                        hand_videos, static_videos, smpl_pos_map, vae, VAE_SCALING_FACTOR, 
+                        accelerator.device, weight_dtype, load_tensors, split_hands
+                    )
                 
                 # Apply condition blur augmentation for robustness to degraded Gaussian rendering
                 condition_blur_prob = training_config.get("condition_blur_prob", 0.0)
@@ -3808,7 +3877,7 @@ def main():
                         logs["condition_blur_applied"] = 1
 
                 # Encode videos
-                if not training_config.get("custom_settings", {}).get("load_tensors", False):
+                if not load_tensors:
                     videos = videos.permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
                     with torch.no_grad():
                         latent_dist = vae.encode(videos).latent_dist
