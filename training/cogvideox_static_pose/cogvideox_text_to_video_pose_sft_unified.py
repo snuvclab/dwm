@@ -1743,6 +1743,7 @@ def setup_pipeline_from_config(config: Dict[str, Any]):
         condition_channels = pipeline_config.get("condition_channels", 16)
         use_adapter = pipeline_config.get("use_adapter", True)
         adapter_version = pipeline_config.get("adapter_version", "v1")
+        use_zero_proj = pipeline_config.get("use_zero_proj", False)
         
         pipeline = CogVideoXFunStaticToVideoPipeline.from_pretrained(
             pretrained_model_name_or_path=None,  # Always start from base model
@@ -1753,6 +1754,7 @@ def setup_pipeline_from_config(config: Dict[str, Any]):
             condition_channels=condition_channels,
             use_adapter=use_adapter,
             adapter_version=adapter_version,
+            use_zero_proj=use_zero_proj,
             split_hands=data_config.get("split_hands", False),
         )
     elif pipeline_type == "cogvideox_fun_static_to_video_pose_cond_token":
@@ -2332,12 +2334,14 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
             condition_channels = config["pipeline"].get("condition_channels", 16)
             use_adapter = config["pipeline"].get("use_adapter", True)
             adapter_version = config["pipeline"].get("adapter_version", "v1")
+            use_zero_proj = config["pipeline"].get("use_zero_proj", False)
             transformer_ = CogVideoXFunTransformer3DModelWithAdapter.from_pretrained(
                 pretrained_model_name_or_path=None,  # Always start from base model
                 base_model_name_or_path=config["model"]["base_model_name_or_path"],
                 condition_channels=condition_channels,
                 use_adapter=use_adapter,
                 adapter_version=adapter_version,
+                use_zero_proj=use_zero_proj,
                 subfolder="transformer",
             )
         elif pipeline_type == "cogvideox_fun_static_to_video_pose_cond_token":
@@ -2681,12 +2685,14 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
                 condition_channels = config["pipeline"].get("condition_channels", 16)
                 use_adapter = config["pipeline"].get("use_adapter", True)
                 adapter_version = config["pipeline"].get("adapter_version", "v1")
+                use_zero_proj = config["pipeline"].get("use_zero_proj", False)
                 load_model = CogVideoXFunTransformer3DModelWithAdapter.from_pretrained(
                     pretrained_model_name_or_path=os.path.join(input_dir, "transformer"),
                     base_model_name_or_path=config["model"]["base_model_name_or_path"],
                     condition_channels=condition_channels,
                     use_adapter=use_adapter,
                     adapter_version=adapter_version,
+                    use_zero_proj=use_zero_proj,
                 )
             elif pipeline_type == "cogvideox_fun_static_to_video_pose_cond_token":
                 # For VideoX-Fun Pipeline with cond token, use cond token transformer
@@ -3572,11 +3578,14 @@ def main():
     prompt_dropout_prob = training_config.get("prompt_dropout_prob", 0.0)
     condition_blur_prob = training_config.get("condition_blur_prob", 0.0)
     condition_blur_strength = training_config.get("condition_blur_strength", 0.2)
+    hand_dropout_prob = training_config.get("hand_dropout_prob", 0.0)
     
     if prompt_dropout_prob > 0:
         accelerator.print(f"  🎲 Prompt dropout: {prompt_dropout_prob * 100:.1f}%")
     if condition_blur_prob > 0:
         accelerator.print(f"  🎨 Condition blur: {condition_blur_prob * 100:.1f}% (strength: {condition_blur_strength})")
+    if hand_dropout_prob > 0:
+        accelerator.print(f"  ✋ Hand dropout: {hand_dropout_prob * 100:.1f}%")
     
     # Print pixel loss settings
     use_pixel_loss = training_config.get("use_pixel_loss", False)
@@ -3863,6 +3872,24 @@ def main():
                         accelerator.device, weight_dtype, load_tensors, split_hands
                     )
                 
+                # Apply hand dropout for classifier-free guidance training (helps prevent color drift)
+                # This should be applied to hand_videos_latents directly since some pipelines use it directly
+                if hand_videos_latents is not None and hand_dropout_prob > 0:
+                    # Get batch size from hand_videos_latents shape
+                    hand_batch_size = hand_videos_latents.shape[0]
+                    # Sample dropout mask: each sample in batch has independent dropout probability
+                    dropout_mask = torch.rand(hand_batch_size, device=accelerator.device) < hand_dropout_prob
+                    
+                    if dropout_mask.any():
+                        # Zero out hand latents for dropped samples
+                        # hand_videos_latents shape: [B, F, C, H, W]
+                        hand_videos_latents[dropout_mask] = torch.zeros_like(hand_videos_latents[dropout_mask])
+                        
+                        # Log dropout statistics (only occasionally to avoid spam)
+                        if global_step % 100 == 0:
+                            num_dropped = dropout_mask.sum().item()
+                            logs["hand_dropout_count"] = num_dropped
+                
                 # Apply condition blur augmentation for robustness to degraded Gaussian rendering
                 condition_blur_prob = training_config.get("condition_blur_prob", 0.0)
                 condition_blur_strength = training_config.get("condition_blur_strength", 0.2)
@@ -3890,6 +3917,7 @@ def main():
                 model_input = videos
 
                 # Use already processed condition videos from _process_condition_videos
+                # Note: hand_dropout is already applied to hand_videos_latents above
                 if hand_videos_latents is not None:
                     hand_videos = hand_videos_latents.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
                 else:
