@@ -92,8 +92,11 @@ scheduler = CogVideoXDPMScheduler.from_pretrained(
     subfolder="scheduler"
 )
 
-proj_path = os.path.join(lora_path, "projection_layer_weights.pt")
-if os.path.exists(proj_path):
+# proj_path = os.path.join(lora_path, "projection_layer_weights.pt")
+non_lora_file = os.path.join(lora_path, "non_lora_weights.pt")
+proj_path = non_lora_file
+
+if os.path.exists(proj_path) or os.path.exists(non_lora_file):
     with torch.no_grad():
         new_conv_in = torch.nn.Conv2d( # 1 for object mask
             transformer.patch_embed.proj.in_channels + 16, transformer.patch_embed.proj.out_channels, \
@@ -101,8 +104,8 @@ if os.path.exists(proj_path):
         )
         transformer.patch_embed.proj = new_conv_in
     proj_dict = torch.load(proj_path, map_location="cpu")
-    proj_dict['weight'] = proj_dict['transformer.patch_embed.proj.weight']
-    proj_dict['bias'] = proj_dict['transformer.patch_embed.proj.bias']
+    proj_dict['weight'] = proj_dict['patch_embed.proj.weight']
+    proj_dict['bias'] = proj_dict['patch_embed.proj.bias']
     model_state_dict = transformer.patch_embed.proj.state_dict()
     loaded_keys = []
     for name, param_data in proj_dict.items():
@@ -130,7 +133,7 @@ if os.path.exists(safetensors_path):
 transformer_state_dict = convert_unet_state_dict_to_peft(lora_state_dict)
 set_peft_model_state_dict(transformer, transformer_state_dict, adapter_name="default")
 
-non_lora_file = os.path.join(lora_path, "non_lora_weights.pt")
+# non_lora_file = os.path.join(lora_path, "non_lora_weights.pt")
 if os.path.exists(non_lora_file):
     non_lora_state_dict = torch.load(non_lora_file, map_location="cpu")
     model_state_dict = transformer.state_dict()
