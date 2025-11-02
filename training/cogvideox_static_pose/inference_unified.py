@@ -91,7 +91,7 @@ def setup_lora_adapter(transformer, config: Dict[str, Any]):
     
     # Get LoRA parameters from config
     lora_rank = config.get("training", {}).get("lora_rank", 64)
-    lora_alpha = config.get("training", {}).get("lora_alpha", 32)
+    lora_alpha = config.get("training", {}).get("lora_alpha", 64)
     
     logger.info(f"   LoRA Rank: {lora_rank}")
     logger.info(f"   LoRA Alpha: {lora_alpha}")

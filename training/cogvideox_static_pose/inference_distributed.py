@@ -21,7 +21,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--pipeline_type",
         type=str,
-        required=True,
+        # required=True,
         choices=["cogvideox_pose_concat", "cogvideox_pose_adapter", "cogvideox_pose_adaln", "cogvideox_i2v"],
         help="Type of pipeline to use for inference"
     )
