@@ -1088,7 +1088,7 @@ def main():
         results = run_batch_inference(args, pipeline, video_paths, Path(args.output_dir), psnr, ssim, lpips, config)
         
         # Compute overall metrics
-        if args.compute_metrics:
+        if args.compute_metrics and METRICS_AVAILABLE:
             successful_results = [r for r in results if r["success"] and r.get("metrics", {}).get("psnr") is not None]
             if successful_results:
                 avg_psnr = np.mean([r["metrics"]["psnr"] for r in successful_results])

@@ -49,8 +49,8 @@ class VideoDataset(Dataset):
         random_flip: Optional[float] = None,
         image_to_video: bool = False,
         use_gray_hand_videos: bool = False,
-        prompt_subdir: str = "prompts",
-        prompt_embeds_subdir: str = "prompt_embeds",
+        prompt_subdir: str = "prompts_ego",
+        prompt_embeds_subdir: str = "prompt_embeds_ego",
         hand_video_subdir: str = "videos_hands",
         hand_video_latents_subdir: str = "hand_video_latents",
     ) -> None:
