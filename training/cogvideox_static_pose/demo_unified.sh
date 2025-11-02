@@ -33,6 +33,7 @@ USE_EMPTY_PROMPTS=false
 COMPUTE_METRICS=true
 SAVE_COMPARISON_VIDEOS=true
 VERBOSE=true
+SUFFIX=""
 
 # Function to print usage
 usage() {
@@ -42,9 +43,9 @@ usage() {
     echo "  --checkpoint_path PATH   Path to trained checkpoint directory"
     echo "  --dataset_file PATH      Path to dataset file containing video paths"
     echo ""
-    echo "Pipeline configuration (choose one):"
-    echo "  --experiment_config PATH Path to experiment YAML config file (auto-detected if not provided)"
-    echo "  --pipeline_type TYPE     Pipeline type (required if no experiment config provided)"
+    echo "Pipeline configuration (optional - auto-detected from checkpoint if not provided):"
+    echo "  --experiment_config PATH Path to experiment YAML config file"
+    echo "  --pipeline_type TYPE     Pipeline type (e.g., cogvideox_fun_static_to_video_raymap_pose_concat)"
     echo ""
     echo "Optional arguments:"
     echo "  --output_dir PATH        Path to save outputs (default: {checkpoint_path}/{eval_subfolder})"
@@ -64,6 +65,7 @@ usage() {
     echo "  --no_metrics             Disable video quality metrics computation"
     echo "  --no_comparison_videos   Disable comparison video saving"
     echo "  --verbose                Enable verbose logging"
+    echo "  --suffix SUFFIX          Suffix to append to output filenames (e.g., '_no_prompt', '_cfg7.5')"
     echo "  --help                   Show this help message"
     echo ""
     echo "Examples:"
@@ -71,7 +73,8 @@ usage() {
     echo "  $0 --experiment_config ./exps/250912/trumans_fun_static_hand_adapter_lora.yaml \\"
     echo "     --checkpoint_path ./outputs/250912/trumans_fun_static_hand_adapter_lora/checkpoint-1000/ \\"
     echo "     --dataset_file ./data/dataset_files/trumans_static_pose_0a7618/test.txt \\"
-    echo "     --output_dir ./outputs/inference/fun_static_hand_adapter_test"
+    echo "     --output_dir ./outputs/inference/fun_static_hand_adapter_test \\"
+    echo "     --suffix '_cfg7.5'"
     echo ""
     echo "  # Single GPU inference with explicit pipeline type"
     echo "  $0 --pipeline_type cogvideox_pose_concat \\"
@@ -174,6 +177,10 @@ while [[ $# -gt 0 ]]; do
             VERBOSE=true
             shift
             ;;
+        --suffix)
+            SUFFIX="$2"
+            shift 2
+            ;;
         --help)
             usage
             exit 0
@@ -199,17 +206,14 @@ if [[ -z "$DATASET_FILE" ]]; then
     exit 1
 fi
 
-# Validate pipeline configuration
-if [[ -z "$EXPERIMENT_CONFIG" && -z "$PIPELINE_TYPE" ]]; then
-    echo "Error: Either --experiment_config or --pipeline_type is required"
-    echo "Note: If --experiment_config is not provided, the script will try to auto-detect it from the checkpoint directory"
-    usage
-    exit 1
+# Validate pipeline configuration (both are optional - inference script will auto-detect)
+if [[ -n "$EXPERIMENT_CONFIG" && -n "$PIPELINE_TYPE" ]]; then
+    echo "⚠️  Warning: Both --experiment_config and --pipeline_type provided. Using --experiment_config and ignoring --pipeline_type"
+    PIPELINE_TYPE=""
 fi
 
-if [[ -n "$EXPERIMENT_CONFIG" && -n "$PIPELINE_TYPE" ]]; then
-    echo "Warning: Both --experiment_config and --pipeline_type provided. Using --experiment_config and ignoring --pipeline_type"
-    PIPELINE_TYPE=""
+if [[ -z "$EXPERIMENT_CONFIG" && -z "$PIPELINE_TYPE" ]]; then
+    echo "🔧 Note: No --experiment_config or --pipeline_type provided. The inference script will auto-detect the config from the checkpoint directory."
 fi
 
 # Check if experiment config file exists
@@ -288,6 +292,9 @@ echo "Use Empty Prompts: $USE_EMPTY_PROMPTS"
 echo "Compute Metrics: $COMPUTE_METRICS"
 echo "Save Comparison Videos: $SAVE_COMPARISON_VIDEOS"
 echo "Verbose: $VERBOSE"
+if [[ -n "$SUFFIX" ]]; then
+    echo "Filename Suffix: $SUFFIX"
+fi
 echo "=================================="
 
 # Build command
@@ -305,10 +312,10 @@ if [[ $NUM_GPUS -eq 1 ]]; then
         echo "🔧 Using GPU ID: $GPU_ID"
     fi
     
-    # Add pipeline configuration
+    # Add pipeline configuration (optional - will auto-detect if not provided)
     if [[ -n "$EXPERIMENT_CONFIG" ]]; then
         CMD="$CMD --experiment_config $EXPERIMENT_CONFIG"
-    else
+    elif [[ -n "$PIPELINE_TYPE" ]]; then
         CMD="$CMD --pipeline_type $PIPELINE_TYPE"
     fi
     
@@ -349,16 +356,20 @@ if [[ $NUM_GPUS -eq 1 ]]; then
         CMD="$CMD --max_batch_size $MAX_BATCH_SIZE"
     fi
     
+    if [[ -n "$SUFFIX" ]]; then
+        CMD="$CMD --suffix '$SUFFIX'"
+    fi
+    
 else
     # Multi-GPU inference
     echo "🚀 Starting multi-GPU inference on $NUM_GPUS GPUs..."
     
     CMD="python training/cogvideox_static_pose/inference_distributed.py"
     
-    # Add pipeline configuration
+    # Add pipeline configuration (optional - will auto-detect if not provided)
     if [[ -n "$EXPERIMENT_CONFIG" ]]; then
         CMD="$CMD --experiment_config $EXPERIMENT_CONFIG"
-    else
+    elif [[ -n "$PIPELINE_TYPE" ]]; then
         CMD="$CMD --pipeline_type $PIPELINE_TYPE"
     fi
     
@@ -401,6 +412,10 @@ else
     
     if [[ -n "$MAX_BATCH_SIZE" ]]; then
         CMD="$CMD --max_batch_size $MAX_BATCH_SIZE"
+    fi
+    
+    if [[ -n "$SUFFIX" ]]; then
+        CMD="$CMD --suffix '$SUFFIX'"
     fi
 fi
 

@@ -383,6 +383,7 @@ class VideoDatasetWithConditions(VideoDataset):
         vae_scale_factor_spatial: int = 8,
         load_raymaps: bool = False,
         load_image_goal: bool = False,
+        load_raw_videos_for_pixel_loss: bool = False,
         prompt_subdir: str = "prompts",
         prompt_embeds_subdir: str = "prompt_embeds",
         hand_video_subdir: str = "videos_hands",
@@ -417,6 +418,7 @@ class VideoDatasetWithConditions(VideoDataset):
         self.vae_scale_factor_spatial = vae_scale_factor_spatial
         self.load_raymaps = load_raymaps
         self.load_image_goal = load_image_goal
+        self.load_raw_videos_for_pixel_loss = load_raw_videos_for_pixel_loss
         self.hand_video_subdir = hand_video_subdir
         self.hand_video_latents_subdir = hand_video_latents_subdir
         
@@ -679,6 +681,30 @@ class VideoDatasetWithConditions(VideoDataset):
                     main_data["image_goal"] = None
             else:
                 main_data["image_goal"] = None
+        
+        # Load raw video for pixel loss (when load_tensors=True and pixel loss enabled)
+        if self.load_tensors and self.load_raw_videos_for_pixel_loss:
+            try:
+                video_reader = decord.VideoReader(uri=self.video_paths[index].as_posix())
+                video_num_frames = len(video_reader)
+                
+                # Sample frames to match max_num_frames
+                step = max(1, video_num_frames // self.max_num_frames)
+                indices = list(range(0, video_num_frames, step))
+                frames = video_reader.get_batch(indices)
+                frames = frames[: self.max_num_frames].float()
+                frames = frames.permute(0, 3, 1, 2).contiguous()  # [F, H, W, C] -> [F, C, H, W]
+                
+                # Normalize to [0, 1] range (do NOT apply [-1, 1] normalization for pixel loss target)
+                frames = frames / 255.0
+                
+                main_data["raw_video"] = frames
+                logger.debug(f"Loaded raw video for pixel loss: shape={frames.shape}, range=[{frames.min():.3f}, {frames.max():.3f}]")
+            except Exception as e:
+                logger.warning(f"Failed to load raw video for pixel loss at index {index}: {e}")
+                main_data["raw_video"] = None
+        else:
+            main_data["raw_video"] = None
 
         return main_data
 
@@ -1068,6 +1094,7 @@ class VideoDatasetWithHumanMotions(VideoDatasetWithConditions):
         vae_scale_factor_spatial: int = 8,
         load_raymaps: bool = False,
         load_image_goal: bool = False,
+        load_raw_videos_for_pixel_loss: bool = False,
         prompt_subdir: str = "prompts",
         prompt_embeds_subdir: str = "prompt_embeds",
         hand_video_subdir: str = "videos_hands",
@@ -1095,6 +1122,7 @@ class VideoDatasetWithHumanMotions(VideoDatasetWithConditions):
             vae_scale_factor_spatial=vae_scale_factor_spatial,
             load_raymaps=load_raymaps,
             load_image_goal=load_image_goal,
+            load_raw_videos_for_pixel_loss=load_raw_videos_for_pixel_loss,
             prompt_subdir=prompt_subdir,
             prompt_embeds_subdir=prompt_embeds_subdir,
             hand_video_subdir=hand_video_subdir,

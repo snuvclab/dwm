@@ -343,6 +343,28 @@ def get_args() -> Dict[str, Any]:
         default="aether",
         help="Model type to determine which dataset class and file types to use. 'aether' for Aether model, 'cogvideox_pose' for CogVideoX pose model.",
     )
+    parser.add_argument(
+        "--use_gray_hand_videos",
+        action="store_true",
+        help="Use gray hand videos instead of colored hand videos for CogVideoX pose model type.",
+    )
+    parser.add_argument(
+        "--split_hands",
+        action="store_true",
+        help="Split hands into left and right hand videos for CogVideoX pose model type.",
+    )
+    parser.add_argument(
+        "--hand_video_subdir",
+        type=str,
+        default="videos_hands",
+        help="Subdirectory name for hand videos in default mode (not gray, not split). Default: 'videos_hands'",
+    )
+    parser.add_argument(
+        "--hand_video_latents_subdir",
+        type=str,
+        default="hand_video_latents",
+        help="Subdirectory name for hand video latents in default mode (not gray, not split). Default: 'hand_video_latents'",
+    )
     return parser.parse_args()
 
 
@@ -423,9 +445,17 @@ def serialize_artifacts(
     human_motions_dir: Optional[pathlib.Path] = None,
     hand_videos_dir: Optional[pathlib.Path] = None,
     hand_video_latents_dir: Optional[pathlib.Path] = None,
+    hand_videos_gray_dir: Optional[pathlib.Path] = None,
+    hand_video_gray_latents_dir: Optional[pathlib.Path] = None,
+    hand_videos_gray_left_dir: Optional[pathlib.Path] = None,
+    hand_video_gray_left_latents_dir: Optional[pathlib.Path] = None,
+    hand_videos_gray_right_dir: Optional[pathlib.Path] = None,
+    hand_video_gray_right_latents_dir: Optional[pathlib.Path] = None,
     hand_mask_videos_dir: Optional[pathlib.Path] = None,
     static_videos_dir: Optional[pathlib.Path] = None,
     static_video_latents_dir: Optional[pathlib.Path] = None,
+    smpl_pos_map_dir: Optional[pathlib.Path] = None,
+    smpl_pos_map_latents_dir: Optional[pathlib.Path] = None,
     images: Optional[torch.Tensor] = None,
     image_latents: Optional[torch.Tensor] = None,
     images_goal: Optional[torch.Tensor] = None,
@@ -441,9 +471,17 @@ def serialize_artifacts(
     human_motions: Optional[torch.Tensor] = None,
     hand_videos: Optional[torch.Tensor] = None,
     hand_video_latents: Optional[torch.Tensor] = None,
+    hand_videos_gray: Optional[torch.Tensor] = None,
+    hand_video_gray_latents: Optional[torch.Tensor] = None,
+    hand_videos_gray_left: Optional[torch.Tensor] = None,
+    hand_video_gray_left_latents: Optional[torch.Tensor] = None,
+    hand_videos_gray_right: Optional[torch.Tensor] = None,
+    hand_video_gray_right_latents: Optional[torch.Tensor] = None,
     hand_mask_videos: Optional[torch.Tensor] = None,
     static_videos: Optional[torch.Tensor] = None,
     static_video_latents: Optional[torch.Tensor] = None,
+    smpl_pos_map: Optional[torch.Tensor] = None,
+    smpl_pos_map_latents: Optional[torch.Tensor] = None,
 ) -> None:
     # Handle the case where videos is None (selective processing)
     if videos is not None:
@@ -478,9 +516,17 @@ def serialize_artifacts(
         (video_latents, video_latents_dir, torch.save, "pt"),
         (hand_videos, hand_videos_dir, functools.partial(save_video, fps=fps), "mp4"),
         (hand_video_latents, hand_video_latents_dir, torch.save, "pt"),
+        (hand_videos_gray, hand_videos_gray_dir, functools.partial(save_video, fps=fps), "mp4"),
+        (hand_video_gray_latents, hand_video_gray_latents_dir, torch.save, "pt"),
+        (hand_videos_gray_left, hand_videos_gray_left_dir, functools.partial(save_video, fps=fps), "mp4"),
+        (hand_video_gray_left_latents, hand_video_gray_left_latents_dir, torch.save, "pt"),
+        (hand_videos_gray_right, hand_videos_gray_right_dir, functools.partial(save_video, fps=fps), "mp4"),
+        (hand_video_gray_right_latents, hand_video_gray_right_latents_dir, torch.save, "pt"),
         (hand_mask_videos, hand_mask_videos_dir, functools.partial(save_video, fps=fps), "mp4"),
         (static_videos, static_videos_dir, functools.partial(save_video, fps=fps), "mp4"),
         (static_video_latents, static_video_latents_dir, torch.save, "pt"),
+        (smpl_pos_map, smpl_pos_map_dir, functools.partial(save_video, fps=fps), "mp4"),
+        (smpl_pos_map_latents, smpl_pos_map_latents_dir, torch.save, "pt"),
         (prompts, prompts_dir, save_prompt, "txt"),
         (prompt_embeds, prompt_embeds_dir, torch.save, "pt"),
         (metadata, videos_dir, save_metadata, "txt"),
@@ -499,13 +545,21 @@ def serialize_artifacts(
             file_type_to_index = {
                 "videos": 0,
                 "video_latents": 1,
-                "hand_videos": 2,
+                "videos_hands": 2,
                 "hand_video_latents": 3,
-                "hand_mask_videos": 4,
-                "static_videos": 5,
-                "static_video_latents": 6,
-                "prompts": 7,
-                "prompt_embeds": 8,
+                "videos_hands_gray": 4,
+                "hand_video_gray_latents": 5,
+                "videos_hands_gray_left": 6,
+                "hand_video_gray_left_latents": 7,
+                "videos_hands_gray_right": 8,
+                "hand_video_gray_right_latents": 9,
+                "videos_hands_mask": 10,
+                "videos_static": 11,
+                "static_video_latents": 12,
+                "smpl_pos_map_egoallo": 13,
+                "smpl_pos_map_egoallo_latents": 14,
+                "prompts": 15,
+                "prompt_embeds": 16,
             }
         else:  # aether
             file_type_to_index = {
@@ -527,14 +581,30 @@ def serialize_artifacts(
         # Keep only the requested file types
         filtered_mapper_list = []
         for file_type in selective_processing:
-            if file_type in file_type_to_index:
-                index = file_type_to_index[file_type]
+            # Handle gray hand video latents mapping for cogvideox_pose model
+            if model_type == "cogvideox_pose":
+                if file_type == "hand_video_gray_latents":
+                    # Map hand_video_gray_latents to hand_video_latents for gray hand videos
+                    mapped_file_type = "hand_video_latents"
+                elif file_type == "hand_video_gray_left_latents":
+                    # Map hand_video_gray_left_latents to hand_video_gray_left_latents
+                    mapped_file_type = "hand_video_gray_left_latents"
+                elif file_type == "hand_video_gray_right_latents":
+                    # Map hand_video_gray_right_latents to hand_video_gray_right_latents
+                    mapped_file_type = "hand_video_gray_right_latents"
+                else:
+                    mapped_file_type = file_type
+            else:
+                mapped_file_type = file_type
+            
+            if mapped_file_type in file_type_to_index:
+                index = file_type_to_index[mapped_file_type]
                 if index < len(data_folder_mapper_list):
                     filtered_mapper_list.append(data_folder_mapper_list[index])
         
         # Only include metadata if we're processing videos or other file types that need it
         if model_type == "cogvideox_pose":
-            should_include_metadata = any(ft in selective_processing for ft in ["videos", "video_latents", "hand_videos", "hand_video_latents", "hand_mask_videos", "static_videos", "static_video_latents", "prompts", "prompt_embeds"])
+            should_include_metadata = any(ft in selective_processing for ft in ["videos", "video_latents", "prompts", "prompt_embeds"])
             metadata_index = 9
         else:  # aether
             should_include_metadata = any(ft in selective_processing for ft in ["videos", "video_latents", "disparity", "disparity_latents", "images", "image_latents", "human_motions", "prompts", "prompt_embeds"])
@@ -557,9 +627,14 @@ def serialize_artifacts(
             base_filename = filename.replace(".mp4", "")
         else:
             raise ValueError(f"No video paths provided for batch index {i}")
-        filenames.append(base_filename)
+        filenames.append(base_filename)    
+
     for data, folder, save_fn, extension in data_folder_mapper_list:
-        if data is None:
+        if data is None or folder is None:
+            if data is None:
+                print(f"Skipping {folder} since data is None")
+            if folder is None:
+                print(f"Skipping {data} since folder is None")
             continue
         for slice, filename in zip(data, filenames):
             path = folder.joinpath(f"{filename}.{extension}")
@@ -607,9 +682,15 @@ def main():
     if "LOCAL_RANK" in os.environ:
         local_rank = int(os.environ["LOCAL_RANK"])
         torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend="nccl")
-        world_size = dist.get_world_size()
-        rank = dist.get_rank()
+        try:
+            dist.init_process_group(backend="nccl")
+            world_size = dist.get_world_size()
+            rank = dist.get_rank()
+        except Exception as e:
+            print(f"Warning: Failed to initialize distributed processing: {e}")
+            print("Falling back to single GPU mode")
+            world_size = 1
+            rank = 0
     else:
         # Single GPU
         local_rank = 0
@@ -634,11 +715,20 @@ def main():
     human_motions_dir = tmp_dir.joinpath(f"human_motions/{rank}")
     
     # CogVideoX pose-specific folders
-    hand_videos_dir = tmp_dir.joinpath(f"videos_hands/{rank}")
-    hand_video_latents_dir = tmp_dir.joinpath(f"hand_video_latents/{rank}")
+    # Use configurable subdirectory names for default mode
+    hand_videos_dir = tmp_dir.joinpath(f"{args.hand_video_subdir}/{rank}")
+    hand_video_latents_dir = tmp_dir.joinpath(f"{args.hand_video_latents_subdir}/{rank}")
+    hand_videos_gray_dir = tmp_dir.joinpath(f"videos_hands_gray/{rank}")
+    hand_video_gray_latents_dir = tmp_dir.joinpath(f"hand_video_gray_latents/{rank}")
+    hand_videos_gray_left_dir = tmp_dir.joinpath(f"videos_hands_gray_left/{rank}")
+    hand_video_gray_left_latents_dir = tmp_dir.joinpath(f"hand_video_gray_left_latents/{rank}")
+    hand_videos_gray_right_dir = tmp_dir.joinpath(f"videos_hands_gray_right/{rank}")
+    hand_video_gray_right_latents_dir = tmp_dir.joinpath(f"hand_video_gray_right_latents/{rank}")
     hand_mask_videos_dir = tmp_dir.joinpath(f"videos_hands_mask/{rank}")
     static_videos_dir = tmp_dir.joinpath(f"videos_static/{rank}")
     static_video_latents_dir = tmp_dir.joinpath(f"static_video_latents/{rank}")
+    smpl_pos_map_dir = tmp_dir.joinpath(f"smpl_pos_map_egoallo/{rank}")
+    smpl_pos_map_latents_dir = tmp_dir.joinpath(f"smpl_pos_map_egoallo_latents/{rank}")
 
     # Create common folders
     videos_dir.mkdir(parents=True, exist_ok=True)
@@ -666,9 +756,17 @@ def main():
     if args.model_type == "cogvideox_pose":
         hand_videos_dir.mkdir(parents=True, exist_ok=True)
         hand_video_latents_dir.mkdir(parents=True, exist_ok=True)
+        hand_videos_gray_dir.mkdir(parents=True, exist_ok=True)
+        hand_video_gray_latents_dir.mkdir(parents=True, exist_ok=True)
+        hand_videos_gray_left_dir.mkdir(parents=True, exist_ok=True)
+        hand_video_gray_left_latents_dir.mkdir(parents=True, exist_ok=True)
+        hand_videos_gray_right_dir.mkdir(parents=True, exist_ok=True)
+        hand_video_gray_right_latents_dir.mkdir(parents=True, exist_ok=True)
         hand_mask_videos_dir.mkdir(parents=True, exist_ok=True)
         static_videos_dir.mkdir(parents=True, exist_ok=True)
         static_video_latents_dir.mkdir(parents=True, exist_ok=True)
+        smpl_pos_map_dir.mkdir(parents=True, exist_ok=True)
+        smpl_pos_map_latents_dir.mkdir(parents=True, exist_ok=True)
 
     weight_dtype = DTYPE_MAPPING[args.dtype]
     target_fps = args.target_fps
@@ -676,9 +774,9 @@ def main():
     # 1. Dataset
     # Import dataset classes based on model type
     if args.model_type == "aether":
-        from training.aether.dataset import BucketSampler, VideoDatasetWithResizing, VideoDatasetWithResizeAndRectangleCrop
+        from training.aether.dataset import VideoDatasetWithResizing, VideoDatasetWithResizeAndRectangleCrop
     elif args.model_type == "cogvideox_pose":
-        from training.cogvideox_static_pose.dataset import BucketSampler, VideoDatasetWithConditionsAndResizing, VideoDatasetWithConditionsAndResizeAndRectangleCrop
+        from training.cogvideox_static_pose.dataset import VideoDatasetWithConditionsAndResizing, VideoDatasetWithConditionsAndResizeAndRectangleCrop
     else:
         raise ValueError(f"Unknown model_type: {args.model_type}. Must be 'aether' or 'cogvideox_pose'")
     
@@ -695,6 +793,14 @@ def main():
         "load_tensors": False,
         "random_flip": args.random_flip,
     }
+
+    if args.model_type == "cogvideox_pose":
+        dataset_init_kwargs.update({
+            "use_gray_hand_videos": args.use_gray_hand_videos,
+            "split_hands": args.split_hands,  # Enable left/right hand video processing
+            "hand_video_subdir": args.hand_video_subdir,
+            "hand_video_latents_subdir": args.hand_video_latents_subdir,
+        })
     
     # Add model-specific arguments
     if args.model_type == "aether":
@@ -737,12 +843,46 @@ def main():
         if args.model_type == "cogvideox_pose":
             if hasattr(dataset, 'hand_video_paths'):
                 dataset.hand_video_paths = dataset.hand_video_paths[start_index:end_index]
+            if hasattr(dataset, 'hand_video_gray_paths'):
+                dataset.hand_video_gray_paths = dataset.hand_video_gray_paths[start_index:end_index]
             if hasattr(dataset, 'static_video_paths'):
                 dataset.static_video_paths = dataset.static_video_paths[start_index:end_index]
     else:
         pass
 
     rank_dataset_size = len(dataset)
+    
+    # Check if dataset is empty for this rank
+    if rank_dataset_size == 0:
+        print(f"\n{'='*80}")
+        print(f"⚠️  Rank {rank}: No valid data found. Skipping processing for this GPU.")
+        print(f"{'='*80}")
+        print(f"📂 Dataset data_root: {dataset.data_root}")
+        print(f"🔧 Split hands enabled: {dataset.split_hands if hasattr(dataset, 'split_hands') else 'N/A'}")
+        print(f"🔧 Use gray hand videos: {dataset.use_gray_hand_videos if hasattr(dataset, 'use_gray_hand_videos') else 'N/A'}")
+        print(f"📊 Original dataset size: {original_dataset_size}")
+        print(f"📊 Assigned range for this rank: {start_index if world_size > 1 else 0} to {end_index if world_size > 1 else original_dataset_size}")
+        
+        # Show what paths were expected
+        if hasattr(dataset, 'video_paths') and dataset.video_paths is not None and len(dataset.video_paths) == 0:
+            print(f"⚠️  Video paths list is empty")
+        if hasattr(dataset, 'hand_video_gray_paths') and dataset.hand_video_gray_paths is not None and len(dataset.hand_video_gray_paths) == 0:
+            print(f"⚠️  Hand video gray paths list is empty")
+        if hasattr(dataset, 'hand_video_paths') and dataset.hand_video_paths is not None and len(dataset.hand_video_paths) == 0:
+            print(f"⚠️  Hand video paths list is empty")
+        if hasattr(dataset, 'static_video_paths') and dataset.static_video_paths is not None and len(dataset.static_video_paths) == 0:
+            print(f"⚠️  Static video paths list is empty")
+            
+        print(f"\n💡 This can happen when:")
+        print(f"   - split_hands=True and some GPUs don't have valid left/right hand videos")
+        print(f"   - Data distribution across GPUs results in empty subsets")
+        print(f"   - Required condition files (hand videos, static videos) are missing")
+        print(f"{'='*80}\n")
+        
+        # Exit gracefully
+        if world_size > 1:
+            dist.destroy_process_group()
+        return
 
     # Look for human_motions folder in the data_root
     human_motions_folder = Path(args.data_root) / "human_motions"
@@ -755,29 +895,20 @@ def main():
         human_motions_data = None
 
     # 2. Dataloader
-    def collate_fn(data):
-        videos = [x["video"] for x in data[0]]
-        videos = torch.stack(videos).to(dtype=weight_dtype, non_blocking=True)
+    def collate_fn(batch):
+        videos = torch.stack([item["video"] for item in batch]).to(dtype=weight_dtype, non_blocking=True)
 
         # Model-specific data collation
         if args.model_type == "aether":
             images = None
             images_goal = None
             if args.save_image_latents:
-                images = [x["image"] for x in data[0]]
-                images = torch.stack(images).to(dtype=weight_dtype, non_blocking=True)
+                images = torch.stack([item["image"] for item in batch]).to(dtype=weight_dtype, non_blocking=True)
+                images_goal = torch.stack([item["image_goal"] for item in batch]).to(dtype=weight_dtype, non_blocking=True)
 
-                images_goal = [x["image_goal"] for x in data[0]]
-                images_goal = torch.stack(images_goal).to(dtype=weight_dtype, non_blocking=True)
-
-            disparity = [x["disparity"] for x in data[0]]
-            disparity = torch.stack(disparity).to(dtype=weight_dtype, non_blocking=True)
-
-            raymap = [x["raymap"] for x in data[0]]
-            raymap = torch.stack(raymap).to(dtype=weight_dtype, non_blocking=True)
-
-            raymap_abs = [x["raymap_abs"] for x in data[0]]
-            raymap_abs = torch.stack(raymap_abs).to(dtype=weight_dtype, non_blocking=True)
+            disparity = torch.stack([item["disparity"] for item in batch]).to(dtype=weight_dtype, non_blocking=True)
+            raymap = torch.stack([item["raymap"] for item in batch]).to(dtype=weight_dtype, non_blocking=True)
+            raymap_abs = torch.stack([item["raymap_abs"] for item in batch]).to(dtype=weight_dtype, non_blocking=True)
 
             return {
                 "images": images,
@@ -788,27 +919,31 @@ def main():
                 "raymap_abs": raymap_abs,
             }
         else:  # cogvideox_pose
-            # Add hand_videos and static_videos if they exist in the dataset
+            # Add hand_videos, static_videos, and smpl_pos_map if they exist in the dataset
             hand_videos = None
             static_videos = None
-            if "hand_videos" in data[0][0]:
-                hand_videos = [x["hand_videos"] for x in data[0]]
-                hand_videos = torch.stack(hand_videos).to(dtype=weight_dtype, non_blocking=True)
+            smpl_pos_map = None
             
-            if "static_videos" in data[0][0]:
-                static_videos = [x["static_videos"] for x in data[0]]
-                static_videos = torch.stack(static_videos).to(dtype=weight_dtype, non_blocking=True)
+            if "hand_videos" in batch[0] and batch[0]["hand_videos"] is not None:
+                hand_videos = torch.stack([item["hand_videos"] for item in batch]).to(dtype=weight_dtype, non_blocking=True)
+            
+            if "static_videos" in batch[0] and batch[0]["static_videos"] is not None:
+                static_videos = torch.stack([item["static_videos"] for item in batch]).to(dtype=weight_dtype, non_blocking=True)
+            
+            if "smpl_pos_map" in batch[0] and batch[0]["smpl_pos_map"] is not None:
+                smpl_pos_map = torch.stack([item["smpl_pos_map"] for item in batch]).to(dtype=weight_dtype, non_blocking=True)
 
             return {
                 "videos": videos,
                 "hand_videos": hand_videos,
                 "static_videos": static_videos,
+                "smpl_pos_map": smpl_pos_map,
             }
 
     dataloader = DataLoader(
         dataset,
-        batch_size=1,
-        sampler=BucketSampler(dataset, batch_size=args.batch_size, shuffle=True, drop_last=False),
+        batch_size=args.batch_size,
+        shuffle=False,
         collate_fn=collate_fn,
         num_workers=args.dataloader_num_workers,
         pin_memory=args.pin_memory,
@@ -931,29 +1066,30 @@ def main():
                     disparity_temp = 2 * disparity_temp - 1  # Normalize to [-1, 1]
                     disparity_latents = vae._encode(disparity_temp)
 
-                    # Process raymaps if requested
-                    should_process_raymaps = (args.selective_processing is None or "raymaps" in args.selective_processing)
-                    should_process_raymaps_abs = (args.selective_processing is None or "raymaps_abs" in args.selective_processing)
+                # Process raymaps if requested
+                should_process_raymaps = (args.selective_processing is None or "raymaps" in args.selective_processing)
+                should_process_raymaps_abs = (args.selective_processing is None or "raymaps_abs" in args.selective_processing)
+                
+                if should_process_raymaps:
+                    raymap = batch["raymap"].to(device, non_blocking=True)
+                else:
+                    raymap = None
                     
-                    if should_process_raymaps:
-                        raymap = batch["raymap"].to(device, non_blocking=True)
-                    else:
-                        raymap = None
-                        
-                    if should_process_raymaps_abs:
-                        raymap_abs = batch["raymap_abs"].to(device, non_blocking=True)
-                    else:
-                        raymap_abs = None
+                if should_process_raymaps_abs:
+                    raymap_abs = batch["raymap_abs"].to(device, non_blocking=True)
+                else:
+                    raymap_abs = None
 
             else:  # cogvideox_pose
                 # CogVideoX pose-specific processing
                 if batch["hand_videos"] is not None:
                     hand_videos = batch["hand_videos"].to(device, non_blocking=True)
-                    hand_videos = hand_videos.permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
                 
                 if batch["static_videos"] is not None:
                     static_videos = batch["static_videos"].to(device, non_blocking=True)
-                    static_videos = static_videos.permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
+                
+                if batch["smpl_pos_map"] is not None:
+                    smpl_pos_map = batch["smpl_pos_map"].to(device, non_blocking=True)
 
                 # Encode videos for CogVideoX pose
                 if args.save_latents_and_embeddings:
@@ -979,8 +1115,13 @@ def main():
                         if static_videos is not None:
                             static_video_latents = vae._encode(static_videos)
                             static_video_latents = static_video_latents.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
+                        
+                        if smpl_pos_map is not None:
+                            smpl_pos_map_latents = vae._encode(smpl_pos_map)
+                            smpl_pos_map_latents = smpl_pos_map_latents.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
 
             # Process images for Aether model
+            should_process_images = False
             if args.model_type == "aether" and images is not None:
                 # Only process images if they're in selective_processing or if no selective processing is specified
                 should_process_images = (args.selective_processing is None or 
@@ -1054,27 +1195,137 @@ def main():
                             human_motions = human_motions_batch
 
             else:  # cogvideox_pose
-                should_process_hand_videos = (args.selective_processing is None or "hand_videos" in args.selective_processing)
-                should_process_static_videos = (args.selective_processing is None or "static_videos" in args.selective_processing)
+                should_process_hand_videos = (args.selective_processing is None or "hand_video_latents" in args.selective_processing)
+                should_process_hand_gray_left = (args.selective_processing is None or "hand_video_gray_left_latents" in args.selective_processing)
+                should_process_hand_gray_right = (args.selective_processing is None or "hand_video_gray_right_latents" in args.selective_processing)
+                should_process_static_videos = (args.selective_processing is None or "static_video_latents" in args.selective_processing)
+                should_process_hand_masks = (args.selective_processing is None or "videos_hands_mask" in args.selective_processing)
+                should_process_smpl_pos_map = (args.selective_processing is None or "smpl_pos_map_egoallo_latents" in args.selective_processing)
                 
-                # Process hand_videos if requested
-                if should_process_hand_videos and hand_videos is not None:
-                    hand_videos = (hand_videos.permute(0, 2, 1, 3, 4) + 1) / 2
-                    
-                    # Create hand mask from hand videos
-                    should_process_hand_masks = (args.selective_processing is None or "hand_mask_videos" in args.selective_processing)
+                # Need hand_videos for left/right processing even if not saving hand_video_latents
+                need_hand_videos = should_process_hand_videos or should_process_hand_gray_left or should_process_hand_gray_right or should_process_hand_masks
+                
+                # Process hand_videos if needed
+                if need_hand_videos and hand_videos is not None:
+                    hand_videos_save = (hand_videos.permute(0, 2, 1, 3, 4) + 1) / 2  # 저장용
+                    hand_videos_encode = hand_videos.permute(0, 2, 1, 3, 4)           # [-1,1] encode용
                     if should_process_hand_masks:
-                        hand_mask_videos = create_hand_mask(hand_videos)
+                        hand_mask_videos = create_hand_mask(hand_videos_save)
                         print(f"Created hand mask videos with shape: {hand_mask_videos.shape}")
+                    else:
+                        hand_mask_videos = None
+                    if should_process_hand_videos:
+                        hand_videos = hand_videos_encode
+                        hand_videos_save_final = hand_videos_save
+                    else:
+                        hand_videos_for_splitting = hand_videos_encode
+                        hand_videos = None
+                        hand_videos_save_final = None
                 else:
                     hand_videos = None
+                    hand_videos_for_splitting = None
+                    hand_videos_save_final = None
                     hand_mask_videos = None
+                
+                # Process left/right gray hand videos if requested (additional to regular gray videos)
+                # Use hand_videos if it's available, otherwise use hand_videos_for_splitting
+                source_hand_videos = hand_videos if hand_videos is not None else hand_videos_for_splitting
+                if should_process_hand_gray_left and source_hand_videos is not None:
+                    batch_size, frames, total_channels, height, width = source_hand_videos.shape
+                    channels_per_hand = total_channels // 2
+                    hand_videos_gray_left = source_hand_videos[:, :, :channels_per_hand, :, :].permute(0, 2, 1, 3, 4)  # encode용
+                    hand_videos_gray_left_save = (hand_videos_gray_left + 1) / 2                                      # 저장용
+                    print(f"Created left hand videos with shape: {hand_videos_gray_left.shape}")
+                else:
+                    hand_videos_gray_left = None
+                    hand_videos_gray_left_save = None
+                
+                if should_process_hand_gray_right and source_hand_videos is not None:
+                    batch_size, frames, total_channels, height, width = source_hand_videos.shape
+                    channels_per_hand = total_channels // 2
+                    hand_videos_gray_right = source_hand_videos[:, :, channels_per_hand:, :, :].permute(0, 2, 1, 3, 4)
+                    hand_videos_gray_right_save = (hand_videos_gray_right + 1) / 2
+                    print(f"Created right hand videos with shape: {hand_videos_gray_right.shape}")
+                else:
+                    hand_videos_gray_right = None
+                    hand_videos_gray_right_save = None
                     
                 # Process static_videos if requested
                 if should_process_static_videos and static_videos is not None:
-                    static_videos = (static_videos.permute(0, 2, 1, 3, 4) + 1) / 2
+                    static_videos_encode = static_videos.permute(0, 2, 1, 3, 4)
+                    static_videos_save = (static_videos_encode + 1) / 2
                 else:
-                    static_videos = None
+                    static_videos_encode = None
+                    static_videos_save = None
+                
+                # Process smpl_pos_map if requested
+                if should_process_smpl_pos_map and smpl_pos_map is not None:
+                    smpl_pos_map_encode = smpl_pos_map.permute(0, 2, 1, 3, 4)
+                    smpl_pos_map_save = (smpl_pos_map_encode + 1) / 2
+                    print(f"Processed SMPL pos map with shape: {smpl_pos_map_encode.shape}")
+                else:
+                    smpl_pos_map_encode = None
+                    smpl_pos_map_save = None
+
+            # Encode videos for CogVideoX pose (after data processing so hand_videos_gray_left/right are available)
+            if args.model_type == "cogvideox_pose" and args.save_latents_and_embeddings:
+                # Check if we should process video latents
+                should_process_videos = (args.selective_processing is None or 
+                                       any(ft in args.selective_processing for ft in ["video_latents", "prompt_embeds"]))
+                video_latents = None
+                if should_process_videos:
+                    if args.use_slicing:
+                        encoded_slices = [vae._encode(video_slice) for video_slice in videos.split(1)]
+                        video_latents = torch.cat(encoded_slices)
+                    else:
+                        video_latents = vae._encode(videos)
+                    video_latents = video_latents.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
+
+                should_process_hand_videos = (args.selective_processing is None or "hand_video_latents" in args.selective_processing)
+                should_process_hand_gray_videos = (args.selective_processing is None or "hand_video_gray_latents" in args.selective_processing)
+                should_process_hand_gray_left = (args.selective_processing is None or "hand_video_gray_left_latents" in args.selective_processing)
+                should_process_hand_gray_right = (args.selective_processing is None or "hand_video_gray_right_latents" in args.selective_processing)
+                should_process_static_videos_latents = (args.selective_processing is None or "static_video_latents" in args.selective_processing)
+                should_process_smpl_pos_map_latents = (args.selective_processing is None or "smpl_pos_map_egoallo_latents" in args.selective_processing)
+
+                # Process hand videos based on use_gray_hand_videos flag
+                hand_video_latents = None
+                hand_video_gray_latents = None
+                hand_video_gray_left_latents = None
+                hand_video_gray_right_latents = None
+                if args.use_gray_hand_videos:
+                    # Use gray hand videos (stored in hand_videos)
+                    if should_process_hand_gray_videos and hand_videos is not None:
+                        hand_video_gray_latents = vae._encode(hand_videos)
+                        hand_video_gray_latents = hand_video_gray_latents.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
+                        print(f"Encoded gray hand video latents with shape: {hand_video_gray_latents.shape}")
+                    
+                    # Additionally process left/right separately if requested
+                    if should_process_hand_gray_left and hand_videos_gray_left is not None:
+                        hand_video_gray_left_latents = vae._encode(hand_videos_gray_left)
+                        hand_video_gray_left_latents = hand_video_gray_left_latents.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
+                        print(f"Encoded left hand video latents with shape: {hand_video_gray_left_latents.shape}")
+                    
+                    if should_process_hand_gray_right and hand_videos_gray_right is not None:
+                        hand_video_gray_right_latents = vae._encode(hand_videos_gray_right)
+                        hand_video_gray_right_latents = hand_video_gray_right_latents.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
+                        print(f"Encoded right hand video latents with shape: {hand_video_gray_right_latents.shape}")
+                else:
+                    # Use colored hand videos
+                    if should_process_hand_videos and hand_videos is not None:
+                        hand_video_latents = vae._encode(hand_videos)
+                        hand_video_latents = hand_video_latents.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
+                
+                static_video_latents = None
+                if should_process_static_videos_latents and static_videos is not None:
+                    static_video_latents = vae._encode(static_videos)
+                    static_video_latents = static_video_latents.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
+                
+                smpl_pos_map_latents = None
+                if should_process_smpl_pos_map and smpl_pos_map is not None:
+                    smpl_pos_map_latents = vae._encode(smpl_pos_map)
+                    smpl_pos_map_latents = smpl_pos_map_latents.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
+                    print(f"Encoded SMPL pos map latents with shape: {smpl_pos_map_latents.shape}")
 
             # Get video paths for this batch (always needed for filename generation)
             batch_video_paths = []
@@ -1193,13 +1444,51 @@ def main():
                     })
             
             else:  # cogvideox_pose
-                if should_process_hand_videos or args.selective_processing is None:
-                    output_data.update({
-                        "hand_videos_dir": hand_videos_dir,
-                        "hand_video_latents_dir": hand_video_latents_dir,
-                        "hand_videos": hand_videos,
-                        "hand_video_latents": hand_video_latents,
-                    })
+                # Define processing flags for cogvideox_pose
+                should_process_hand_videos = (args.selective_processing is None or "hand_video_latents" in args.selective_processing)
+                should_process_hand_gray_videos = (args.selective_processing is None or "hand_video_gray_latents" in args.selective_processing)
+                should_process_hand_gray_left = (args.selective_processing is None or "hand_video_gray_left_latents" in args.selective_processing)
+                should_process_hand_gray_right = (args.selective_processing is None or "hand_video_gray_right_latents" in args.selective_processing)
+                should_process_hand_masks = (args.selective_processing is None or "videos_hands_mask" in args.selective_processing)
+                should_process_static_videos = (args.selective_processing is None or "static_video_latents" in args.selective_processing)
+                should_process_smpl_pos_map = (args.selective_processing is None or "smpl_pos_map_egoallo_latents" in args.selective_processing)
+                
+                # Process hand videos based on use_gray_hand_videos flag
+                if args.use_gray_hand_videos:
+                    # Use gray hand videos (stored in hand_videos)
+                    if should_process_hand_gray_videos or args.selective_processing is None:
+                        output_data.update({
+                            "hand_videos_dir": hand_videos_gray_dir,  # Use gray directory
+                            "hand_video_latents_dir": hand_video_gray_latents_dir,  # Use gray latents directory
+                            "hand_videos": hand_videos,  # gray videos stored in hand_videos
+                            "hand_video_latents": hand_video_gray_latents,  # gray latents stored in hand_video_latents
+                        })
+                    
+                    # Additionally process left/right separately if requested
+                    if should_process_hand_gray_left or args.selective_processing is None:
+                        output_data.update({
+                            "hand_videos_gray_left_dir": hand_videos_gray_left_dir,
+                            "hand_video_gray_left_latents_dir": hand_video_gray_left_latents_dir,
+                            "hand_videos_gray_left": hand_videos_gray_left.permute(0, 2, 1, 3, 4),
+                            "hand_video_gray_left_latents": hand_video_gray_left_latents,
+                        })
+                    
+                    if should_process_hand_gray_right or args.selective_processing is None:
+                        output_data.update({
+                            "hand_videos_gray_right_dir": hand_videos_gray_right_dir,
+                            "hand_video_gray_right_latents_dir": hand_video_gray_right_latents_dir,
+                            "hand_videos_gray_right": hand_videos_gray_right.permute(0, 2, 1, 3, 4),
+                            "hand_video_gray_right_latents": hand_video_gray_right_latents,
+                        })
+                else:
+                    # Use colored hand videos (with configurable subdirectory names)
+                    if should_process_hand_videos or args.selective_processing is None:
+                        output_data.update({
+                            "hand_videos_dir": hand_videos_dir,  # Uses args.hand_video_subdir
+                            "hand_video_latents_dir": hand_video_latents_dir,  # Uses args.hand_video_latents_subdir
+                            "hand_videos": hand_videos_save_final.permute(0, 2, 1, 3, 4),
+                            "hand_video_latents": hand_video_latents,
+                        })
                 
                 if should_process_hand_masks or args.selective_processing is None:
                     output_data.update({
@@ -1214,7 +1503,14 @@ def main():
                         "static_videos": static_videos,
                         "static_video_latents": static_video_latents,
                     })
-            
+                
+                if should_process_smpl_pos_map or args.selective_processing is None:
+                    output_data.update({
+                        "smpl_pos_map_dir": smpl_pos_map_dir,
+                        "smpl_pos_map_latents_dir": smpl_pos_map_latents_dir,
+                        "smpl_pos_map": smpl_pos_map,
+                        "smpl_pos_map_latents": smpl_pos_map_latents,
+                    })
             output_queue.put(output_data)
 
         except Exception:
@@ -1261,12 +1557,21 @@ def main():
                 ("human_motions", "pt"),
             ]
         else:  # cogvideox_pose
+            # Use configurable subdirectory names for default mode
             model_folders = [
-                ("videos_hands", "mp4"),
-                ("hand_video_latents", "pt"),
+                (args.hand_video_subdir, "mp4"),  # Configurable hand videos directory
+                (args.hand_video_latents_subdir, "pt"),  # Configurable hand video latents directory
+                ("videos_hands_gray", "mp4"),
+                ("hand_video_gray_latents", "pt"),
+                ("videos_hands_gray_left", "mp4"),
+                ("hand_video_gray_left_latents", "pt"),
+                ("videos_hands_gray_right", "mp4"),
+                ("hand_video_gray_right_latents", "pt"),
                 ("videos_hands_mask", "mp4"),
                 ("videos_static", "mp4"),
                 ("static_video_latents", "pt"),
+                ("smpl_pos_map_egoallo", "mp4"),
+                ("smpl_pos_map_egoallo_latents", "pt"),
             ]
         
         all_folders = common_folders + model_folders
@@ -1347,16 +1652,33 @@ def main():
                         data["human_motion"] = f"human_motions/{stem}.pt"
                 
                 else:  # cogvideox_pose
+                    # Use configurable subdirectory names for default mode
                     if args.selective_processing is None or "hand_videos" in args.selective_processing:
-                        data["hand_video"] = f"videos_hands/{stem}.mp4"
+                        data["hand_video"] = f"{args.hand_video_subdir}/{stem}.mp4"
                     if args.selective_processing is None or "hand_video_latents" in args.selective_processing:
-                        data["hand_video_latent"] = f"hand_video_latents/{stem}.pt"
+                        data["hand_video_latent"] = f"{args.hand_video_latents_subdir}/{stem}.pt"
+                    if args.selective_processing is None or "videos_hands_gray" in args.selective_processing:
+                        data["hand_video_gray"] = f"videos_hands_gray/{stem}.mp4"
+                    if args.selective_processing is None or "hand_video_gray_latents" in args.selective_processing:
+                        data["hand_video_gray_latent"] = f"hand_video_gray_latents/{stem}.pt"
+                    if args.selective_processing is None or "videos_hands_gray_left" in args.selective_processing:
+                        data["hand_video_gray_left"] = f"videos_hands_gray_left/{stem}.mp4"
+                    if args.selective_processing is None or "hand_video_gray_left_latents" in args.selective_processing:
+                        data["hand_video_gray_left_latent"] = f"hand_video_gray_left_latents/{stem}.pt"
+                    if args.selective_processing is None or "videos_hands_gray_right" in args.selective_processing:
+                        data["hand_video_gray_right"] = f"videos_hands_gray_right/{stem}.mp4"
+                    if args.selective_processing is None or "hand_video_gray_right_latents" in args.selective_processing:
+                        data["hand_video_gray_right_latent"] = f"hand_video_gray_right_latents/{stem}.pt"
                     if args.selective_processing is None or "hand_mask_videos" in args.selective_processing:
                         data["hand_mask_video"] = f"videos_hands_mask/{stem}.mp4"
                     if args.selective_processing is None or "static_videos" in args.selective_processing:
                         data["static_video"] = f"videos_static/{stem}.mp4"
                     if args.selective_processing is None or "static_video_latents" in args.selective_processing:
                         data["static_video_latent"] = f"static_video_latents/{stem}.pt"
+                    if args.selective_processing is None or "smpl_pos_map_egoallo" in args.selective_processing:
+                        data["smpl_pos_map"] = f"smpl_pos_map_egoallo/{stem}.mp4"
+                    if args.selective_processing is None or "smpl_pos_map_egoallo_latents" in args.selective_processing:
+                        data["smpl_pos_map_latent"] = f"smpl_pos_map_egoallo_latents/{stem}.pt"
                 
                 file.write(json.dumps(data) + "\n")
 

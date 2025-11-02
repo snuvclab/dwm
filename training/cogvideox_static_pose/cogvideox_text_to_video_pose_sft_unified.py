@@ -28,8 +28,18 @@ import imageio.v3 as iio
 
 import diffusers
 import torch
+import torch.nn.functional as F
 import transformers
 import wandb
+
+# Try to import MS-SSIM for pixel-space loss
+try:
+    from pytorch_msssim import ms_ssim
+    HAS_MS_SSIM = True
+except ImportError:
+    HAS_MS_SSIM = False
+    logger_temp = logging.getLogger(__name__)
+    logger_temp.warning("pytorch-msssim not found. Install with: pip install pytorch-msssim")
 from accelerate import Accelerator, DistributedType, init_empty_weights
 from accelerate.logging import get_logger
 from accelerate.utils import (
@@ -1733,6 +1743,7 @@ def setup_pipeline_from_config(config: Dict[str, Any]):
         condition_channels = pipeline_config.get("condition_channels", 16)
         use_adapter = pipeline_config.get("use_adapter", True)
         adapter_version = pipeline_config.get("adapter_version", "v1")
+        use_zero_proj = pipeline_config.get("use_zero_proj", False)
         
         pipeline = CogVideoXFunStaticToVideoPipeline.from_pretrained(
             pretrained_model_name_or_path=None,  # Always start from base model
@@ -1743,6 +1754,7 @@ def setup_pipeline_from_config(config: Dict[str, Any]):
             condition_channels=condition_channels,
             use_adapter=use_adapter,
             adapter_version=adapter_version,
+            use_zero_proj=use_zero_proj,
             split_hands=data_config.get("split_hands", False),
         )
     elif pipeline_type == "cogvideox_fun_static_to_video_pose_cond_token":
@@ -2322,12 +2334,14 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
             condition_channels = config["pipeline"].get("condition_channels", 16)
             use_adapter = config["pipeline"].get("use_adapter", True)
             adapter_version = config["pipeline"].get("adapter_version", "v1")
+            use_zero_proj = config["pipeline"].get("use_zero_proj", False)
             transformer_ = CogVideoXFunTransformer3DModelWithAdapter.from_pretrained(
                 pretrained_model_name_or_path=None,  # Always start from base model
                 base_model_name_or_path=config["model"]["base_model_name_or_path"],
                 condition_channels=condition_channels,
                 use_adapter=use_adapter,
                 adapter_version=adapter_version,
+                use_zero_proj=use_zero_proj,
                 subfolder="transformer",
             )
         elif pipeline_type == "cogvideox_fun_static_to_video_pose_cond_token":
@@ -2671,12 +2685,14 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
                 condition_channels = config["pipeline"].get("condition_channels", 16)
                 use_adapter = config["pipeline"].get("use_adapter", True)
                 adapter_version = config["pipeline"].get("adapter_version", "v1")
+                use_zero_proj = config["pipeline"].get("use_zero_proj", False)
                 load_model = CogVideoXFunTransformer3DModelWithAdapter.from_pretrained(
                     pretrained_model_name_or_path=os.path.join(input_dir, "transformer"),
                     base_model_name_or_path=config["model"]["base_model_name_or_path"],
                     condition_channels=condition_channels,
                     use_adapter=use_adapter,
                     adapter_version=adapter_version,
+                    use_zero_proj=use_zero_proj,
                 )
             elif pipeline_type == "cogvideox_fun_static_to_video_pose_cond_token":
                 # For VideoX-Fun Pipeline with cond token, use cond token transformer
@@ -2952,6 +2968,51 @@ def _apply_gaussian_blur_to_video(video: torch.Tensor, strength: float = 0.2) ->
     blurred = torch.clamp(blurred, 0.0, 1.0)
     
     return blurred.reshape(b, c, f, h, w)
+
+
+def compute_pixel_loss(pred_video: torch.Tensor, target_video: torch.Tensor, loss_type: str = "ms_ssim") -> torch.Tensor:
+    """
+    Compute pixel-space loss between predicted and target videos.
+    
+    Args:
+        pred_video: [B, F, C, H, W] in [0, 1] range
+        target_video: [B, F, C, H, W] in [0, 1] range  
+        loss_type: "mse", "ms_ssim", or "combined"
+    
+    Returns:
+        Scalar loss tensor
+    """
+    # Reshape to [B*F, C, H, W] for MS-SSIM
+    b, f, c, h, w = pred_video.shape
+    pred_flat = pred_video.reshape(b * f, c, h, w)
+    target_flat = target_video.reshape(b * f, c, h, w)
+    
+    if loss_type == "mse":
+        return F.mse_loss(pred_flat, target_flat)
+    
+    elif loss_type == "ms_ssim":
+        if not HAS_MS_SSIM:
+            logger.warning("pytorch-msssim not available, falling back to MSE loss")
+            return F.mse_loss(pred_flat, target_flat)
+        
+        # MS-SSIM returns similarity in [0, 1], convert to loss
+        # Higher MS-SSIM = more similar = lower loss
+        ms_ssim_val = ms_ssim(pred_flat, target_flat, data_range=1.0, size_average=True)
+        return 1.0 - ms_ssim_val
+    
+    elif loss_type == "combined":
+        mse = F.mse_loss(pred_flat, target_flat)
+        if HAS_MS_SSIM:
+            ms_ssim_val = ms_ssim(pred_flat, target_flat, data_range=1.0, size_average=True)
+            ssim_loss = 1.0 - ms_ssim_val
+            # Balanced combination
+            return 0.5 * mse + 0.5 * ssim_loss
+        else:
+            logger.warning("pytorch-msssim not available, using MSE only")
+            return mse
+    
+    else:
+        raise ValueError(f"Unknown loss_type: {loss_type}. Must be one of: 'mse', 'ms_ssim', 'combined'")
 
 
 # Copied from diffusers.pipelines.cogvideo.pipeline_cogvideox.CogVideoXPipeline._get_t5_prompt_embeds
@@ -3244,6 +3305,7 @@ def main():
         "vae_scale_factor_spatial": data_config.get("vae_scale_factor_spatial", 8),
         "load_raymaps": data_config.get("load_raymaps", False),
         "load_image_goal": data_config.get("load_image_goal", False),
+        "load_raw_videos_for_pixel_loss": training_config.get("use_pixel_loss", False),
         "prompt_subdir": data_config.get("prompt_subdir", "prompts"),
         "prompt_embeds_subdir": data_config.get("prompt_embeds_subdir", "prompt_embeds"),
         "hand_video_subdir": data_config.get("hand_video_subdir", "videos_hands"),
@@ -3284,6 +3346,7 @@ def main():
         train_dataset,
         batch_size=training_config["batch_size"],
         shuffle=True,
+        drop_last=True,  # Drop last incomplete batch to ensure consistent batch size
         collate_fn=lambda batch: {
             "videos": torch.stack([item["video"] for item in batch]),
             "prompts": (
@@ -3298,6 +3361,7 @@ def main():
             "human_motions": torch.stack([item["human_motions"] for item in batch]) if "human_motions" in batch[0] and batch[0]["human_motions"] is not None else None,
             "raymaps": torch.stack([item["raymap"] for item in batch]) if "raymap" in batch[0] and batch[0]["raymap"] is not None else None,
             "image_goal": torch.stack([item["image_goal"] for item in batch]) if "image_goal" in batch[0] and batch[0]["image_goal"] is not None else None,
+            "raw_video": torch.stack([item["raw_video"] for item in batch]) if "raw_video" in batch[0] and batch[0]["raw_video"] is not None else None,
         },
         num_workers=data_config.get("dataloader_num_workers", 0),
         pin_memory=data_config.get("pin_memory", True),
@@ -3514,11 +3578,24 @@ def main():
     prompt_dropout_prob = training_config.get("prompt_dropout_prob", 0.0)
     condition_blur_prob = training_config.get("condition_blur_prob", 0.0)
     condition_blur_strength = training_config.get("condition_blur_strength", 0.2)
+    hand_dropout_prob = training_config.get("hand_dropout_prob", 0.0)
     
     if prompt_dropout_prob > 0:
         accelerator.print(f"  🎲 Prompt dropout: {prompt_dropout_prob * 100:.1f}%")
     if condition_blur_prob > 0:
         accelerator.print(f"  🎨 Condition blur: {condition_blur_prob * 100:.1f}% (strength: {condition_blur_strength})")
+    if hand_dropout_prob > 0:
+        accelerator.print(f"  ✋ Hand dropout: {hand_dropout_prob * 100:.1f}%")
+    
+    # Print pixel loss settings
+    use_pixel_loss = training_config.get("use_pixel_loss", False)
+    if use_pixel_loss:
+        pixel_loss_weight = training_config.get("pixel_loss_weight", 0.1)
+        pixel_loss_type = training_config.get("pixel_loss_type", "ms_ssim")
+        pixel_loss_start_step = training_config.get("pixel_loss_start_step", 0)
+        accelerator.print(f"  🖼️  Pixel loss enabled: weight={pixel_loss_weight}, type={pixel_loss_type}, start_step={pixel_loss_start_step}")
+        if not HAS_MS_SSIM and pixel_loss_type in ["ms_ssim", "combined"]:
+            accelerator.print(f"  ⚠️  Warning: MS-SSIM not available, will fallback to MSE")
     
     print(f"🚀 Starting training for {max_train_steps} steps...")
     
@@ -3697,6 +3774,13 @@ def main():
     elif prompt_dropout_prob > 0 and load_tensors:
         logger.warning("⚠️  Prompt dropout is not supported in load_tensors mode (text_encoder not available)")
 
+    # Free up memory by deleting vae and text_encoder when using preprocessed tensors
+    if load_tensors:
+        del vae, text_encoder
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize(accelerator.device)
+
     # Training loop - epoch based (like original CogVideoX)
     transformer.train()
 
@@ -3720,12 +3804,91 @@ def main():
                 image_goal = batch.get("image_goal")  # For planning mode (future use)
                 
                 # Process condition videos once for all pipelines
-                
                 split_hands = data_config.get("split_hands", False)
-                hand_videos_latents, static_videos_latents, smpl_pos_map_latents = _process_condition_videos(
-                    hand_videos, static_videos, smpl_pos_map, vae, VAE_SCALING_FACTOR, 
-                    accelerator.device, weight_dtype, load_tensors, split_hands
-                )
+                
+                if load_tensors:
+                    # When load_tensors=True, VAE is already deleted and videos are already latents
+                    # Dataset returns latents in [C, F, H, W] format, collate_fn makes [B, C, F, H, W]
+                    # Stored latents are distribution parameters (mean and logvar), need to sample
+                    
+                    # Process hand videos (already latents)
+                    if hand_videos is not None:
+                        hand_videos = hand_videos.to(device=accelerator.device, dtype=weight_dtype)
+                        # Already latents: [B, C, F, H, W] format (distribution parameters)
+                        
+                        if split_hands:
+                            # Split hands mode: hand_videos has doubled channels (left + right)
+                            # Split into left and right hand latents
+                            batch_size, channels, frames, height, width = hand_videos.shape
+                            half_channels = channels // 2
+                            
+                            hand_left = hand_videos[:, :half_channels, :, :, :]  # [B, C/2, F, H, W]
+                            hand_right = hand_videos[:, half_channels:, :, :, :]  # [B, C/2, F, H, W]
+                            
+                            # Sample from distribution separately
+                            hand_left_latent_dist = DiagonalGaussianDistribution(hand_left)
+                            hand_left_latents = hand_left_latent_dist.sample() * VAE_SCALING_FACTOR
+                            
+                            hand_right_latent_dist = DiagonalGaussianDistribution(hand_right)
+                            hand_right_latents = hand_right_latent_dist.sample() * VAE_SCALING_FACTOR
+                            
+                            # Concatenate along channel dimension
+                            hand_videos_latents = torch.cat([hand_left_latents, hand_right_latents], dim=1)  # [B, C1+C2, F, H, W]
+                        else:
+                            # Regular mode: sample from distribution (same as _process_condition_videos)
+                            hand_latent_dist = DiagonalGaussianDistribution(hand_videos)
+                            hand_videos_latents = hand_latent_dist.sample() * VAE_SCALING_FACTOR
+                        
+                        # Convert to [B, F, C, H, W] format
+                        hand_videos_latents = hand_videos_latents.permute(0, 2, 1, 3, 4)  # [B, F, C, H, W]
+                        hand_videos_latents = hand_videos_latents.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
+                    else:
+                        hand_videos_latents = None
+                    
+                    # Process static videos (already latents)
+                    if static_videos is not None:
+                        static_videos = static_videos.to(device=accelerator.device, dtype=weight_dtype)
+                        # Already latents: [B, C, F, H, W] format (distribution parameters)
+                        # Sample from distribution (same as _process_condition_videos)
+                        static_latent_dist = DiagonalGaussianDistribution(static_videos)
+                        static_videos_latents = static_latent_dist.sample() * VAE_SCALING_FACTOR
+                        static_videos_latents = static_videos_latents.permute(0, 2, 1, 3, 4)  # [B, F, C, H, W]
+                        static_videos_latents = static_videos_latents.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
+                    else:
+                        static_videos_latents = None
+                    
+                    # Process SMPL pos map (already processed)
+                    if smpl_pos_map is not None:
+                        smpl_pos_map_latents = smpl_pos_map.to(device=accelerator.device, dtype=weight_dtype)
+                        if smpl_pos_map_latents.ndim == 4:  # [F, C, H, W] -> add batch dim
+                            smpl_pos_map_latents = smpl_pos_map_latents.unsqueeze(0)  # [1, F, C, H, W]
+                        smpl_pos_map_latents = smpl_pos_map_latents.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
+                    else:
+                        smpl_pos_map_latents = None
+                else:
+                    # When load_tensors=False, VAE is available for encoding
+                    hand_videos_latents, static_videos_latents, smpl_pos_map_latents = _process_condition_videos(
+                        hand_videos, static_videos, smpl_pos_map, vae, VAE_SCALING_FACTOR, 
+                        accelerator.device, weight_dtype, load_tensors, split_hands
+                    )
+                
+                # Apply hand dropout for classifier-free guidance training (helps prevent color drift)
+                # This should be applied to hand_videos_latents directly since some pipelines use it directly
+                if hand_videos_latents is not None and hand_dropout_prob > 0:
+                    # Get batch size from hand_videos_latents shape
+                    hand_batch_size = hand_videos_latents.shape[0]
+                    # Sample dropout mask: each sample in batch has independent dropout probability
+                    dropout_mask = torch.rand(hand_batch_size, device=accelerator.device) < hand_dropout_prob
+                    
+                    if dropout_mask.any():
+                        # Zero out hand latents for dropped samples
+                        # hand_videos_latents shape: [B, F, C, H, W]
+                        hand_videos_latents[dropout_mask] = torch.zeros_like(hand_videos_latents[dropout_mask])
+                        
+                        # Log dropout statistics (only occasionally to avoid spam)
+                        if global_step % 100 == 0:
+                            num_dropped = dropout_mask.sum().item()
+                            logs["hand_dropout_count"] = num_dropped
                 
                 # Apply condition blur augmentation for robustness to degraded Gaussian rendering
                 condition_blur_prob = training_config.get("condition_blur_prob", 0.0)
@@ -3741,7 +3904,7 @@ def main():
                         logs["condition_blur_applied"] = 1
 
                 # Encode videos
-                if not training_config.get("custom_settings", {}).get("load_tensors", False):
+                if not load_tensors:
                     videos = videos.permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
                     with torch.no_grad():
                         latent_dist = vae.encode(videos).latent_dist
@@ -3754,6 +3917,7 @@ def main():
                 model_input = videos
 
                 # Use already processed condition videos from _process_condition_videos
+                # Note: hand_dropout is already applied to hand_videos_latents above
                 if hand_videos_latents is not None:
                     hand_videos = hand_videos_latents.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
                 else:
@@ -4273,11 +4437,65 @@ def main():
 
                 target = model_input
 
-                loss = torch.mean(
+                # Compute latent space loss (standard velocity matching)
+                latent_loss = torch.mean(
                     (weights * (model_pred - target) ** 2).reshape(batch_size, -1),
                     dim=1,
                 )
-                loss = loss.mean()
+                latent_loss = latent_loss.mean()
+                
+                # Compute pixel space loss if enabled
+                use_pixel_loss = training_config.get("use_pixel_loss", False)
+                pixel_loss_weight = training_config.get("pixel_loss_weight", 0.1)
+                pixel_loss_type = training_config.get("pixel_loss_type", "ms_ssim")
+                pixel_loss_start_step = training_config.get("pixel_loss_start_step", 0)
+                
+                if use_pixel_loss and global_step >= pixel_loss_start_step and "raw_video" in batch and batch["raw_video"] is not None:
+                    # Note: model_pred is already the predicted clean latent z_0
+                    # (scheduler.get_velocity returns denoised latent, not velocity!)
+                    pred_z0 = model_pred
+                    
+                    # 1. VAE decode to pixel space
+                    with torch.cuda.amp.autocast(enabled=False):  # Use full precision for VAE
+                        # Scale and permute for VAE: [B, F, C, H, W] -> [B, C, F, H, W]
+                        pred_z0_scaled = pred_z0 / VAE_SCALING_FACTOR
+                        pred_z0_scaled = pred_z0_scaled.permute(0, 2, 1, 3, 4)
+                        
+                        # Decode with frozen VAE (memory efficient)
+                        with torch.no_grad():
+                            pred_x0 = vae.decode(pred_z0_scaled.to(dtype=vae.dtype)).sample
+                        
+                        # Convert back: [B, C, F, H, W] -> [B, F, C, H, W]
+                        pred_x0 = pred_x0.permute(0, 2, 1, 3, 4)
+                    
+                    # 2. Normalize to [0, 1] range
+                    pred_x0 = (pred_x0 + 1.0) / 2.0  # [-1, 1] -> [0, 1]
+                    pred_x0 = torch.clamp(pred_x0, 0.0, 1.0)
+                    
+                    # 3. Get target video (already in [0, 1] from dataset)
+                    target_x0 = batch["raw_video"].to(device=accelerator.device, dtype=weight_dtype)
+                    
+                    # 4. Compute pixel loss
+                    try:
+                        pixel_loss = compute_pixel_loss(pred_x0, target_x0, loss_type=pixel_loss_type)
+                        
+                        # 5. Combined loss
+                        total_loss = latent_loss + pixel_loss_weight * pixel_loss
+                        
+                        # Log pixel loss components
+                        logs.update({
+                            "latent_loss": latent_loss.detach().item(),
+                            "pixel_loss": pixel_loss.detach().item(),
+                            "pixel_loss_weighted": (pixel_loss_weight * pixel_loss).detach().item(),
+                        })
+                        
+                        loss = total_loss
+                    except Exception as e:
+                        logger.warning(f"Failed to compute pixel loss at step {global_step}: {e}")
+                        loss = latent_loss
+                else:
+                    loss = latent_loss
+                
                 accelerator.backward(loss)
 
                 if accelerator.sync_gradients and accelerator.distributed_type != DistributedType.DEEPSPEED:

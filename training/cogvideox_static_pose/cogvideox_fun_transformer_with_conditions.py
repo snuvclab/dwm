@@ -2172,10 +2172,13 @@ class CogVideoXFunTransformer3DModelWithAdapter(CogVideoXFunTransformer3DModel):
     3. Uses CogVideoXPatchEmbedWithAdapter for conditional processing
     """
     
-    def __init__(self, *args, condition_channels: int = 0, adapter_version: str = "v1", use_enhanced_processing: bool = False, **kwargs):
+    def __init__(self, *args, condition_channels: int = 0, 
+                 adapter_version: str = "v1", use_enhanced_processing: bool = False, 
+                 use_zero_proj: bool = False, **kwargs):
         self.add_noise_in_inpaint_model = kwargs.pop("add_noise_in_inpaint_model", False)
         self.adapter_version = adapter_version
         self.use_enhanced_processing = use_enhanced_processing
+        self.use_zero_proj = use_zero_proj
         super().__init__(*args, **kwargs)
         
         # Replace patch_embed with adapter version if condition_channels > 0
@@ -2229,6 +2232,9 @@ class CogVideoXFunTransformer3DModelWithAdapter(CogVideoXFunTransformer3DModel):
             'sample_frames': getattr(current_patch_embed, 'sample_frames', None),
             'temporal_compression_ratio': getattr(current_patch_embed, 'temporal_compression_ratio', 1),
         }
+
+        if adapter_version == "v1":
+            adapter_kwargs['use_zero_proj'] = self.use_zero_proj
         
         # Add enhanced processing flag for V3 and V4 adapters
         if adapter_version in ["v3", "v4"]:
@@ -2293,6 +2299,7 @@ class CogVideoXFunTransformer3DModelWithAdapter(CogVideoXFunTransformer3DModel):
         subfolder="transformer",
         condition_channels: Optional[int] = None,
         adapter_version: str = "v1",
+        use_zero_proj: bool = False,
         use_enhanced_processing: bool = False,
         **kwargs
     ):
@@ -2320,7 +2327,7 @@ class CogVideoXFunTransformer3DModelWithAdapter(CogVideoXFunTransformer3DModel):
                 # Use base config
                 if condition_channels is None:
                     condition_channels = 16  # default
-                model = cls(condition_channels=condition_channels, adapter_version=adapter_version)
+                model = cls(condition_channels=condition_channels, adapter_version=adapter_version, use_zero_proj=use_zero_proj)
 
             # 2) Load checkpoint state_dict directly
             # Try to find all safetensors files first
@@ -2378,7 +2385,10 @@ class CogVideoXFunTransformer3DModelWithAdapter(CogVideoXFunTransformer3DModel):
                 condition_channels = getattr(base_model.config, "condition_channels", 16)
 
             # Create extended model
-            model = cls(**base_model.config, condition_channels=condition_channels, adapter_version=adapter_version, use_enhanced_processing=use_enhanced_processing)
+            model = cls(**base_model.config, condition_channels=condition_channels, 
+                        adapter_version=adapter_version, 
+                        use_enhanced_processing=use_enhanced_processing, 
+                        use_zero_proj=use_zero_proj)
 
             # Load base weights into extended model
             missing, unexpected = model.load_state_dict(base_model.state_dict(), strict=False)
@@ -2398,6 +2408,7 @@ class CogVideoXFunTransformer3DModelWithAdapter(CogVideoXFunTransformer3DModel):
             "adapter_version": getattr(self, 'adapter_version', 'v1'),
             "total_input_channels": self.patch_embed.proj.in_channels,
             "base_channels": getattr(self, 'original_in_channels', self.patch_embed.proj.in_channels),
+            "use_zero_proj": getattr(self, 'use_zero_proj', False),
         }
         return info
     
@@ -2465,10 +2476,6 @@ class CogVideoXFunTransformer3DModelWithAdapter(CogVideoXFunTransformer3DModel):
         # Handle VideoX-Fun specific inputs
         if inpaint_latents is not None:
             hidden_states = torch.concat([hidden_states, inpaint_latents], 2)
-        
-        if self.adapter_version == "v1" and control_latents is not None:
-            # concat control latents if not using adapter
-            hidden_states = torch.concat([hidden_states, control_latents], 2)
 
         # 2. Patch embedding with adapter support
         patch_embed_input = {'text_embeds': encoder_hidden_states, 

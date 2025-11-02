@@ -100,6 +100,8 @@ def load_rendering_status_report(report_path=None, script_path=None):
         script_name = os.path.basename(script_path) if script_path else ""
         if script_name in ['blender_ego_static.py']:
             report_file = "rendering_status_report_static.json"
+        elif script_name in ['blender_ego_static_depth.py']:
+            report_file = "rendering_status_report_static_depth.json"
         elif script_name in ['blender_ego_hand.py']:
             report_file = "rendering_status_report_hands.json"
         else:
@@ -217,6 +219,9 @@ def check_already_rendered(blend_file, save_path, status_report=None, script_pat
         if script_name in ['blender_ego_static.py']:
             is_video_output = True
             video_type = "static"
+        elif script_name in ['blender_ego_static_depth.py']:
+            is_video_output = True
+            video_type = "static_depth"
         elif script_name in ['blender_ego_hand.py']:
             is_video_output = True
             video_type = "hands"
@@ -322,6 +327,8 @@ def check_already_rendered(blend_file, save_path, status_report=None, script_pat
                     # Check for video files based on script type
                     if script_path and 'blender_ego_static.py' in script_path:
                         videos_path = os.path.join(sequences_path, "videos_static")
+                    elif script_path and 'blender_ego_static_depth.py' in script_path:
+                        videos_path = os.path.join(sequences_path, "depth_static")
                     elif script_path and 'blender_ego_hand.py' in script_path:
                         # Use different path based on grayscale and separate options
                         if grayscale and separate:
@@ -332,7 +339,7 @@ def check_already_rendered(blend_file, save_path, status_report=None, script_pat
                         elif grayscale:
                             videos_path = os.path.join(sequences_path, "videos_hands_gray")
                         else:
-                            videos_path = os.path.join(sequences_path, "videos_hands")
+                            videos_path = os.path.join(sequences_path, "videos_hands_new2")
                     else:
                         videos_path = sequences_path
                     
@@ -347,12 +354,14 @@ def check_already_rendered(blend_file, save_path, status_report=None, script_pat
                             if os.path.exists(videos_path_right):
                                 right_videos = len([f for f in os.listdir(videos_path_right) if f.endswith('.mp4')])
                             video_files = min(left_videos, right_videos)  # Complete only if both have same count
+                        elif script_path and 'blender_ego_static_depth.py' in script_path:
+                            video_files = len([f for f in os.listdir(videos_path) if f.endswith('.exr')])
                         else:
                             # Normal mode: count videos in single folder
                             video_files = len([f for f in os.listdir(videos_path) if f.endswith('.mp4')])
                         
                         # Get expected video count for this specific animation
-                        if script_path and 'blender_ego_static.py' in script_path:
+                        if script_path and ('blender_ego_static.py' in script_path or 'blender_ego_static_depth.py' in script_path):
                             video_type = "static"
                         elif script_path and 'blender_ego_hand.py' in script_path:
                             video_type = "hands"
@@ -645,6 +654,9 @@ def main():
         # Provide helpful guidance based on script type
         script_name = os.path.basename(args.script_path)
         if script_name in ['blender_ego_static.py']:
+            print(f"💡 To generate a status report for {script_name}, run:")
+            print(f"   python check_video_rendering_status.py --video-type static --stride 25 --clip-length 49")
+        elif script_name in ['blender_ego_static_depth.py']:
             print(f"💡 To generate a status report for {script_name}, run:")
             print(f"   python check_video_rendering_status.py --video-type static --stride 25 --clip-length 49")
         elif script_name in ['blender_ego_hand.py']:
@@ -1150,8 +1162,8 @@ def main():
             cmd.extend(["--width", str(args.width)])
             cmd.extend(["--height", str(args.height)])
         
-        # Add samples option if specified and using blender_ego_rgb_depth_optimized.py
-        if 'blender_ego_rgb_depth_optimized.py' in args.script_path or 'blender_ego_static.py' in args.script_path:
+        # Add samples option if specified and using scripts that accept it
+        if ('blender_ego_rgb_depth_optimized.py' in args.script_path) or ('blender_ego_static.py' in args.script_path):
             cmd.extend(["--samples", str(args.samples)])
         
         # Add no-depth option if specified and using blender_ego_rgb_depth_optimized.py

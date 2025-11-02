@@ -1059,6 +1059,7 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
                         condition_channels=None, 
                         use_adapter=False,
                         adapter_version="v1",
+                        use_zero_proj=False,
                         split_hands=False,
                         compress_smpl_pos_map_temporal=False,
                         add_control_adapter=False,
@@ -1078,6 +1079,7 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
             condition_channels: Number of condition channels (0 or None for base model, >0 for concat model)
             use_adapter: Whether to use adapter-based transformer
             adapter_version: Version of adapter to use ("v1" or "v2")
+            use_zero_proj: Whether to use zero projection for adapter
         """
         # Check if this is a base model path (for creating pose-conditioned pipeline)
         if base_model_name_or_path is not None:
@@ -1100,6 +1102,7 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
                         subfolder="transformer",
                         condition_channels=condition_channels,
                         adapter_version=adapter_version,
+                        use_zero_proj=use_zero_proj,
                         torch_dtype=kwargs.get("torch_dtype", torch.bfloat16),
                         revision=kwargs.get("revision", None),
                         variant=kwargs.get("variant", None),
