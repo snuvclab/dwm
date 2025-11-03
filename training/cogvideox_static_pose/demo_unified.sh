@@ -11,9 +11,9 @@ PIPELINE_TYPE=""
 EXPERIMENT_CONFIG=""
 CHECKPOINT_PATH=""
 DATASET_FILE=""
-DATA_ROOT="./data"
+DATA_ROOT="/virtual_lab/jhb_vclab/world_model/data"
 OUTPUT_DIR=""
-EVAL_SUBFOLDER="eval"
+EVAL_SUBFOLDER="test_selected_50"
 NUM_GPUS=1
 GPU_IDS=""
 
