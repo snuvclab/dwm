@@ -42,3 +42,8 @@ pip install gsplat
 bash tests/gsplat/get_static.sh --vrs_file "path/to/file.vrs" --num_frames "frame_num"
 ```
 
+
+To check the frame index for frame_num, run
+```bash
+python data_processing/aria/1_get_images_and_cameras.py --data_root <vrs_dir> #path to directory, not vrs file
+```
