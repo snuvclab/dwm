@@ -213,7 +213,8 @@ class VideoDataset(Dataset):
             )
 
         with open(video_path, "r", encoding="utf-8") as file:
-            video_paths = [self.data_root.joinpath(line.strip()) for line in file.readlines() if len(line.strip()) > 0]
+            # video_paths = [self.data_root.joinpath(line.strip()) for line in file.readlines() if len(line.strip()) > 0]
+            video_paths = [self.data_root.parent.joinpath("processed2").joinpath(line.strip()) for line in file.readlines() if len(line.strip()) > 0]
 
         # Derive prompt paths from video paths using configurable prompt_subdir
         prompt_paths = [path.parent.parent.joinpath(self.prompt_subdir, path.name.replace(".mp4", ".txt")) for path in video_paths]
@@ -441,6 +442,12 @@ class VideoDatasetWithConditions(VideoDataset):
         
         self.static_video_paths = self._derive_condition_video_paths("videos_static")
         
+        # Derive warped videos paths
+        self.warped_video_paths = self._derive_condition_video_paths("warped_videos")
+        
+        # Derive warped mask videos paths
+        self.warped_mask_video_paths = self._derive_condition_video_paths("warped_mask_videos")
+        
         # Derive SMPL pos map paths if enabled
         if self.use_smpl_pos_map:
             self.smpl_pos_map_paths = self._derive_condition_video_paths("smpl_pos_map_egoallo")
@@ -474,6 +481,14 @@ class VideoDatasetWithConditions(VideoDataset):
                 missing_static_videos = [path for path in self.static_video_paths if not path.is_file()]
                 raise ValueError(
                     f"Some static video files are missing. First few missing files: {missing_static_videos[:5]}"
+                )
+            
+            # Validate warped videos if they exist (optional, so just warn)
+            if any(not path.is_file() for path in self.warped_video_paths):
+                missing_warped_videos = [path for path in self.warped_video_paths if not path.is_file()]
+                logger.warning(
+                    f"Some warped video files are missing. First few missing files: {missing_warped_videos[:5]}. "
+                    f"Warped videos are optional."
                 )
             
             # Validate SMPL pos map videos if enabled
@@ -546,6 +561,34 @@ class VideoDatasetWithConditions(VideoDataset):
             except Exception as e:
                 logger.warning(f"Failed to load static video latents for index {index}: {e}")
                 main_data["static_videos"] = None
+            
+            # Load warped videos if available
+            try:
+                warped_video_latents = self._load_condition_video_latents_or_encode(self.warped_video_paths[index], "warped_video_latents")
+                main_data["warped_videos"] = warped_video_latents
+            except Exception as e:
+                logger.warning(f"Failed to load warped video latents for index {index}: {e}")
+                main_data["warped_videos"] = None
+            
+            # Load warped mask videos if available (always as raw video, no latents)
+            # Note: warped_mask doesn't have latents, always load as raw video even when load_tensors=True
+            try:
+                # Always load as raw video, bypassing _preprocess_video to avoid latent lookup
+                video_reader = decord.VideoReader(uri=self.warped_mask_video_paths[index].as_posix())
+                video_num_frames = len(video_reader)
+                
+                # Calculate step, ensuring it's at least 1 to avoid "range() arg 3 must be zero" error
+                step = max(1, video_num_frames // self.max_num_frames)
+                indices = list(range(0, video_num_frames, step))
+                frames = video_reader.get_batch(indices)
+                frames = frames[: self.max_num_frames].float()
+                frames = frames.permute(0, 3, 1, 2).contiguous()
+                frames = torch.stack([self.video_transforms(frame) for frame in frames], dim=0)
+                
+                main_data["warped_masks"] = frames
+            except Exception as e:
+                logger.warning(f"Failed to load warped mask video for index {index}: {e}")
+                main_data["warped_masks"] = None
             
             # Load SMPL pos map if enabled
             if self.use_smpl_pos_map:
@@ -633,6 +676,23 @@ class VideoDatasetWithConditions(VideoDataset):
             except Exception as e:
                 logger.warning(f"Failed to load static video for index {index}: {e}")
                 main_data["static_videos"] = None
+            
+            # Load warped videos if available (raw mode)
+            try:
+                _, warped_video, _ = self._preprocess_video(self.warped_video_paths[index])
+                main_data["warped_videos"] = warped_video
+            except Exception as e:
+                logger.warning(f"Failed to load warped video for index {index}: {e}")
+                main_data["warped_videos"] = None
+            
+            # Load warped mask videos if available (raw mode)
+            # Note: warped_mask doesn't have latents, always load as raw video
+            try:
+                _, warped_mask, _ = self._preprocess_video(self.warped_mask_video_paths[index])
+                main_data["warped_masks"] = warped_mask
+            except Exception as e:
+                logger.warning(f"Failed to load warped mask video for index {index}: {e}")
+                main_data["warped_masks"] = None
             
             # Load SMPL pos map if enabled
             if self.use_smpl_pos_map:
