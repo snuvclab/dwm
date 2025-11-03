@@ -92,28 +92,28 @@ scheduler = CogVideoXDPMScheduler.from_pretrained(
     subfolder="scheduler"
 )
 
-# proj_path = os.path.join(lora_path, "projection_layer_weights.pt")
+proj_path = os.path.join(lora_path, "projection_layer_weights.pt")
 non_lora_file = os.path.join(lora_path, "non_lora_weights.pt")
-proj_path = non_lora_file
+# proj_path = non_lora_file
 
-if os.path.exists(proj_path) or os.path.exists(non_lora_file):
-    with torch.no_grad():
-        new_conv_in = torch.nn.Conv2d( # 1 for object mask
-            transformer.patch_embed.proj.in_channels + 16, transformer.patch_embed.proj.out_channels, \
-                transformer.patch_embed.proj.kernel_size, transformer.patch_embed.proj.stride, transformer.patch_embed.proj.padding
-        )
-        transformer.patch_embed.proj = new_conv_in
-    proj_dict = torch.load(proj_path, map_location="cpu")
-    proj_dict['weight'] = proj_dict['patch_embed.proj.weight']
-    proj_dict['bias'] = proj_dict['patch_embed.proj.bias']
-    model_state_dict = transformer.patch_embed.proj.state_dict()
-    loaded_keys = []
-    for name, param_data in proj_dict.items():
-        if name in model_state_dict:
-            model_state_dict[name].copy_(param_data)
-            loaded_keys.append(name)
-    # transformer.patch_embed.proj.load_state_dict(torch.load(proj_path, weights_only=True))
-    transformer.patch_embed.proj.to(dtype=torch.bfloat16, device="cuda")
+# if os.path.exists(proj_path) or os.path.exists(non_lora_file):
+#     with torch.no_grad():
+#         new_conv_in = torch.nn.Conv2d( # 1 for object mask
+#             transformer.patch_embed.proj.in_channels + 16, transformer.patch_embed.proj.out_channels, \
+#                 transformer.patch_embed.proj.kernel_size, transformer.patch_embed.proj.stride, transformer.patch_embed.proj.padding
+#         )
+#         transformer.patch_embed.proj = new_conv_in
+#     proj_dict = torch.load(proj_path, map_location="cpu")
+#     proj_dict['weight'] = proj_dict['patch_embed.proj.weight']
+#     proj_dict['bias'] = proj_dict['patch_embed.proj.bias']
+#     model_state_dict = transformer.patch_embed.proj.state_dict()
+#     loaded_keys = []
+#     for name, param_data in proj_dict.items():
+#         if name in model_state_dict:
+#             model_state_dict[name].copy_(param_data)
+#             loaded_keys.append(name)
+#     # transformer.patch_embed.proj.load_state_dict(torch.load(proj_path, weights_only=True))
+#     transformer.patch_embed.proj.to(dtype=torch.bfloat16, device="cuda")
 
 
 # Add LoRA to attention layers (same config as training)
@@ -189,7 +189,7 @@ for validation_video in validation_video_list:
 
     input_video_mask = torch.zeros_like(input_video[:, :1])
 
-    if proj_path is not None:
+    if os.path.exists(proj_path):
         # hand_video = iio.imread(os.path.join("/virtual_lab/jhb_vclab/world_model/data", hand_video_path)).astype(np.float32) / 255.0
         # hand_video = hand_video.transpose(3, 0, 1, 2)  # [F, H, W, C] -> [C, F, H, W]
         # hand_video = hand_video[np.newaxis, :]  # Add batch dimension: [C, F, H, W] -> [1, C, F, H, W]
