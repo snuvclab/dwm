@@ -110,6 +110,10 @@ def setup_lora_adapter(transformer, config: Dict[str, Any]):
 
 def load_checkpoint_with_config(pipeline, checkpoint_path: str, config: Dict[str, Any]):
     """Load checkpoint based on training mode from config."""
+    # Allow running from base model without a checkpoint
+    if checkpoint_path is None or str(checkpoint_path).strip() == "":
+        logger.info("ℹ️  No checkpoint_path provided. Skipping checkpoint loading and using base model weights.")
+        return
     training_mode = config.get("training", {}).get("mode", "full")
     pipeline_type = config.get("pipeline", {}).get("type", "cogvideox_pose_concat")
     
@@ -154,6 +158,8 @@ def load_checkpoint_with_config(pipeline, checkpoint_path: str, config: Dict[str
                 if name in model_state_dict:
                     model_state_dict[name].copy_(param_data)
                     loaded_keys.append(name)
+                else:
+                    print(f"⚠️ {name} not found in model state dict")
             logger.info(f"✅ Loaded non-LoRA weights: {loaded_keys}")
         else:
             # Legacy support: Load projection layer weights if they exist
@@ -232,8 +238,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--checkpoint_path",
         type=str,
-        required=True,
-        help="Path to the trained checkpoint directory"
+        default=None,
+        help="Path to the trained checkpoint directory (optional; if omitted, base model weights are used)"
     )
     parser.add_argument(
         "--experiment_config",
@@ -246,14 +252,52 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset_file",
         type=str,
-        required=True,
-        help="Path to dataset file containing video paths"
+        default=None,
+        help="Path to dataset file containing video paths (optional if custom paths provided)"
     )
     parser.add_argument(
         "--data_root",
         type=str,
         default="./data",
         help="Root directory containing the dataset"
+    )
+    
+    # Custom paths (alternative to dataset_file)
+    parser.add_argument(
+        "--video_path",
+        type=str,
+        default=None,
+        help="Custom video path (alternative to dataset_file)"
+    )
+    parser.add_argument(
+        "--static_video_path",
+        type=str,
+        default=None,
+        help="Custom static video path"
+    )
+    parser.add_argument(
+        "--hand_video_path",
+        type=str,
+        default=None,
+        help="Custom hand video path"
+    )
+    parser.add_argument(
+        "--mask_video_path",
+        type=str,
+        default=None,
+        help="Custom mask video path"
+    )
+    parser.add_argument(
+        "--prompt",
+        type=str,
+        default="",
+        help="Custom text prompt (alternative to reading from file)"
+    )
+    parser.add_argument(
+        "--prompt_file",
+        type=str,
+        default=None,
+        help="Custom prompt file path"
     )
     parser.add_argument(
         "--output_dir",
@@ -374,6 +418,12 @@ def parse_args() -> argparse.Namespace:
         default=False,
         help="Enable verbose logging"
     )
+    parser.add_argument(
+        "--suffix",
+        type=str,
+        default="",
+        help="Suffix to append to output filenames (e.g., '_no_prompt', '_cfg7.5')"
+    )
 
     return parser.parse_args()
 
@@ -404,7 +454,7 @@ def build_pipeline(args: argparse.Namespace, config: Dict[str, Any]):
     logger.info(f"🔧 Training mode: {training_mode}")
     
     # Get base model path from config
-    base_model_path = config.get("model", {}).get("base_model_name_or_path", "THUDM/CogVideoX-5b")
+    base_model_path = config.get("model", {}).get("base_model_name_or_path", "alibaba-pai/CogVideoX-Fun-V1.1-5b-InP")
     logger.info(f"🔧 Base model: {base_model_path}")
     
     # Determine weight dtype based on model size (same logic as training script)
@@ -597,8 +647,48 @@ def compute_video_metrics(generated_video, gt_video, psnr, ssim, lpips):
     }
 
 
-def find_files_by_path(data_root: Path, video_path: str) -> dict:
-    """Find all related files for a given video path."""
+def find_files_by_path(data_root: Path, video_path: str, custom_paths: Optional[dict] = None, config: Optional[Dict[str, Any]] = None) -> dict:
+    """Find all related files for a given video path or use custom paths.
+    
+    Args:
+        data_root: Root directory for data
+        video_path: Relative video path (used for auto-derivation if custom_paths not provided)
+        custom_paths: Optional dict with custom paths:
+            - video: Custom GT video path
+            - static_video: Custom static video path
+            - hand_video: Custom hand video path
+            - mask_video: Custom mask video path
+            - prompt: Custom prompt text or prompt file path
+            - human_motions: Custom human motions file path
+        config: Optional config dict to read prompt_subdir and hand_video_subdir
+    
+    Returns:
+        dict with file paths for video, static_video, hand_video, mask_video, prompt, human_motions
+    """
+    # Use custom paths if provided
+    if custom_paths:
+        logger.info("🔧 Using custom paths instead of auto-derivation")
+        files = {
+            'video': custom_paths.get('video'),
+            'static_video': custom_paths.get('static_video'),
+            'hand_video': custom_paths.get('hand_video'),
+            'mask_video': custom_paths.get('mask_video'),
+            'prompt': custom_paths.get('prompt'),
+            'human_motions': custom_paths.get('human_motions'),
+        }
+        
+        # Check if files exist and print status
+        for file_type, file_path in files.items():
+            if file_path and Path(file_path).exists():
+                logger.info(f"✅ Custom {file_type}: {file_path}")
+            elif file_path:
+                logger.warning(f"⚠️  Custom {file_type} not found: {file_path}")
+            else:
+                logger.debug(f"ℹ️  Custom {file_type} not provided")
+        
+        return files
+    
+    # Auto-derive paths from video_path (existing behavior)
     files = {}
     
     # Get base path from video_path parent directory
@@ -608,17 +698,24 @@ def find_files_by_path(data_root: Path, video_path: str) -> dict:
     video_name = video_path_obj.stem
     base_path = data_root / video_path_obj.parent.parent  # videos/ -> processed2/
     
+    # Read prompt_subdir and hand_video_subdir from config (with defaults)
+    data_config = config.get("data", {}) if config else {}
+    prompt_subdir = data_config.get("prompt_subdir", "prompts")
+    hand_video_subdir = data_config.get("hand_video_subdir", "videos_hands")
+    
     # Define file paths based on pipeline type
     video_file = base_path / 'videos' / f"{video_name}.mp4"
     static_video_file = base_path / 'videos_static' / f"{video_name}.mp4"
-    hand_video_file = base_path / 'videos_hands' / f"{video_name}.mp4"
-    prompt_file = base_path / 'prompts' / f"{video_name}.txt"
+    hand_video_file = base_path / hand_video_subdir / f"{video_name}.mp4"
+    mask_video_file = base_path / 'warped_mask_videos' / 'mask_video.mp4'  # Fixed filename for mask
+    prompt_file = base_path / prompt_subdir / f"{video_name}.txt"
     human_motions_file = base_path / 'human_motions' / f"{video_name}.pt"
     
     files = {
         'video': str(video_file),
         'static_video': str(static_video_file),
         'hand_video': str(hand_video_file),
+        'mask_video': str(mask_video_file),
         'prompt': str(prompt_file),
         'human_motions': str(human_motions_file),
     }
@@ -642,8 +739,21 @@ def run_single_inference(args, pipeline, video_path, output_dir, psnr, ssim, lpi
     # Get pipeline type from config
     pipeline_type = args.pipeline_type or config.get("pipeline", {}).get("type", "cogvideox_pose_concat")
     
-    # Find related files
-    files = find_files_by_path(Path(args.data_root), video_path)
+    # Prepare custom paths if provided
+    custom_paths = None
+    if args.video_path is not None:
+        # Custom paths mode
+        custom_paths = {
+            'video': args.video_path,  # GT video for metrics
+            'static_video': args.static_video_path,
+            'hand_video': args.hand_video_path,
+            'mask_video': args.mask_video_path,
+            'prompt': args.prompt_file or args.prompt,  # Prompt file or text
+            'human_motions': None,  # Not supported yet via args
+        }
+    
+    # Find related files (auto-derive or use custom paths)
+    files = find_files_by_path(Path(args.data_root), video_path, custom_paths=custom_paths, config=config)
     
     # Load required data based on pipeline type
     if pipeline_type == "cogvideox_i2v":
@@ -727,9 +837,15 @@ def run_single_inference(args, pipeline, video_path, output_dir, psnr, ssim, lpi
         hand_video = hand_video.transpose(3, 0, 1, 2)  # [F, H, W, C] -> [C, F, H, W]
         hand_video = hand_video[np.newaxis, :]  # Add batch dimension: [C, F, H, W] -> [1, C, F, H, W]
         
+        mask_video = None
+        if files['mask_video'] is not None:
+            mask_video = 1 - iio.imread(files['mask_video']).astype(np.float32) / 255.0
+            mask_video = mask_video.transpose(3, 0, 1, 2)  # [F, H, W, C] -> [C, F, H, W]
+            mask_video = mask_video[np.newaxis, :]  # Add batch dimension: [C, F, H, W] -> [1, C, F, H, W]
         pipeline_args = {
             "static_videos": static_video,
             "hand_pose_videos": hand_video,
+            "mask_video": mask_video,
             "prompt": "",
             "height": args.height,
             "width": args.width,
@@ -754,10 +870,16 @@ def run_single_inference(args, pipeline, video_path, output_dir, psnr, ssim, lpi
         hand_video = hand_video.transpose(3, 0, 1, 2)  # [F, H, W, C] -> [C, F, H, W]
         hand_video = hand_video[np.newaxis, :]  # Add batch dimension: [C, F, H, W] -> [1, C, F, H, W]
         
+        mask_video = None
+        if files['mask_video'] is not None:
+            mask_video = 1 - iio.imread(files['mask_video']).astype(np.float32) / 255.0
+            mask_video = mask_video.transpose(3, 0, 1, 2)  # [F, H, W, C] -> [C, F, H, W]
+            mask_video = mask_video[np.newaxis, :]  # Add batch dimension: [C, F, H, W] -> [1, C, F, H, W]
         pipeline_args = {
             "static_videos": static_video,
             "hand_videos": hand_video,
             "prompt": "",
+            "mask_video": mask_video,
             "height": args.height,
             "width": args.width,
             "num_frames": args.num_frames,
@@ -849,9 +971,15 @@ def run_single_inference(args, pipeline, video_path, output_dir, psnr, ssim, lpi
     
     # Load prompt if available
     if files['prompt'] is not None and not args.use_empty_prompts:
-        with open(files['prompt'], 'r') as f:
-            prompt_text = f.read().strip()
-        pipeline_args["prompt"] = prompt_text
+        # Check if files['prompt'] is a file path or direct text
+        if Path(files['prompt']).exists() and Path(files['prompt']).is_file():
+            # It's a file path
+            with open(files['prompt'], 'r') as f:
+                prompt_text = f.read().strip()
+            pipeline_args["prompt"] = prompt_text
+        else:
+            # It's direct text (from --prompt argument)
+            pipeline_args["prompt"] = files['prompt']
     
     # Generate video
     generator = torch.Generator(device=device).manual_seed(args.seed)
@@ -916,6 +1044,10 @@ def save_inference_outputs(args, video_path, generated_video, gt_video, files, m
     
     base_name = f"{scene_name}_{action_name}_{video_name}"
     
+    # Add suffix to base_name if provided
+    if args.suffix:
+        base_name = f"{base_name}{args.suffix}"
+    
     # Ensure videos have the same number of frames
     num_frames = min(len(generated_video), args.num_frames)
     generated_video = generated_video[:num_frames].numpy()
@@ -961,6 +1093,10 @@ def save_inference_outputs(args, video_path, generated_video, gt_video, files, m
     with open(result_filename, 'w') as f:
         json.dump(result_data, f, indent=2)
     logger.info(f"✅ Saved result metadata: {result_filename}")
+    
+    # Also add suffix info to result_data if provided
+    if args.suffix:
+        result_data["filename_suffix"] = args.suffix
 
 
 def run_batch_inference(args, pipeline, video_paths, output_dir, psnr, ssim, lpips, config):
@@ -1057,23 +1193,31 @@ def main():
             args.output_dir = str(Path(args.checkpoint_path) / args.eval_subfolder)
             logger.info(f"🔧 Auto-generated output directory: {args.output_dir}")
         
-        # Load dataset file
-        dataset_file = Path(args.dataset_file)
-        if not dataset_file.exists():
-            raise ValueError(f"Dataset file does not exist: {dataset_file}")
-        
-        with dataset_file.open('r') as f:
-            video_paths = [line.strip() for line in f if line.strip()]
-        
-        # Limit batch size if specified
-        if args.max_batch_size:
-            video_paths = video_paths[:args.max_batch_size]
+        # Load dataset file or use custom paths
+        if args.dataset_file is not None:
+            # Use dataset file
+            dataset_file = Path(args.dataset_file)
+            if not dataset_file.exists():
+                raise ValueError(f"Dataset file does not exist: {dataset_file}")
+            
+            with dataset_file.open('r') as f:
+                video_paths = [line.strip() for line in f if line.strip()]
+            
+            # Limit batch size if specified
+            if args.max_batch_size:
+                video_paths = video_paths[:args.max_batch_size]
+            
+            logger.info(f"📋 Processing {len(video_paths)} video paths from dataset file")
+        elif args.video_path is not None:
+            # Use custom single video path
+            video_paths = [args.video_path]
+            logger.info(f"📋 Processing single custom video path: {args.video_path}")
+        else:
+            raise ValueError("Either --dataset_file or --video_path must be provided")
         
         # Get pipeline type from config if not provided
         pipeline_type = args.pipeline_type or config.get("pipeline", {}).get("type", "cogvideox_pose_concat")
-                
 
-        logger.info(f"📋 Processing {len(video_paths)} video paths")
         logger.info(f"🎯 Pipeline: {pipeline_type}")
         logger.info(f"📁 Checkpoint: {args.checkpoint_path}")
         logger.info(f"📁 Output: {args.output_dir}")
