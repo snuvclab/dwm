@@ -2884,12 +2884,65 @@ def _apply_condition_flags(hand_videos, static_videos, conditions_config):
     return hand_videos, static_videos
 
 
-def _create_fun_mask_input(noisy_model_input, vae_scaling_factor=None):
-    """Create mask input for VideoX-Fun pipelines."""
-    if vae_scaling_factor is not None:
-        return torch.ones_like(noisy_model_input[:, :, :1]) * vae_scaling_factor
+def _create_fun_mask_input(noisy_model_input, vae_scaling_factor=None, warped_mask=None):
+    """Create mask input for VideoX-Fun pipelines.
+    
+    Args:
+        noisy_model_input: [B, F_latent, C, H_latent, W_latent] tensor (latent space)
+        vae_scaling_factor: Scaling factor for VAE (optional)
+        warped_mask: [B, F_pixel, C_mask, H_pixel, W_pixel] or [B, C_mask, F_pixel, H_pixel, W_pixel] mask tensor (optional)
+    
+    Returns:
+        mask_input: [B, F_latent, 1, H_latent, W_latent] tensor (matching noisy_model_input dimensions)
+    """
+    if warped_mask is not None:
+        # Use warped_mask: resize to latent size (temporal + spatial) and apply VAE scaling factor
+        # warped_mask could be in [B, F, C, H, W] or [B, C, F, H, W] format
+        if warped_mask.ndim == 5:
+            # Determine format by checking if second dimension matches frame count (unlikely to be channels)
+            if warped_mask.shape[1] > 10:  # Likely frames if > 10 (frames are typically 16+)
+                mask = warped_mask  # [B, F, C, H, W]
+            else:  # [B, C, F, H, W]
+                mask = warped_mask.permute(0, 2, 1, 3, 4)  # [B, F, C, H, W]
+        else:
+            raise ValueError(f"Unexpected warped_mask shape: {warped_mask.shape}")
+        
+        # If mask has multiple channels, take first channel
+        if mask.shape[2] > 1:
+            mask = mask[:, :, :1, :, :]  # Take first channel: [B, F_pixel, 1, H_pixel, W_pixel]
+        elif mask.shape[2] == 1:
+            mask = mask  # Already single channel: [B, F_pixel, 1, H_pixel, W_pixel]
+        
+        # Get target dimensions from noisy_model_input: [F_latent, H_latent, W_latent]
+        b_latent, f_latent, c_latent, h_latent, w_latent = noisy_model_input.shape
+        b_mask, f_pixel, c_mask, h_pixel, w_pixel = mask.shape
+        
+        # Resize mask to latent dimensions using trilinear interpolation (temporal + spatial)
+        # Convert to [B, C, F, H, W] format for F.interpolate (it expects channel first)
+        mask = mask.permute(0, 2, 1, 3, 4)  # [B, 1, F_pixel, H_pixel, W_pixel]
+        # Use trilinear interpolation to resize all dimensions at once
+        # Target: [f_latent, h_latent, w_latent]
+        resized_mask = F.interpolate(
+            mask,
+            size=(f_latent, h_latent, w_latent),
+            mode='trilinear',  # 3D interpolation: temporal + spatial
+            align_corners=False
+        )
+        
+        # Convert back to [B, F, C, H, W] format
+        resized_mask = resized_mask.permute(0, 2, 1, 3, 4)  # [B, F_latent, 1, H_latent, W_latent]
+        
+        # Apply VAE scaling factor
+        if vae_scaling_factor is not None:
+            resized_mask = resized_mask * vae_scaling_factor
+        
+        return resized_mask
     else:
-        return torch.ones_like(noisy_model_input[:, :, :1])
+        # Default: create ones mask matching noisy_model_input shape
+        if vae_scaling_factor is not None:
+            return torch.ones_like(noisy_model_input[:, :, :1]) * vae_scaling_factor
+        else:
+            return torch.ones_like(noisy_model_input[:, :, :1])
 
 
 def _blur_condition_latent(latent: torch.Tensor, strength: float = 0.2) -> torch.Tensor:
@@ -3362,6 +3415,8 @@ def main():
             "raymaps": torch.stack([item["raymap"] for item in batch]) if "raymap" in batch[0] and batch[0]["raymap"] is not None else None,
             "image_goal": torch.stack([item["image_goal"] for item in batch]) if "image_goal" in batch[0] and batch[0]["image_goal"] is not None else None,
             "raw_video": torch.stack([item["raw_video"] for item in batch]) if "raw_video" in batch[0] and batch[0]["raw_video"] is not None else None,
+            "warped_videos": torch.stack([item["warped_videos"] for item in batch]) if "warped_videos" in batch[0] and batch[0]["warped_videos"] is not None else None,
+            "warped_masks": torch.stack([item["warped_masks"] for item in batch]) if "warped_masks" in batch[0] and batch[0]["warped_masks"] is not None else None,
         },
         num_workers=data_config.get("dataloader_num_workers", 0),
         pin_memory=data_config.get("pin_memory", True),
@@ -3784,6 +3839,12 @@ def main():
     # Training loop - epoch based (like original CogVideoX)
     transformer.train()
 
+    # Check if we should use warped_videos (for I2V training)
+    start_i2v_training_iter = training_config.get("start_i2v_training_iter", None)
+    warped_videos_prob = training_config.get("warped_videos_prob", 0.0)
+    use_warped_videos = False
+    warped_mask = None
+
     for epoch in range(first_epoch, num_epochs):
         for step, batch in enumerate(train_dataloader):
             models_to_accumulate = [transformer]
@@ -3793,7 +3854,26 @@ def main():
                 # Update epoch for display
                 current_epoch = epoch
                 
-                videos = batch["videos"].to(accelerator.device, non_blocking=True)
+                if start_i2v_training_iter is not None and global_step >= start_i2v_training_iter:
+                    # Check probability for using warped_videos
+                    if random.random() < warped_videos_prob:
+                        warped_videos = batch.get("warped_videos")
+                        warped_masks = batch.get("warped_masks")
+                        if warped_videos is not None:
+                            use_warped_videos = True
+                            # Process warped_mask for later use in mask creation
+                            if warped_masks is not None:
+                                warped_mask = warped_masks.to(accelerator.device, non_blocking=True)
+                                # warped_mask format will be handled in _create_fun_mask_input
+                                # It can be [B, F, C, H, W] or [B, C, F, H, W] depending on dataset format
+                                # _create_fun_mask_input will resize it to match latent spatial size
+                
+                # Use warped_videos if available and selected, otherwise use regular videos
+                if use_warped_videos:
+                    videos = warped_videos.to(accelerator.device, non_blocking=True)
+                else:
+                    videos = batch["videos"].to(accelerator.device, non_blocking=True)
+                
                 images = batch.get("images")  # For I2V pipeline and prediction mode
                 prompts = batch["prompts"]
                 hand_videos = batch.get("hand_videos")
@@ -4144,7 +4224,8 @@ def main():
                 elif pipeline_config["type"] == "cogvideox_fun_static_to_video_pose_concat":
                     # For VideoX-Fun static-to-video pose concat pipeline, use both static and hand videos as conditions
                     # Use preprocessed condition latents
-                    mask_input = _create_fun_mask_input(noisy_model_input, VAE_SCALING_FACTOR)
+                    # Use warped_mask if available (for I2V training)
+                    mask_input = _create_fun_mask_input(noisy_model_input, VAE_SCALING_FACTOR, warped_mask=warped_mask)
                     transformer_input = torch.cat([noisy_model_input, mask_input, static_videos_latents, hand_videos_latents], dim=2)
                     condition_latents = None
                     

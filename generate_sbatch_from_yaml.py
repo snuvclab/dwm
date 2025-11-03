@@ -131,7 +131,7 @@ def generate_sbatch_script(yaml_file, output_script=None, aicomputing=False):
 #SBATCH --gpus-per-node={slurm.get('gpus_per_node', slurm.get('gpus', 4))}
 #SBATCH --cpus-per-task={slurm.get('cpus_per_task', 48)}
 #SBATCH --mem={slurm.get('mem', '400G')}
-#SBATCH --partition={slurm.get('partition', 'train')}
+#SBATCH --partition={slurm.get('partition', 'jhb_vclab')}
 #SBATCH --nodelist={slurm.get('nodelist', 'compute-st-kait-gpu-2')}
 #SBATCH --output={slurm.get('output', 'out/%j_default.out')}
 #SBATCH --error={slurm.get('error', 'out/%j_default.err')}"""
@@ -275,11 +275,30 @@ if [ "$DEBUG_MODE" = true ]; then
     ACCELERATE_CONFIG_FILE="accelerate_configs/deepspeed_1.yaml"
     echo "🔧 Debug mode: Using single GPU with ipdb"
 elif [ "$SLURM_TEST_MODE" = true ]; then
-    # Test mode - use 2 GPUs
-    NUM_GPUS=2
-    GPU_IDS="0,1"
-    ACCELERATE_CONFIG_FILE="accelerate_configs/deepspeed_2.yaml"
-    echo "🧪 SLURM test mode: Using 2 GPUs with accelerate"
+    # Test mode - use available GPUs from CUDA_VISIBLE_DEVICES
+    # accelerate launch automatically uses CUDA_VISIBLE_DEVICES, so we don't need --gpu_ids
+    if [ -n "$CUDA_VISIBLE_DEVICES" ]; then
+        # Count number of GPUs in CUDA_VISIBLE_DEVICES
+        NUM_GPUS=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
+    else
+        # Fallback if CUDA_VISIBLE_DEVICES not set
+        NUM_GPUS=4
+        echo "⚠️  WARNING: CUDA_VISIBLE_DEVICES not set, defaulting to 4 GPUs"
+    fi
+    
+    # Use appropriate accelerate config based on GPU count
+    if [ $NUM_GPUS -eq 1 ]; then
+        ACCELERATE_CONFIG_FILE="accelerate_configs/deepspeed_1.yaml"
+    elif [ $NUM_GPUS -eq 2 ]; then
+        ACCELERATE_CONFIG_FILE="accelerate_configs/deepspeed_2.yaml"
+    elif [ $NUM_GPUS -eq 4 ]; then
+        ACCELERATE_CONFIG_FILE="accelerate_configs/deepspeed_4.yaml"
+    else
+        ACCELERATE_CONFIG_FILE="accelerate_configs/deepspeed_4.yaml"
+    fi
+    echo "🧪 SLURM test mode: Using $NUM_GPUS GPUs from CUDA_VISIBLE_DEVICES"
+    echo "🧪 CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
+    echo "🧪 Note: accelerate launch will use CUDA_VISIBLE_DEVICES automatically (no --gpu_ids needed)"
 else
     # SLURM mode - use GPU count from YAML
     NUM_GPUS={slurm.get('gpus_per_node', 4)}
@@ -364,12 +383,23 @@ if [ "$DEBUG_MODE" = true ]; then
     echo "🔧 Debug mode command: $cmd"
     echo "🔧 Debug mode: Batch size overridden to 1, validation videos to 1 for easier debugging"
 elif [ "$SLURM_TEST_MODE" = true ]; then
-    cmd="accelerate launch --config_file $ACCELERATE_CONFIG_FILE --gpu_ids $GPU_IDS $SCRIPT_NAME --experiment_config $EXPERIMENT_CONFIG --mode slurm_test --override data.max_validation_videos=0"
+    # Don't use --gpu_ids, accelerate launch automatically uses CUDA_VISIBLE_DEVICES
+    cmd="accelerate launch --config_file $ACCELERATE_CONFIG_FILE $SCRIPT_NAME --experiment_config $EXPERIMENT_CONFIG --mode slurm_test --override data.max_validation_videos=0"
     echo "🚀 Accelerate command: $cmd"
-    echo "🧪 SLURM test mode: Validation videos overridden to 1 for faster testing"
+    echo "🧪 SLURM test mode: Validation videos overridden to 0 for faster testing"
+    echo "🧪 Using CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES (accelerate will use this automatically)"
 else
-    cmd="accelerate launch --config_file $ACCELERATE_CONFIG_FILE --gpu_ids $GPU_IDS $SCRIPT_NAME --experiment_config $EXPERIMENT_CONFIG --mode slurm"
-    echo "🚀 Default command: $cmd"
+    # SLURM mode: accelerate launch automatically uses CUDA_VISIBLE_DEVICES if set
+    # Only use --gpu_ids if CUDA_VISIBLE_DEVICES is not set
+    if [ -n "$CUDA_VISIBLE_DEVICES" ]; then
+        # CUDA_VISIBLE_DEVICES is set, accelerate will use it automatically
+        cmd="accelerate launch --config_file $ACCELERATE_CONFIG_FILE $SCRIPT_NAME --experiment_config $EXPERIMENT_CONFIG --mode slurm"
+        echo "🚀 Default command (using CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES): $cmd"
+    else
+        # Fallback: use --gpu_ids if CUDA_VISIBLE_DEVICES not set
+        cmd="accelerate launch --config_file $ACCELERATE_CONFIG_FILE --gpu_ids $GPU_IDS $SCRIPT_NAME --experiment_config $EXPERIMENT_CONFIG --mode slurm"
+        echo "🚀 Default command (using --gpu_ids=$GPU_IDS): $cmd"
+    fi
 fi
 
 echo ""
