@@ -452,7 +452,6 @@ def serialize_artifacts(
     hand_videos_gray_right_dir: Optional[pathlib.Path] = None,
     hand_video_gray_right_latents_dir: Optional[pathlib.Path] = None,
     hand_mask_videos_dir: Optional[pathlib.Path] = None,
-    hand_video_mask_latents_dir: Optional[pathlib.Path] = None,
     static_videos_dir: Optional[pathlib.Path] = None,
     static_video_latents_dir: Optional[pathlib.Path] = None,
     smpl_pos_map_dir: Optional[pathlib.Path] = None,
@@ -479,7 +478,6 @@ def serialize_artifacts(
     hand_videos_gray_right: Optional[torch.Tensor] = None,
     hand_video_gray_right_latents: Optional[torch.Tensor] = None,
     hand_mask_videos: Optional[torch.Tensor] = None,
-    hand_video_mask_latents: Optional[torch.Tensor] = None,
     static_videos: Optional[torch.Tensor] = None,
     static_video_latents: Optional[torch.Tensor] = None,
     smpl_pos_map: Optional[torch.Tensor] = None,
@@ -525,7 +523,6 @@ def serialize_artifacts(
         (hand_videos_gray_right, hand_videos_gray_right_dir, functools.partial(save_video, fps=fps), "mp4"),
         (hand_video_gray_right_latents, hand_video_gray_right_latents_dir, torch.save, "pt"),
         (hand_mask_videos, hand_mask_videos_dir, functools.partial(save_video, fps=fps), "mp4"),
-        (hand_video_mask_latents, hand_video_mask_latents_dir, torch.save, "pt"),
         (static_videos, static_videos_dir, functools.partial(save_video, fps=fps), "mp4"),
         (static_video_latents, static_video_latents_dir, torch.save, "pt"),
         (smpl_pos_map, smpl_pos_map_dir, functools.partial(save_video, fps=fps), "mp4"),
@@ -557,13 +554,12 @@ def serialize_artifacts(
                 "videos_hands_gray_right": 8,
                 "hand_video_gray_right_latents": 9,
                 "videos_hands_mask": 10,
-                "hand_video_mask_latents": 11,
-                "videos_static": 12,
-                "static_video_latents": 13,
-                "smpl_pos_map_egoallo": 14,
-                "smpl_pos_map_egoallo_latents": 15,
-                "prompts": 16,
-                "prompt_embeds": 17,
+                "videos_static": 11,
+                "static_video_latents": 12,
+                "smpl_pos_map_egoallo": 13,
+                "smpl_pos_map_egoallo_latents": 14,
+                "prompts": 15,
+                "prompt_embeds": 16,
             }
         else:  # aether
             file_type_to_index = {
@@ -609,7 +605,7 @@ def serialize_artifacts(
         # Only include metadata if we're processing videos or other file types that need it
         if model_type == "cogvideox_pose":
             should_include_metadata = any(ft in selective_processing for ft in ["videos", "video_latents", "prompts", "prompt_embeds"])
-            metadata_index = 17
+            metadata_index = 9
         else:  # aether
             should_include_metadata = any(ft in selective_processing for ft in ["videos", "video_latents", "disparity", "disparity_latents", "images", "image_latents", "human_motions", "prompts", "prompt_embeds"])
             metadata_index = 13
@@ -729,7 +725,6 @@ def main():
     hand_videos_gray_right_dir = tmp_dir.joinpath(f"videos_hands_gray_right/{rank}")
     hand_video_gray_right_latents_dir = tmp_dir.joinpath(f"hand_video_gray_right_latents/{rank}")
     hand_mask_videos_dir = tmp_dir.joinpath(f"videos_hands_mask/{rank}")
-    hand_video_mask_latents_dir = tmp_dir.joinpath(f"hand_video_mask_latents/{rank}")
     static_videos_dir = tmp_dir.joinpath(f"videos_static/{rank}")
     static_video_latents_dir = tmp_dir.joinpath(f"static_video_latents/{rank}")
     smpl_pos_map_dir = tmp_dir.joinpath(f"smpl_pos_map_egoallo/{rank}")
@@ -768,7 +763,6 @@ def main():
         hand_videos_gray_right_dir.mkdir(parents=True, exist_ok=True)
         hand_video_gray_right_latents_dir.mkdir(parents=True, exist_ok=True)
         hand_mask_videos_dir.mkdir(parents=True, exist_ok=True)
-        hand_video_mask_latents_dir.mkdir(parents=True, exist_ok=True)
         static_videos_dir.mkdir(parents=True, exist_ok=True)
         static_video_latents_dir.mkdir(parents=True, exist_ok=True)
         smpl_pos_map_dir.mkdir(parents=True, exist_ok=True)
@@ -1206,17 +1200,16 @@ def main():
                 should_process_hand_gray_right = (args.selective_processing is None or "hand_video_gray_right_latents" in args.selective_processing)
                 should_process_static_videos = (args.selective_processing is None or "static_video_latents" in args.selective_processing)
                 should_process_hand_masks = (args.selective_processing is None or "videos_hands_mask" in args.selective_processing)
-                should_process_hand_mask_latents = (args.selective_processing is None or "hand_video_mask_latents" in args.selective_processing)
                 should_process_smpl_pos_map = (args.selective_processing is None or "smpl_pos_map_egoallo_latents" in args.selective_processing)
                 
                 # Need hand_videos for left/right processing even if not saving hand_video_latents
-                need_hand_videos = should_process_hand_videos or should_process_hand_gray_left or should_process_hand_gray_right or should_process_hand_masks or should_process_hand_mask_latents
+                need_hand_videos = should_process_hand_videos or should_process_hand_gray_left or should_process_hand_gray_right or should_process_hand_masks
                 
                 # Process hand_videos if needed
                 if need_hand_videos and hand_videos is not None:
                     hand_videos_save = (hand_videos.permute(0, 2, 1, 3, 4) + 1) / 2  # 저장용
                     hand_videos_encode = hand_videos.permute(0, 2, 1, 3, 4)           # [-1,1] encode용
-                    if should_process_hand_masks or should_process_hand_mask_latents:
+                    if should_process_hand_masks:
                         hand_mask_videos = create_hand_mask(hand_videos_save)
                         print(f"Created hand mask videos with shape: {hand_mask_videos.shape}")
                     else:
@@ -1292,7 +1285,6 @@ def main():
                 should_process_hand_gray_videos = (args.selective_processing is None or "hand_video_gray_latents" in args.selective_processing)
                 should_process_hand_gray_left = (args.selective_processing is None or "hand_video_gray_left_latents" in args.selective_processing)
                 should_process_hand_gray_right = (args.selective_processing is None or "hand_video_gray_right_latents" in args.selective_processing)
-                should_process_hand_mask_latents = (args.selective_processing is None or "hand_video_mask_latents" in args.selective_processing)
                 should_process_static_videos_latents = (args.selective_processing is None or "static_video_latents" in args.selective_processing)
                 should_process_smpl_pos_map_latents = (args.selective_processing is None or "smpl_pos_map_egoallo_latents" in args.selective_processing)
 
@@ -1334,17 +1326,6 @@ def main():
                     smpl_pos_map_latents = vae._encode(smpl_pos_map)
                     smpl_pos_map_latents = smpl_pos_map_latents.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
                     print(f"Encoded SMPL pos map latents with shape: {smpl_pos_map_latents.shape}")
-                
-                # Encode hand mask videos to latents
-                hand_video_mask_latents = None
-                if should_process_hand_mask_latents and hand_mask_videos is not None:
-                    # Convert hand_mask_videos from [B, F, C, H, W] to [B, C, F, H, W] for encoding
-                    # hand_mask_videos is in [0, 1] range, need to convert to [-1, 1] for VAE
-                    hand_mask_videos_encode = hand_mask_videos.permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
-                    hand_mask_videos_encode = 2 * hand_mask_videos_encode - 1  # Normalize to [-1, 1]
-                    hand_video_mask_latents = vae._encode(hand_mask_videos_encode)
-                    hand_video_mask_latents = hand_video_mask_latents.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
-                    print(f"Encoded hand mask video latents with shape: {hand_video_mask_latents.shape}")
 
             # Get video paths for this batch (always needed for filename generation)
             batch_video_paths = []
@@ -1515,12 +1496,6 @@ def main():
                         "hand_mask_videos": hand_mask_videos,
                     })
                 
-                if should_process_hand_mask_latents or args.selective_processing is None:
-                    output_data.update({
-                        "hand_video_mask_latents_dir": hand_video_mask_latents_dir,
-                        "hand_video_mask_latents": hand_video_mask_latents,
-                    })
-                
                 if should_process_static_videos or args.selective_processing is None:
                     output_data.update({
                         "static_videos_dir": static_videos_dir,
@@ -1593,7 +1568,6 @@ def main():
                 ("videos_hands_gray_right", "mp4"),
                 ("hand_video_gray_right_latents", "pt"),
                 ("videos_hands_mask", "mp4"),
-                ("hand_video_mask_latents", "pt"),
                 ("videos_static", "mp4"),
                 ("static_video_latents", "pt"),
                 ("smpl_pos_map_egoallo", "mp4"),
@@ -1697,8 +1671,6 @@ def main():
                         data["hand_video_gray_right_latent"] = f"hand_video_gray_right_latents/{stem}.pt"
                     if args.selective_processing is None or "hand_mask_videos" in args.selective_processing:
                         data["hand_mask_video"] = f"videos_hands_mask/{stem}.mp4"
-                    if args.selective_processing is None or "hand_video_mask_latents" in args.selective_processing:
-                        data["hand_video_mask_latent"] = f"hand_video_mask_latents/{stem}.pt"
                     if args.selective_processing is None or "static_videos" in args.selective_processing:
                         data["static_video"] = f"videos_static/{stem}.mp4"
                     if args.selective_processing is None or "static_video_latents" in args.selective_processing:
