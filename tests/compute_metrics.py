@@ -1,4 +1,5 @@
 import os
+import glob
 import argparse
 import imageio.v3 as iio
 from tqdm import tqdm
@@ -14,10 +15,11 @@ parser.add_argument("--txt_path", type=str, required=True)
 parser.add_argument("--output_dir", type=str, required=True)
 args = parser.parse_args()
 
+os.makedirs(args.output_dir, exist_ok=True)
 save_path = os.path.join(args.output_dir, "results.txt")
+
 with open(args.txt_path, "r") as f:
-    lines = f.readlines()
-validation_video_list = [line.strip() for line in lines]
+    validation_video_list = [line.strip() for line in f if line.strip()]
 
 data_root = "/virtual_lab/jhb_vclab/world_model/data"
 
@@ -38,8 +40,7 @@ def safe_read_video(path):
         if not os.path.exists(path):
             return None
         arr = iio.imread(path)
-        # imageio returns [H,W,C] for single-frame images; make it [1,H,W,C] for consistency
-        if arr.ndim == 3:
+        if arr.ndim == 3:  # single frame -> [1,H,W,C]
             arr = arr[None, ...]
         if arr.ndim != 4:
             return None
@@ -48,10 +49,7 @@ def safe_read_video(path):
         return None
 
 def compute_dreamsim_video(gt_video, pred_video, dreamsim_model, dreamsim_preprocess, device):
-    """
-    Compute mean DreamSim distance for an entire video in batch mode.
-    Expects gt_video/pred_video as numpy arrays in [0,1], shape [F,H,W,C].
-    """
+    """Mean DreamSim distance for an entire video (batched). Inputs: numpy [F,H,W,C] in [0,1]."""
     gt_imgs, pred_imgs = [], []
     F = gt_video.shape[0]
     for f in range(F):
@@ -59,83 +57,123 @@ def compute_dreamsim_video(gt_video, pred_video, dreamsim_model, dreamsim_prepro
         pred_img = Image.fromarray((pred_video[f] * 255).astype("uint8"))
         gt_imgs.append(dreamsim_preprocess(gt_img))
         pred_imgs.append(dreamsim_preprocess(pred_img))
-
     gt_batch = torch.stack(gt_imgs).to(device)   # [F,3,224,224]
     pred_batch = torch.stack(pred_imgs).to(device)
-
     with torch.no_grad():
-        dists = dreamsim_model(pred_batch.squeeze(1), gt_batch.squeeze(1))  # [F] or scalar reduced; assume [F]
-        if dists.ndim == 0:
-            return float(dists.item())
-        return float(dists.mean().item())
+        dists = dreamsim_model(pred_batch.squeeze(1), gt_batch.squeeze(1))  # [F] or scalar
+        return float(dists.mean().item() if dists.ndim > 0 else dists.item())
 
-per_video_results = []
-skipped = []  # list of tuples: (name, reason)
+def find_prediction_paths(output_dir, original_name):
+    """
+    Return a sorted list of candidate prediction files for a given GT video.
+    Supports:
+      - exact flattened name: original.replace('/', '_')
+      - numbered variants: <base_noext>_0<ext>, <base_noext>_1<ext>, ...
+    """
+    base = original_name.replace("/", "_")        # e.g., "dir/foo.mp4" -> "dir_foo.mp4"
+    root, ext = os.path.splitext(base)
+    candidates = set()
+
+    # exact file (as before)
+    p_exact = os.path.join(output_dir, base)
+    if os.path.exists(p_exact):
+        candidates.add(p_exact)
+
+    # patterns for numbered variants (with or without ext)
+    patterns = [
+        os.path.join(output_dir, f"{root}_*{ext}") if ext else None,
+        os.path.join(output_dir, f"{root}_*"),
+    ]
+    for pat in patterns:
+        if pat is None: 
+            continue
+        for p in glob.glob(pat):
+            if os.path.isfile(p):
+                candidates.add(p)
+
+    # sort by numeric suffix if present (…_3.mp4 -> 3), otherwise lexicographic
+    def suffix_key(p):
+        fname = os.path.basename(p)
+        stem, _e = os.path.splitext(fname)
+        if "_" in stem:
+            maybe = stem.split("_")[-1]
+            if maybe.isdigit():
+                return (0, int(maybe), fname)
+        return (1, 0, fname)
+
+    return sorted(candidates, key=suffix_key)
+
+per_pair_results = []  # store per GT–PRED pair
+skipped = []           # (name, reason)
 
 for validation_video in tqdm(validation_video_list):
     gt_video_path = os.path.join(data_root, validation_video)
-    pred_video_path = os.path.join(args.output_dir, validation_video.replace("/", "_"))
-
     gt_video = safe_read_video(gt_video_path)
     if gt_video is None:
         skipped.append((validation_video, f"missing/unreadable GT: {gt_video_path}"))
         continue
 
-    pred_video = safe_read_video(pred_video_path)
-    if pred_video is None:
-        skipped.append((validation_video, f"missing/unreadable PRED: {pred_video_path}"))
+    pred_paths = find_prediction_paths(args.output_dir, validation_video)
+    if not pred_paths:
+        skipped.append((validation_video, "no prediction files found"))
         continue
 
-    if gt_video.shape != pred_video.shape:
-        skipped.append((validation_video, f"shape mismatch GT {gt_video.shape} vs PRED {pred_video.shape}"))
-        continue
+    for pred_video_path in pred_paths:
+        pred_video = safe_read_video(pred_video_path)
+        if pred_video is None:
+            skipped.append((f"{validation_video} :: {os.path.basename(pred_video_path)}", "missing/unreadable PRED"))
+            continue
 
-    F, H, W, C = gt_video.shape
-    if C == 1:
-        gt_video = gt_video.repeat(1, 1, 1, 3)
-        pred_video = pred_video.repeat(1, 1, 1, 3)
-        C = 3
+        if gt_video.shape != pred_video.shape:
+            skipped.append((f"{validation_video} :: {os.path.basename(pred_video_path)}",
+                            f"shape mismatch GT {gt_video.shape} vs PRED {pred_video.shape}"))
+            continue
 
-    gt = torch.from_numpy(gt_video).permute(0, 3, 1, 2).to(device)     # [F,C,H,W] in [0,1]
-    pred = torch.from_numpy(pred_video).permute(0, 3, 1, 2).to(device) # [F,C,H,W] in [0,1]
+        F, H, W, C = gt_video.shape
+        if C == 1:
+            gt_video = gt_video.repeat(1, 1, 1, 3)
+            pred_video = pred_video.repeat(1, 1, 1, 3)
 
-    with torch.no_grad():
-        # PSNR / SSIM averaged across frames
-        psnr_val = float(psnr_metric(pred, gt).item())
-        ssim_val = float(ssim_metric(pred, gt).item())
+        gt = torch.from_numpy(gt_video).permute(0, 3, 1, 2).to(device)     # [F,C,H,W] in [0,1]
+        pred = torch.from_numpy(pred_video).permute(0, 3, 1, 2).to(device) # [F,C,H,W] in [0,1]
 
-        # LPIPS expects [-1,1], 3ch
-        gt_lp = gt[:, :3].mul(2.0).sub(1.0)
-        pred_lp = pred[:, :3].mul(2.0).sub(1.0)
-        lpips_val = float(lpips_metric(pred_lp, gt_lp).item())
+        with torch.no_grad():
+            psnr_val = float(psnr_metric(pred, gt).item())
+            ssim_val = float(ssim_metric(pred, gt).item())
+            gt_lp = gt[:, :3].mul(2.0).sub(1.0)
+            pred_lp = pred[:, :3].mul(2.0).sub(1.0)
+            lpips_val = float(lpips_metric(pred_lp, gt_lp).item())
+            dreamsim_val = compute_dreamsim_video(gt_video, pred_video, dreamsim_model, dreamsim_preprocess, device)
 
-        # DreamSim (batched)
-        dreamsim_val = compute_dreamsim_video(
-            gt_video, pred_video, dreamsim_model, dreamsim_preprocess, device
-        )
-
-    per_video_results.append({
-        "name": validation_video,
-        "psnr": psnr_val,
-        "ssim": ssim_val,
-        "lpips": lpips_val,
-        "dreamsim": dreamsim_val,
-    })
+        per_pair_results.append({
+            "gt": validation_video,
+            "pred": os.path.basename(pred_video_path),
+            "psnr": psnr_val,
+            "ssim": ssim_val,
+            "lpips": lpips_val,
+            "dreamsim": dreamsim_val,
+        })
 
 # ---- Write results ----
 with open(save_path, "w") as f:
-    if per_video_results:
-        avg_psnr = sum(r["psnr"] for r in per_video_results) / len(per_video_results)
-        avg_ssim = sum(r["ssim"] for r in per_video_results) / len(per_video_results)
-        avg_lpips = sum(r["lpips"] for r in per_video_results) / len(per_video_results)
-        avg_dreamsim = sum(r["dreamsim"] for r in per_video_results) / len(per_video_results)
+    if per_pair_results:
+        # overall averages across ALL GT–PRED pairs
+        avg_psnr = sum(r["psnr"] for r in per_pair_results) / len(per_pair_results)
+        avg_ssim = sum(r["ssim"] for r in per_pair_results) / len(per_pair_results)
+        avg_lpips = sum(r["lpips"] for r in per_pair_results) / len(per_pair_results)
+        avg_dreamsim = sum(r["dreamsim"] for r in per_pair_results) / len(per_pair_results)
 
-        for r in per_video_results:
-            f.write(f"{r['name']}\tPSNR: {r['psnr']:.4f}\tSSIM: {r['ssim']:.4f}\tLPIPS: {r['lpips']:.6f}\tDreamSim: {r['dreamsim']:.6f}\n")
-        f.write("\n")
-        f.write(f"AVERAGE\tPSNR: {avg_psnr:.4f}\tSSIM: {avg_ssim:.4f}\tLPIPS: {avg_lpips:.6f}\tDreamSim: {avg_dreamsim:.6f}\n")
+        current_gt = None
+        for r in per_pair_results:
+            if r["gt"] != current_gt:
+                current_gt = r["gt"]
+                f.write(f"\nGT: {current_gt}\n")
+            f.write(f"  PRED: {r['pred']}\tPSNR: {r['psnr']:.4f}\tSSIM: {r['ssim']:.4f}\tLPIPS: {r['lpips']:.6f}\tDreamSim: {r['dreamsim']:.6f}\n")
+
+        f.write("\nOVERALL AVERAGES (across all GT–PRED pairs)\n")
+        f.write(f"PSNR: {avg_psnr:.4f}\tSSIM: {avg_ssim:.4f}\tLPIPS: {avg_lpips:.6f}\tDreamSim: {avg_dreamsim:.6f}\n")
     else:
-        f.write("No valid video pairs were found; nothing to average.\n")
+        f.write("No valid GT–PRED pairs were found; nothing to average.\n")
 
     if skipped:
         f.write("\nSKIPPED ENTRIES:\n")

@@ -804,11 +804,19 @@ def main():
     def save_model_hook(models, weights, output_dir):
         if accelerator.is_main_process:
             transformer_lora_layers_to_save = None
+            projection_state_dict = None
 
             for model in models:
                 if isinstance(unwrap_model(accelerator, model), type(unwrap_model(accelerator, transformer))):
                     model = unwrap_model(accelerator, model)
                     transformer_lora_layers_to_save = get_peft_model_state_dict(model)
+
+                    # Concat models: save proj weights (modified existing proj)
+                    if hasattr(model, 'patch_embed') and hasattr(model.patch_embed, 'proj'):
+                        projection_state_dict = {
+                            "transformer.patch_embed.proj.weight": model.patch_embed.proj.weight.data,
+                            "transformer.patch_embed.proj.bias": model.patch_embed.proj.bias.data if model.patch_embed.proj.bias is not None else None,
+                        }
                 else:
                     raise ValueError(f"Unexpected save model: {model.__class__}")
 
@@ -820,7 +828,10 @@ def main():
                 output_dir,
                 transformer_lora_layers=transformer_lora_layers_to_save,
             )
-
+            if projection_state_dict is not None:               
+                torch.save(projection_state_dict, os.path.join(output_dir, "projection_layer_weights.pt"))
+                print(f"✅ Saved concat projection weights: {list(projection_state_dict.keys())}")
+                
     def load_model_hook(models, input_dir):
         transformer_ = None
 
@@ -1453,8 +1464,8 @@ def main():
                             accelerator.save_state(save_path)
                             logger.info(f"✅ Saved state to {save_path}")
 
-                            # save conv2d weights
-                            torch.save(transformer.patch_embed.proj.state_dict(), os.path.join(save_path, f"projection_layer_weights.pt"))
+                            # # save conv2d weights
+                            # torch.save(transformer.patch_embed.proj.state_dict(), os.path.join(save_path, f"projection_layer_weights.pt"))
                         except RuntimeError as e:
                             if "out of memory" in str(e).lower():
                                 logger.warning(f"⚠️ OOM during checkpoint save, retrying with CPU offload...")
