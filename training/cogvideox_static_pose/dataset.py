@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 import torchvision.transforms as TT
 from torch.utils.data import Dataset, Sampler
 from torchvision import transforms
@@ -96,10 +97,12 @@ class VideoDataset(Dataset):
                 self.prompts,
                 self.video_paths,
             ) = self._load_dataset_from_local_path()
+            self.is_i2v_sample = [False] * len(self.video_paths)  # Track source for each sample
         else:
             (
                 self.prompts,
                 self.video_paths,
+                self.is_i2v_sample,
             ) = self._load_dataset_from_datafile()
             # ) = self._load_dataset_from_csv()
 
@@ -213,8 +216,8 @@ class VideoDataset(Dataset):
             )
 
         with open(video_path, "r", encoding="utf-8") as file:
-            # video_paths = [self.data_root.joinpath(line.strip()) for line in file.readlines() if len(line.strip()) > 0]
-            video_paths = [self.data_root.parent.joinpath("processed2").joinpath(line.strip()) for line in file.readlines() if len(line.strip()) > 0]
+            video_paths = [self.data_root.joinpath(line.strip()) for line in file.readlines() if len(line.strip()) > 0]
+            # video_paths = [self.data_root.parent.joinpath("processed2").joinpath(line.strip()) for line in file.readlines() if len(line.strip()) > 0]
 
         # Derive prompt paths from video paths using configurable prompt_subdir
         prompt_paths = [path.parent.parent.joinpath(self.prompt_subdir, path.name.replace(".mp4", ".txt")) for path in video_paths]
@@ -241,14 +244,19 @@ class VideoDataset(Dataset):
 
         return prompts, video_paths
 
-    def _load_dataset_from_datafile(self) -> Tuple[List[str], List[str]]:
+    def _load_dataset_from_datafile(self) -> Tuple[List[str], List[Path], List[bool]]:
+        # Load regular dataset
         with open(self.data_root / self.dataset_file, "r") as f:
             video_paths = [self.data_root.joinpath(line.strip()) for line in f.readlines() if len(line.strip()) > 0]
+        
         # Use configurable prompt_subdir
         prompt_paths = [path.parent.parent.joinpath(self.prompt_subdir, path.name.replace(".mp4", ".txt")) for path in video_paths]
         prompts = [path.read_text() for path in prompt_paths]
+        
+        # Track source: False for regular dataset
+        is_i2v_sample = [False] * len(video_paths)
 
-        return prompts, video_paths
+        return prompts, video_paths, is_i2v_sample
 
     def _preprocess_video(self, path: Path) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         r"""
@@ -366,6 +374,7 @@ class VideoDatasetWithConditions(VideoDataset):
         self,
         data_root: str,
         dataset_file: Optional[str] = None,
+        dataset_file_i2v: Optional[str] = None,
         caption_column: str = "text",
         video_column: str = "video",
         max_num_frames: int = 49,
@@ -389,7 +398,15 @@ class VideoDatasetWithConditions(VideoDataset):
         prompt_embeds_subdir: str = "prompt_embeds",
         hand_video_subdir: str = "videos_hands",
         hand_video_latents_subdir: str = "hand_video_latents",
+        start_i2v_training_iter: Optional[int] = None,
+        warped_videos_prob: float = 0.0,
     ) -> None:
+        # Store dataset_file_i2v and I2V parameters before calling parent
+        self.dataset_file_i2v = dataset_file_i2v
+        self.start_i2v_training_iter = start_i2v_training_iter
+        self.warped_videos_prob = warped_videos_prob
+        self._current_global_step = 0  # Will be updated by training script
+        
         # Initialize parent class with main video column
         super().__init__(
             data_root=data_root,
@@ -410,6 +427,10 @@ class VideoDatasetWithConditions(VideoDataset):
             hand_video_latents_subdir=hand_video_latents_subdir,
         )
         
+        # Merge with i2v dataset if provided
+        if dataset_file_i2v is not None:
+            self._merge_i2v_dataset()
+        
         # Store the flags
         self.use_gray_hand_videos = use_gray_hand_videos
         self.split_hands = split_hands
@@ -423,6 +444,7 @@ class VideoDatasetWithConditions(VideoDataset):
         self.hand_video_subdir = hand_video_subdir
         self.hand_video_latents_subdir = hand_video_latents_subdir
         
+    
         # Automatically derive hand video and static video paths from main video paths
         if self.split_hands:
             # Split hands mode: load left and right hand videos separately
@@ -498,6 +520,40 @@ class VideoDatasetWithConditions(VideoDataset):
                     raise ValueError(
                         f"Some SMPL pos map files are missing. First few missing files: {missing_smpl_pos_maps[:5]}"
                     )
+                    
+    def _merge_i2v_dataset(self):
+        """Merge i2v dataset with regular dataset.
+        
+        Loads dataset_file_i2v and appends to existing video_paths, prompts, and is_i2v_sample lists.
+        """
+        # Load i2v dataset
+        with open(self.data_root / self.dataset_file_i2v, "r") as f:
+            i2v_video_paths = [self.data_root.joinpath(line.strip()) for line in f.readlines() if len(line.strip()) > 0]
+        
+        # Use configurable prompt_subdir
+        i2v_prompt_paths = [path.parent.parent.joinpath(self.prompt_subdir, path.name.replace(".mp4", ".txt")) for path in i2v_video_paths]
+        i2v_prompts = [path.read_text() for path in i2v_prompt_paths]
+        
+        # Append to existing lists
+        self.video_paths.extend(i2v_video_paths)
+        self.prompts.extend(i2v_prompts)
+        
+        # Mark i2v samples as True (existing samples are False)
+        i2v_is_i2v_sample = [True] * len(i2v_video_paths)
+        self.is_i2v_sample.extend(i2v_is_i2v_sample)
+        
+        logger.info(
+            f"Merged i2v dataset: {len(i2v_video_paths)} samples from {self.dataset_file_i2v} "
+            f"(total: {len(self.video_paths)} samples)"
+        )
+    
+    def set_global_step(self, global_step: int):
+        """Update current global step for conditional i2v training.
+        
+        Args:
+            global_step: Current global step from training loop
+        """
+        self._current_global_step = global_step
 
     def _derive_condition_video_paths(self, condition_folder: str) -> List[Path]:
         """Derive condition video paths from main video paths.
@@ -562,33 +618,97 @@ class VideoDatasetWithConditions(VideoDataset):
                 logger.warning(f"Failed to load static video latents for index {index}: {e}")
                 main_data["static_videos"] = None
             
-            # Load warped videos if available
-            try:
-                warped_video_latents = self._load_condition_video_latents_or_encode(self.warped_video_paths[index], "warped_video_latents")
-                main_data["warped_videos"] = warped_video_latents
-            except Exception as e:
-                logger.warning(f"Failed to load warped video latents for index {index}: {e}")
-                main_data["warped_videos"] = None
+            # Handle warped_videos and masks if this sample is from i2v dataset
+            # Use is_i2v_sample to determine if warped should be used (based on dataset_file_i2v)
+            # Only use i2v if global_step >= start_i2v_training_iter
+            is_i2v = self.is_i2v_sample[index] if hasattr(self, 'is_i2v_sample') and index < len(self.is_i2v_sample) else False
             
-            # Load warped mask videos if available (always as raw video, no latents)
-            # Note: warped_mask doesn't have latents, always load as raw video even when load_tensors=True
-            try:
-                # Always load as raw video, bypassing _preprocess_video to avoid latent lookup
-                video_reader = decord.VideoReader(uri=self.warped_mask_video_paths[index].as_posix())
-                video_num_frames = len(video_reader)
+            # Check if we should use i2v at this global step
+            should_use_i2v = (
+                is_i2v and
+                self.start_i2v_training_iter is not None and
+                self._current_global_step >= self.start_i2v_training_iter
+            )
+            
+            # Get latent shape for mask creation (always needed)
+            static_video_latent = main_data.get("static_videos")
+            if static_video_latent is not None:
+                c_latent, f_latent, h_latent, w_latent = static_video_latent.shape
+            else:
+                video_latent = main_data["video"]
+                c_latent, f_latent, h_latent, w_latent = video_latent.shape
+            
+            if should_use_i2v:
+                # load_tensors=True: Interpolate warped_mask to latent size here
+                warped_mask_raw = None
+                try:
+                    # Always load as raw video, bypassing _preprocess_video to avoid latent lookup
+                    video_reader = decord.VideoReader(uri=self.warped_mask_video_paths[index].as_posix())
+                    video_num_frames = len(video_reader)
+                    
+                    # Calculate step, ensuring it's at least 1 to avoid "range() arg 3 must be zero" error
+                    step = max(1, video_num_frames // self.max_num_frames)
+                    indices = list(range(0, video_num_frames, step))
+                    frames = video_reader.get_batch(indices)
+                    frames = frames[: self.max_num_frames].float() / 255.0
+                    frames = frames.permute(0, 3, 1, 2).contiguous()
+                    frames = torch.stack([frame for frame in frames], dim=0)
+                    
+                    # frames shape: [F, C, H, W]
+                    warped_mask_raw = frames
+                except Exception as e:
+                    logger.warning(f"Failed to load warped mask video for index {index}: {e}")
                 
-                # Calculate step, ensuring it's at least 1 to avoid "range() arg 3 must be zero" error
-                step = max(1, video_num_frames // self.max_num_frames)
-                indices = list(range(0, video_num_frames, step))
-                frames = video_reader.get_batch(indices)
-                frames = frames[: self.max_num_frames].float()
-                frames = frames.permute(0, 3, 1, 2).contiguous()
-                frames = torch.stack([self.video_transforms(frame) for frame in frames], dim=0)
+                # Interpolate warped_mask to latent size using trilinear interpolation (only for load_tensors=True)
+                if warped_mask_raw is not None:
+                    # warped_mask_raw shape: [F_pixel, C_mask, H_pixel, W_pixel]
+                    f_pixel, c_mask, h_pixel, w_pixel = warped_mask_raw.shape
+                    
+                    # Convert to [1, 1, F, H, W] format for F.interpolate (batch and channel dimensions needed)
+                    # Take first channel if multiple channels
+                    if c_mask > 1:
+                        mask_single_channel = warped_mask_raw[:, :1, :, :]  # [F_pixel, 1, H_pixel, W_pixel]
+                    else:
+                        mask_single_channel = warped_mask_raw  # [F_pixel, 1, H_pixel, W_pixel]
+                    
+                    # Remove channel dimension: [F_pixel, 1, H_pixel, W_pixel] -> [F_pixel, H_pixel, W_pixel]
+                    mask_3d = mask_single_channel.squeeze(1)  # [F_pixel, H_pixel, W_pixel]
+                    
+                    # Add batch and channel dimensions: [F_pixel, H_pixel, W_pixel] -> [1, 1, F_pixel, H_pixel, W_pixel]
+                    mask_5d = mask_3d.unsqueeze(0).unsqueeze(0)  # [1, 1, F_pixel, H_pixel, W_pixel]
+                    
+                    # Use trilinear interpolation to resize to latent dimensions
+                    mask_resized = F.interpolate(
+                        mask_5d,
+                        size=(f_latent, h_latent, w_latent),
+                        mode='trilinear',
+                        align_corners=False
+                    )  # [1, 1, F_latent, H_latent, W_latent]
+                    
+                    # Squeeze back to [F_latent, 1, H_latent, W_latent] format (no batch dimension in dataset)
+                    mask_resized = mask_resized.squeeze(0).squeeze(0)  # [F_latent, H_latent, W_latent]
+                    mask_resized = mask_resized.unsqueeze(1)  # [F_latent, 1, H_latent, W_latent]
+                    
+                    # For i2v samples, always use the warped mask (no probability-based replacement)
+                    main_data["masks"] = mask_resized
+                else:
+                    # If loading failed, use ones mask
+                    ones_mask = torch.ones(f_latent, 1, h_latent, w_latent)
+                    main_data["masks"] = ones_mask
                 
-                main_data["warped_masks"] = frames
-            except Exception as e:
-                logger.warning(f"Failed to load warped mask video for index {index}: {e}")
-                main_data["warped_masks"] = None
+                # For i2v samples, always replace static_videos with warped_video
+                warped_video_latents = None
+                try:
+                    warped_video_latents = self._load_condition_video_latents_or_encode(self.warped_video_paths[index], "warped_video_latents")
+                except Exception as e:
+                    logger.warning(f"Failed to load warped video latents for index {index}: {e}")
+                
+                if warped_video_latents is not None:
+                    main_data["static_videos"] = warped_video_latents
+            else:
+                # should_use_i2v is False: return ones_mask instead
+                ones_mask = torch.ones(f_latent, 1, h_latent, w_latent)
+                main_data["masks"] = ones_mask
             
             # Load SMPL pos map if enabled
             if self.use_smpl_pos_map:
@@ -677,22 +797,58 @@ class VideoDatasetWithConditions(VideoDataset):
                 logger.warning(f"Failed to load static video for index {index}: {e}")
                 main_data["static_videos"] = None
             
-            # Load warped videos if available (raw mode)
-            try:
-                _, warped_video, _ = self._preprocess_video(self.warped_video_paths[index])
-                main_data["warped_videos"] = warped_video
-            except Exception as e:
-                logger.warning(f"Failed to load warped video for index {index}: {e}")
-                main_data["warped_videos"] = None
+            # Handle warped_videos and masks if this sample is from i2v dataset (raw mode)
+            # Use is_i2v_sample to determine if warped should be used (based on dataset_file_i2v)
+            # Only use i2v if global_step >= start_i2v_training_iter
+            is_i2v = self.is_i2v_sample[index] if hasattr(self, 'is_i2v_sample') and index < len(self.is_i2v_sample) else False
             
-            # Load warped mask videos if available (raw mode)
-            # Note: warped_mask doesn't have latents, always load as raw video
-            try:
-                _, warped_mask, _ = self._preprocess_video(self.warped_mask_video_paths[index])
-                main_data["warped_masks"] = warped_mask
-            except Exception as e:
-                logger.warning(f"Failed to load warped mask video for index {index}: {e}")
-                main_data["warped_masks"] = None
+            # Check if we should use i2v at this global step
+            should_use_i2v = (
+                is_i2v and
+                self.start_i2v_training_iter is not None and
+                self._current_global_step >= self.start_i2v_training_iter
+            )
+            
+            # Get video shape for mask creation (always needed)
+            # In raw mode, static_videos or main video shape is used for creating ones_mask
+            if main_data.get("static_videos") is not None:
+                static_video = main_data["static_videos"]
+                f_pixel, c_pixel, h_pixel, w_pixel = static_video.shape
+            else:
+                video = main_data["video"]
+                f_pixel, c_pixel, h_pixel, w_pixel = video.shape
+            
+            if should_use_i2v:
+                # In raw mode (load_tensors=False), don't interpolate here
+                # Load raw mask - interpolation will be handled in training loop after VAE encoding
+                warped_mask_raw = None
+                try:
+                    _, warped_mask_raw, _ = self._preprocess_video(self.warped_mask_video_paths[index])
+                except Exception as e:
+                    logger.warning(f"Failed to load warped mask video for index {index}: {e}")
+                
+                # Store raw mask (training loop will handle interpolation)
+                # If loading failed, use ones mask with same shape as video
+                if warped_mask_raw is not None:
+                    main_data["masks"] = warped_mask_raw
+                else:
+                    # Create ones mask with same shape as video (will be interpolated in training loop)
+                    ones_mask = torch.ones(f_pixel, 1, h_pixel, w_pixel)
+                    main_data["masks"] = ones_mask
+                
+                # For i2v samples, always replace static_videos with warped_video
+                warped_video = None
+                try:
+                    _, warped_video, _ = self._preprocess_video(self.warped_video_paths[index])
+                except Exception as e:
+                    logger.warning(f"Failed to load warped video for index {index}: {e}")
+                
+                if warped_video is not None:
+                    main_data["static_videos"] = warped_video
+            else:
+                # should_use_i2v is False: return ones_mask instead
+                ones_mask = torch.ones(f_pixel, 1, h_pixel, w_pixel)
+                main_data["masks"] = ones_mask
             
             # Load SMPL pos map if enabled
             if self.use_smpl_pos_map:

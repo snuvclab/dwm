@@ -109,6 +109,8 @@ def log_validation_with_dataset(
     config: Dict[str, Any],
     validation_video_path: str,
     validation_prompt: str,
+    validation_warped_video_path: str = None,
+    validation_mask_video_path: str = None,
     validation_hand_video_path: str = None,
     validation_static_video_path: str = None,
     validation_human_motions_path: str = None,
@@ -122,6 +124,7 @@ def log_validation_with_dataset(
     validation_mode: str = None,
     apply_blur_to_static: bool = False,
     blur_strength: float = 0.2,
+    warped_videos_prob: float = 0.0,
 ):
     """Log validation results with side-by-side comparison of generated and ground truth videos."""
     logger.info(
@@ -324,6 +327,14 @@ def log_validation_with_dataset(
             # This leverages the Fun checkpoint's behavior to output cond video as-is
             mask_video = torch.zeros((batch_size, 1, num_frames, height, width), dtype=torch.uint8)
             pipeline_args["mask_video"] = mask_video
+        elif validation_mode == "warped_to_video":
+            # Warped-to-video mode: All frames are condition video (0 = keep all)
+            # This leverages the Fun checkpoint's behavior to output cond video as-is
+            validation_mask_video = 1 - iio.imread(validation_mask_video_path).astype(np.float32) / 255.0
+            validation_mask_video = validation_mask_video.transpose(3, 0, 1, 2)  # [F, H, W, C] -> [C, F, H, W]
+            validation_mask_video = validation_mask_video[np.newaxis, :]  # Add batch dimension: [C, F, H, W] -> [1, C, F, H, W]
+            validation_mask_video = torch.from_numpy(validation_mask_video).float()
+            pipeline_args["mask_video"] = validation_mask_video[:, :1]
     
     # Add pipeline-specific arguments
     if pipeline_type is None:
@@ -554,6 +565,7 @@ def run_validation(
     pipeline_config = config["pipeline"]
     model_config_dict = config["model"]
     data_config = config.get("data", {})
+    dataset_file_i2v = data_config.get("dataset_file_i2v", None)
     
     if pipeline_config["type"] == "cogvideox_i2v":
         # Setup basic CogVideoX I2V Pipeline for validation
@@ -919,7 +931,8 @@ def run_validation(
         validation_hand_videos_right = []
         validation_smpl_pos_maps = []
         validation_raymaps = []
-        
+        validation_warped_videos = []
+        validation_warped_mask_videos = []
         split_hands = data_config.get("split_hands", False)
         use_smpl_pos_map = pipeline_config["type"] in ["cogvideox_fun_static_to_video_posmap_concat", "cogvideox_fun_static_to_video_posmap_adapter"]
         use_raymap = pipeline_config["type"] in ["cogvideox_fun_static_to_video_raymap_pose_concat"]
@@ -949,6 +962,12 @@ def run_validation(
             
             static_path = video_path_obj.parent.parent / "videos_static" / video_path_obj.name
             validation_static_videos.append(Path(data_config["data_root"]) / static_path)
+
+            warped_video_path = video_path_obj.parent.parent / "warped_videos" / video_path_obj.name
+            validation_warped_videos.append(Path(data_config["data_root"]) / warped_video_path)
+
+            warped_mask_video_path = video_path_obj.parent.parent / "warped_mask_videos" / video_path_obj.name
+            validation_warped_mask_videos.append(Path(data_config["data_root"]) / warped_mask_video_path)
             
             # Add SMPL pos map path if needed
             if use_smpl_pos_map:
@@ -965,8 +984,8 @@ def run_validation(
                 validation_raymaps.append(None)
 
         # Run validation for each video
-        for validation_video, validation_prompt, validation_hand_video, validation_static_video, validation_hand_video_left, validation_hand_video_right, validation_smpl_pos_map, validation_raymap in zip(
-            validation_videos, validation_prompts, validation_hand_videos, validation_static_videos, validation_hand_videos_left, validation_hand_videos_right, validation_smpl_pos_maps, validation_raymaps
+        for validation_video, validation_prompt, validation_hand_video, validation_static_video, validation_hand_video_left, validation_hand_video_right, validation_smpl_pos_map, validation_raymap, validation_warped_video, validation_warped_mask_video in zip(
+            validation_videos, validation_prompts, validation_hand_videos, validation_static_videos, validation_hand_videos_left, validation_hand_videos_right, validation_smpl_pos_maps, validation_raymaps, validation_warped_videos, validation_warped_mask_videos
         ):
             # Check required files based on pipeline type
             if pipeline_config["type"] in ["cogvideox_pose_adaln", "cogvideox_pose_adaln_perframe"]:
@@ -977,6 +996,10 @@ def run_validation(
             else:
                 # For concat/adapter, check for hand/static videos
                 required_files = [validation_video, validation_prompt, validation_static_video]
+                
+                if dataset_file_i2v is not None:
+                    required_files.append(validation_warped_video)
+                    required_files.append(validation_warped_mask_video)
                 
                 # Add hand video files based on split_hands mode
                 if split_hands:
@@ -1077,27 +1100,47 @@ def run_validation(
                     apply_blur_to_static=False,
                 )
                 
-                # Mode 2: Blurred static video (robustness test) - only if blur augmentation is enabled
-                condition_blur_prob = config.get("training", {}).get("condition_blur_prob", 0.0)
-                if condition_blur_prob > 0:
-                    condition_blur_strength = config.get("training", {}).get("condition_blur_strength", 0.2)
-                    print(f"   Mode 2: Static-to-Video (blurred condition, strength={condition_blur_strength})")
+                # # Mode 2: Blurred static video (robustness test) - only if blur augmentation is enabled
+                # condition_blur_prob = config.get("training", {}).get("condition_blur_prob", 0.0)
+                # if condition_blur_prob > 0:
+                #     condition_blur_strength = config.get("training", {}).get("condition_blur_strength", 0.2)
+                #     print(f"   Mode 2: Static-to-Video (blurred condition, strength={condition_blur_strength})")
+                #     log_validation_with_dataset(
+                #         pipe=pipe,
+                #         config=config,
+                #         accelerator=accelerator,
+                #         validation_video_path=validation_video,
+                #         validation_prompt=prompt_text,
+                #         validation_hand_video_path=validation_hand_video,
+                #         validation_static_video_path=validation_static_video,
+                #         validation_human_motions_path=None,
+                #         validation_hand_video_left_path=validation_hand_video_left,
+                #         validation_hand_video_right_path=validation_hand_video_right,
+                #         step=step,
+                #         pipeline_type=config["pipeline"]["type"],
+                #         validation_mode="static_to_video",
+                #         apply_blur_to_static=True,
+                #         blur_strength=condition_blur_strength,
+                #     )
+
+                # Mode 3: Warped static video (robustness test) - only if warped augmentation is enabled
+                if dataset_file_i2v is not None:
+                    print("   Mode 3: Static-to-Video (warped condition)")
                     log_validation_with_dataset(
                         pipe=pipe,
                         config=config,
                         accelerator=accelerator,
                         validation_video_path=validation_video,
                         validation_prompt=prompt_text,
+                        validation_mask_video_path=validation_warped_mask_video,
                         validation_hand_video_path=validation_hand_video,
-                        validation_static_video_path=validation_static_video,
+                        validation_static_video_path=validation_warped_video,
                         validation_human_motions_path=None,
                         validation_hand_video_left_path=validation_hand_video_left,
                         validation_hand_video_right_path=validation_hand_video_right,
                         step=step,
                         pipeline_type=config["pipeline"]["type"],
-                        validation_mode="static_to_video",
-                        apply_blur_to_static=True,
-                        blur_strength=condition_blur_strength,
+                        validation_mode="warped_to_video"
                     )
             elif config["pipeline"]["type"] == "cogvideox_static_to_video_cross_pose_adapter":
                 # For VideoX-Fun CrossPipeline, test static-to-video mode with cross-attention
@@ -2889,54 +2932,16 @@ def _create_fun_mask_input(noisy_model_input, vae_scaling_factor=None, warped_ma
     
     Args:
         noisy_model_input: [B, F_latent, C, H_latent, W_latent] tensor (latent space)
-        vae_scaling_factor: Scaling factor for VAE (optional)
-        warped_mask: [B, F_pixel, C_mask, H_pixel, W_pixel] or [B, C_mask, F_pixel, H_pixel, W_pixel] mask tensor (optional)
+        vae_scaling_factor: Scaling factor for VAE (optional, for backward compatibility)
+        warped_mask: [B, F_latent, 1, H_latent, W_latent] tensor (already processed in dataset)
     
     Returns:
         mask_input: [B, F_latent, 1, H_latent, W_latent] tensor (matching noisy_model_input dimensions)
     """
     if warped_mask is not None:
-        # Use warped_mask: resize to latent size (temporal + spatial) and apply VAE scaling factor
-        # warped_mask could be in [B, F, C, H, W] or [B, C, F, H, W] format
-        if warped_mask.ndim == 5:
-            # Determine format by checking if second dimension matches frame count (unlikely to be channels)
-            if warped_mask.shape[1] > 10:  # Likely frames if > 10 (frames are typically 16+)
-                mask = warped_mask  # [B, F, C, H, W]
-            else:  # [B, C, F, H, W]
-                mask = warped_mask.permute(0, 2, 1, 3, 4)  # [B, F, C, H, W]
-        else:
-            raise ValueError(f"Unexpected warped_mask shape: {warped_mask.shape}")
-        
-        # If mask has multiple channels, take first channel
-        if mask.shape[2] > 1:
-            mask = mask[:, :, :1, :, :]  # Take first channel: [B, F_pixel, 1, H_pixel, W_pixel]
-        elif mask.shape[2] == 1:
-            mask = mask  # Already single channel: [B, F_pixel, 1, H_pixel, W_pixel]
-        
-        # Get target dimensions from noisy_model_input: [F_latent, H_latent, W_latent]
-        b_latent, f_latent, c_latent, h_latent, w_latent = noisy_model_input.shape
-        b_mask, f_pixel, c_mask, h_pixel, w_pixel = mask.shape
-        
-        # Resize mask to latent dimensions using trilinear interpolation (temporal + spatial)
-        # Convert to [B, C, F, H, W] format for F.interpolate (it expects channel first)
-        mask = mask.permute(0, 2, 1, 3, 4)  # [B, 1, F_pixel, H_pixel, W_pixel]
-        # Use trilinear interpolation to resize all dimensions at once
-        # Target: [f_latent, h_latent, w_latent]
-        resized_mask = F.interpolate(
-            mask,
-            size=(f_latent, h_latent, w_latent),
-            mode='trilinear',  # 3D interpolation: temporal + spatial
-            align_corners=False
-        )
-        
-        # Convert back to [B, F, C, H, W] format
-        resized_mask = resized_mask.permute(0, 2, 1, 3, 4)  # [B, F_latent, 1, H_latent, W_latent]
-        
-        # Apply VAE scaling factor
-        if vae_scaling_factor is not None:
-            resized_mask = resized_mask * vae_scaling_factor
-        
-        return resized_mask
+        # warped_mask is already processed in dataset (interpolated and scaled)
+        # Shape: [B, F_latent, 1, H_latent, W_latent]
+        return warped_mask * vae_scaling_factor
     else:
         # Default: create ones mask matching noisy_model_input shape
         if vae_scaling_factor is not None:
@@ -2958,7 +2963,6 @@ def _blur_condition_latent(latent: torch.Tensor, strength: float = 0.2) -> torch
     Returns:
         Blurred latent tensor with same shape
     """
-    import torch.nn.functional as F
     
     # Determine kernel size based on strength
     kernel_size = int(3 + strength * 10)
@@ -3343,6 +3347,8 @@ def main():
     dataset_init_kwargs = {
         "data_root": data_config["data_root"],
         "dataset_file": data_config["dataset_file"],
+        "dataset_file_i2v": data_config.get("dataset_file_i2v", None),  # Optional i2v dataset file
+        "start_i2v_training_iter": training_config.get("start_i2v_training_iter", None),
         "max_num_frames": training_config.get("custom_settings", {}).get("max_num_frames", 48),
         "load_tensors": training_config.get("custom_settings", {}).get("load_tensors", False),
         "random_flip": training_config.get("custom_settings", {}).get("random_flip", False),
@@ -3395,12 +3401,8 @@ def main():
     #     num_workers=data_config.get("dataloader_num_workers", 0),
     #     pin_memory=data_config.get("pin_memory", True),
     # )
-    train_dataloader = DataLoader(
-        train_dataset,
-        batch_size=training_config["batch_size"],
-        shuffle=True,
-        drop_last=True,  # Drop last incomplete batch to ensure consistent batch size
-        collate_fn=lambda batch: {
+    def collate_fn(batch):
+        return {
             "videos": torch.stack([item["video"] for item in batch]),
             "prompts": (
                 torch.stack([item["prompt"] for item in batch])
@@ -3415,9 +3417,15 @@ def main():
             "raymaps": torch.stack([item["raymap"] for item in batch]) if "raymap" in batch[0] and batch[0]["raymap"] is not None else None,
             "image_goal": torch.stack([item["image_goal"] for item in batch]) if "image_goal" in batch[0] and batch[0]["image_goal"] is not None else None,
             "raw_video": torch.stack([item["raw_video"] for item in batch]) if "raw_video" in batch[0] and batch[0]["raw_video"] is not None else None,
-            "warped_videos": torch.stack([item["warped_videos"] for item in batch]) if "warped_videos" in batch[0] and batch[0]["warped_videos"] is not None else None,
-            "warped_masks": torch.stack([item["warped_masks"] for item in batch]) if "warped_masks" in batch[0] and batch[0]["warped_masks"] is not None else None,
-        },
+            "masks": torch.stack([item["masks"] for item in batch]) if "masks" in batch[0] else None,
+        }
+    
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=training_config["batch_size"],
+        shuffle=True,
+        drop_last=True,  # Drop last incomplete batch to ensure consistent batch size
+        collate_fn=collate_fn,
         num_workers=data_config.get("dataloader_num_workers", 0),
         pin_memory=data_config.get("pin_memory", True),
     )
@@ -3705,6 +3713,10 @@ def main():
                     first_epoch = global_step // num_update_steps_per_epoch
     else:
         initial_global_step = 0
+    
+    # Initialize dataset's global_step for conditional i2v training
+    if hasattr(train_dataset, 'set_global_step'):
+        train_dataset.set_global_step(initial_global_step)
 
     progress_bar = tqdm(
         range(0, max_train_steps),
@@ -3839,12 +3851,6 @@ def main():
     # Training loop - epoch based (like original CogVideoX)
     transformer.train()
 
-    # Check if we should use warped_videos (for I2V training)
-    start_i2v_training_iter = training_config.get("start_i2v_training_iter", None)
-    warped_videos_prob = training_config.get("warped_videos_prob", 0.0)
-    use_warped_videos = False
-    warped_mask = None
-
     for epoch in range(first_epoch, num_epochs):
         for step, batch in enumerate(train_dataloader):
             models_to_accumulate = [transformer]
@@ -3854,25 +3860,15 @@ def main():
                 # Update epoch for display
                 current_epoch = epoch
                 
-                if start_i2v_training_iter is not None and global_step >= start_i2v_training_iter:
-                    # Check probability for using warped_videos
-                    if random.random() < warped_videos_prob:
-                        warped_videos = batch.get("warped_videos")
-                        warped_masks = batch.get("warped_masks")
-                        if warped_videos is not None:
-                            use_warped_videos = True
-                            # Process warped_mask for later use in mask creation
-                            if warped_masks is not None:
-                                warped_mask = warped_masks.to(accelerator.device, non_blocking=True)
-                                # warped_mask format will be handled in _create_fun_mask_input
-                                # It can be [B, F, C, H, W] or [B, C, F, H, W] depending on dataset format
-                                # _create_fun_mask_input will resize it to match latent spatial size
+                # Get videos (already decided at dataset level whether to use warped_videos)
+                videos = batch["videos"].to(accelerator.device, non_blocking=True)
                 
-                # Use warped_videos if available and selected, otherwise use regular videos
-                if use_warped_videos:
-                    videos = warped_videos.to(accelerator.device, non_blocking=True)
-                else:
-                    videos = batch["videos"].to(accelerator.device, non_blocking=True)
+                # Get mask if available
+                # Note: dataset creates mask field only for i2v samples when global_step >= start_i2v_training_iter
+                # So if masks exists in batch, it means it's from an i2v sample and we should use it
+                warped_mask = None
+                if batch.get("masks") is not None:
+                    warped_mask = batch["masks"].to(accelerator.device, non_blocking=True)
                 
                 images = batch.get("images")  # For I2V pipeline and prediction mode
                 prompts = batch["prompts"]
@@ -4225,8 +4221,11 @@ def main():
                     # For VideoX-Fun static-to-video pose concat pipeline, use both static and hand videos as conditions
                     # Use preprocessed condition latents
                     # Use warped_mask if available (for I2V training)
-                    mask_input = _create_fun_mask_input(noisy_model_input, VAE_SCALING_FACTOR, warped_mask=warped_mask)
-                    transformer_input = torch.cat([noisy_model_input, mask_input, static_videos_latents, hand_videos_latents], dim=2)
+                    mask_input = _create_fun_mask_input(noisy_model_input, VAE_SCALING_FACTOR, 
+                                                        warped_mask=warped_mask)
+                    mask_input = mask_input.to(device=accelerator.device, dtype=weight_dtype)
+                    transformer_input = torch.cat([noisy_model_input, mask_input, 
+                                                   static_videos_latents, hand_videos_latents], dim=2)
                     condition_latents = None
                     
                 elif pipeline_config["type"] == "cogvideox_fun_static_to_video_posmap_concat":
@@ -4601,6 +4600,10 @@ def main():
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
+                
+                # Update dataset's global_step for conditional i2v training
+                if hasattr(train_dataset, 'set_global_step'):
+                    train_dataset.set_global_step(global_step)
 
                 # Log metrics
                 last_lr = lr_scheduler.get_last_lr()[0] if lr_scheduler is not None else training_config["learning_rate"]
