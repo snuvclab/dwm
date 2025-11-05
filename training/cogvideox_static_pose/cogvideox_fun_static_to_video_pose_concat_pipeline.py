@@ -1888,6 +1888,8 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
         processed_hand_videos = None
         if hand_videos is not None:
             processed_hand_videos = self.preprocess_hand_conditions(hand_videos, height, width, num_frames)
+            processed_hand_videos = self.image_processor.preprocess(rearrange(processed_hand_videos, "b c f h w -> (b f) c h w"), height=height, width=width) 
+            processed_hand_videos = rearrange(processed_hand_videos, "(b f) c h w -> b c f h w", f=video_length)
 
         # Preprocess smpl_pos_map if provided
         processed_smpl_pos_map = None
