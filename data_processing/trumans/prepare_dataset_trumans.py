@@ -456,6 +456,8 @@ def serialize_artifacts(
     static_video_latents_dir: Optional[pathlib.Path] = None,
     smpl_pos_map_dir: Optional[pathlib.Path] = None,
     smpl_pos_map_latents_dir: Optional[pathlib.Path] = None,
+    warped_videos_dir: Optional[pathlib.Path] = None,
+    warped_video_latents_dir: Optional[pathlib.Path] = None,
     images: Optional[torch.Tensor] = None,
     image_latents: Optional[torch.Tensor] = None,
     images_goal: Optional[torch.Tensor] = None,
@@ -482,6 +484,8 @@ def serialize_artifacts(
     static_video_latents: Optional[torch.Tensor] = None,
     smpl_pos_map: Optional[torch.Tensor] = None,
     smpl_pos_map_latents: Optional[torch.Tensor] = None,
+    warped_videos: Optional[torch.Tensor] = None,
+    warped_video_latents: Optional[torch.Tensor] = None,
 ) -> None:
     # Handle the case where videos is None (selective processing)
     if videos is not None:
@@ -527,6 +531,8 @@ def serialize_artifacts(
         (static_video_latents, static_video_latents_dir, torch.save, "pt"),
         (smpl_pos_map, smpl_pos_map_dir, functools.partial(save_video, fps=fps), "mp4"),
         (smpl_pos_map_latents, smpl_pos_map_latents_dir, torch.save, "pt"),
+        (warped_videos, warped_videos_dir, functools.partial(save_video, fps=fps), "mp4"),
+        (warped_video_latents, warped_video_latents_dir, torch.save, "pt"),
         (prompts, prompts_dir, save_prompt, "txt"),
         (prompt_embeds, prompt_embeds_dir, torch.save, "pt"),
         (metadata, videos_dir, save_metadata, "txt"),
@@ -558,8 +564,10 @@ def serialize_artifacts(
                 "static_video_latents": 12,
                 "smpl_pos_map_egoallo": 13,
                 "smpl_pos_map_egoallo_latents": 14,
-                "prompts": 15,
-                "prompt_embeds": 16,
+                "warped_videos": 15,
+                "warped_video_latents": 16,
+                "prompts": 17,
+                "prompt_embeds": 18,
             }
         else:  # aether
             file_type_to_index = {
@@ -605,7 +613,7 @@ def serialize_artifacts(
         # Only include metadata if we're processing videos or other file types that need it
         if model_type == "cogvideox_pose":
             should_include_metadata = any(ft in selective_processing for ft in ["videos", "video_latents", "prompts", "prompt_embeds"])
-            metadata_index = 9
+            metadata_index = 11
         else:  # aether
             should_include_metadata = any(ft in selective_processing for ft in ["videos", "video_latents", "disparity", "disparity_latents", "images", "image_latents", "human_motions", "prompts", "prompt_embeds"])
             metadata_index = 13
@@ -729,6 +737,8 @@ def main():
     static_video_latents_dir = tmp_dir.joinpath(f"static_video_latents/{rank}")
     smpl_pos_map_dir = tmp_dir.joinpath(f"smpl_pos_map_egoallo/{rank}")
     smpl_pos_map_latents_dir = tmp_dir.joinpath(f"smpl_pos_map_egoallo_latents/{rank}")
+    warped_videos_dir = tmp_dir.joinpath(f"warped_videos/{rank}")
+    warped_video_latents_dir = tmp_dir.joinpath(f"warped_video_latents/{rank}")
 
     # Create common folders
     videos_dir.mkdir(parents=True, exist_ok=True)
@@ -767,6 +777,8 @@ def main():
         static_video_latents_dir.mkdir(parents=True, exist_ok=True)
         smpl_pos_map_dir.mkdir(parents=True, exist_ok=True)
         smpl_pos_map_latents_dir.mkdir(parents=True, exist_ok=True)
+        warped_videos_dir.mkdir(parents=True, exist_ok=True)
+        warped_video_latents_dir.mkdir(parents=True, exist_ok=True)
 
     weight_dtype = DTYPE_MAPPING[args.dtype]
     target_fps = args.target_fps
@@ -919,10 +931,11 @@ def main():
                 "raymap_abs": raymap_abs,
             }
         else:  # cogvideox_pose
-            # Add hand_videos, static_videos, and smpl_pos_map if they exist in the dataset
+            # Add hand_videos, static_videos, smpl_pos_map, and warped_videos if they exist in the dataset
             hand_videos = None
             static_videos = None
             smpl_pos_map = None
+            warped_videos = None
             
             if "hand_videos" in batch[0] and batch[0]["hand_videos"] is not None:
                 hand_videos = torch.stack([item["hand_videos"] for item in batch]).to(dtype=weight_dtype, non_blocking=True)
@@ -932,12 +945,16 @@ def main():
             
             if "smpl_pos_map" in batch[0] and batch[0]["smpl_pos_map"] is not None:
                 smpl_pos_map = torch.stack([item["smpl_pos_map"] for item in batch]).to(dtype=weight_dtype, non_blocking=True)
+            
+            if "warped_videos" in batch[0] and batch[0]["warped_videos"] is not None:
+                warped_videos = torch.stack([item["warped_videos"] for item in batch]).to(dtype=weight_dtype, non_blocking=True)
 
             return {
                 "videos": videos,
                 "hand_videos": hand_videos,
                 "static_videos": static_videos,
                 "smpl_pos_map": smpl_pos_map,
+                "warped_videos": warped_videos,
             }
 
     dataloader = DataLoader(
@@ -1000,6 +1017,8 @@ def main():
             hand_mask_videos = None
             static_videos = None
             static_video_latents = None
+            warped_videos = None
+            warped_video_latents = None
             pose_params = None
             prompts = None
             prompt_embeds = None
@@ -1090,6 +1109,9 @@ def main():
                 
                 if batch["smpl_pos_map"] is not None:
                     smpl_pos_map = batch["smpl_pos_map"].to(device, non_blocking=True)
+                
+                if batch["warped_videos"] is not None:
+                    warped_videos = batch["warped_videos"].to(device, non_blocking=True)
 
                 # Encode videos for CogVideoX pose
                 if args.save_latents_and_embeddings:
@@ -1201,6 +1223,7 @@ def main():
                 should_process_static_videos = (args.selective_processing is None or "static_video_latents" in args.selective_processing)
                 should_process_hand_masks = (args.selective_processing is None or "videos_hands_mask" in args.selective_processing)
                 should_process_smpl_pos_map = (args.selective_processing is None or "smpl_pos_map_egoallo_latents" in args.selective_processing)
+                should_process_warped_videos = (args.selective_processing is None or "warped_video_latents" in args.selective_processing)
                 
                 # Need hand_videos for left/right processing even if not saving hand_video_latents
                 need_hand_videos = should_process_hand_videos or should_process_hand_gray_left or should_process_hand_gray_right or should_process_hand_masks
@@ -1231,19 +1254,19 @@ def main():
                 # Use hand_videos if it's available, otherwise use hand_videos_for_splitting
                 source_hand_videos = hand_videos if hand_videos is not None else hand_videos_for_splitting
                 if should_process_hand_gray_left and source_hand_videos is not None:
-                    batch_size, frames, total_channels, height, width = source_hand_videos.shape
+                    batch_size, total_channels, frames, height, width = source_hand_videos.shape
                     channels_per_hand = total_channels // 2
-                    hand_videos_gray_left = source_hand_videos[:, :, :channels_per_hand, :, :].permute(0, 2, 1, 3, 4)  # encode용
-                    hand_videos_gray_left_save = (hand_videos_gray_left + 1) / 2                                      # 저장용
+                    hand_videos_gray_left = source_hand_videos[:, :channels_per_hand, :, :, :]
+                    hand_videos_gray_left_save = (hand_videos_gray_left + 1) / 2                                      
                     print(f"Created left hand videos with shape: {hand_videos_gray_left.shape}")
                 else:
                     hand_videos_gray_left = None
                     hand_videos_gray_left_save = None
                 
                 if should_process_hand_gray_right and source_hand_videos is not None:
-                    batch_size, frames, total_channels, height, width = source_hand_videos.shape
+                    batch_size, total_channels, frames, height, width = source_hand_videos.shape
                     channels_per_hand = total_channels // 2
-                    hand_videos_gray_right = source_hand_videos[:, :, channels_per_hand:, :, :].permute(0, 2, 1, 3, 4)
+                    hand_videos_gray_right = source_hand_videos[:, channels_per_hand:, :, :, :]
                     hand_videos_gray_right_save = (hand_videos_gray_right + 1) / 2
                     print(f"Created right hand videos with shape: {hand_videos_gray_right.shape}")
                 else:
@@ -1266,6 +1289,15 @@ def main():
                 else:
                     smpl_pos_map_encode = None
                     smpl_pos_map_save = None
+                
+                # Process warped_videos if requested
+                if should_process_warped_videos and warped_videos is not None:
+                    warped_videos_encode = warped_videos.permute(0, 2, 1, 3, 4)
+                    warped_videos_save = (warped_videos_encode + 1) / 2
+                    print(f"Processed warped videos with shape: {warped_videos_encode.shape}")
+                else:
+                    warped_videos_encode = None
+                    warped_videos_save = None
 
             # Encode videos for CogVideoX pose (after data processing so hand_videos_gray_left/right are available)
             if args.model_type == "cogvideox_pose" and args.save_latents_and_embeddings:
@@ -1326,6 +1358,12 @@ def main():
                     smpl_pos_map_latents = vae._encode(smpl_pos_map)
                     smpl_pos_map_latents = smpl_pos_map_latents.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
                     print(f"Encoded SMPL pos map latents with shape: {smpl_pos_map_latents.shape}")
+                
+                warped_video_latents = None
+                if should_process_warped_videos and warped_videos is not None:
+                    warped_video_latents = vae._encode(warped_videos_encode)
+                    warped_video_latents = warped_video_latents.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
+                    print(f"Encoded warped video latents with shape: {warped_video_latents.shape}")
 
             # Get video paths for this batch (always needed for filename generation)
             batch_video_paths = []
@@ -1511,6 +1549,14 @@ def main():
                         "smpl_pos_map": smpl_pos_map,
                         "smpl_pos_map_latents": smpl_pos_map_latents,
                     })
+                
+                if should_process_warped_videos or args.selective_processing is None:
+                    output_data.update({
+                        "warped_videos_dir": warped_videos_dir,
+                        "warped_video_latents_dir": warped_video_latents_dir,
+                        "warped_videos": warped_videos_save if warped_videos_save is not None else None,
+                        "warped_video_latents": warped_video_latents,
+                    })
             output_queue.put(output_data)
 
         except Exception:
@@ -1572,6 +1618,8 @@ def main():
                 ("static_video_latents", "pt"),
                 ("smpl_pos_map_egoallo", "mp4"),
                 ("smpl_pos_map_egoallo_latents", "pt"),
+                ("warped_videos", "mp4"),
+                ("warped_video_latents", "pt"),
             ]
         
         all_folders = common_folders + model_folders
@@ -1679,6 +1727,10 @@ def main():
                         data["smpl_pos_map"] = f"smpl_pos_map_egoallo/{stem}.mp4"
                     if args.selective_processing is None or "smpl_pos_map_egoallo_latents" in args.selective_processing:
                         data["smpl_pos_map_latent"] = f"smpl_pos_map_egoallo_latents/{stem}.pt"
+                    if args.selective_processing is None or "warped_videos" in args.selective_processing:
+                        data["warped_video"] = f"warped_videos/{stem}.mp4"
+                    if args.selective_processing is None or "warped_video_latents" in args.selective_processing:
+                        data["warped_video_latent"] = f"warped_video_latents/{stem}.pt"
                 
                 file.write(json.dumps(data) + "\n")
 
