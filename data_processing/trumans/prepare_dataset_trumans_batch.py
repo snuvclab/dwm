@@ -223,7 +223,7 @@ def get_args() -> argparse.Namespace:
         nargs="+",
         type=str,
         default=None,
-        help="Only check these specific file types when using --skip_existing. If --model_type is not 'custom', this argument is ignored. Options: videos, images, images_goal, image_latents, image_goal_latents, video_latents, disparity, disparity_latents, raymaps, raymaps_abs, prompts, prompt_embeds, human_motions, videos_hands, hand_video_latents, videos_hands_gray, hand_video_gray_latents, videos_hands_gray_left, hand_video_gray_left_latents, videos_hands_gray_right, hand_video_gray_right_latents, videos_hands_mask, hand_video_mask_latents, videos_static, static_video_latents",
+        help="Only check these specific file types when using --skip_existing. If --model_type is not 'custom', this argument is ignored. Options: videos, images, images_goal, image_latents, image_goal_latents, video_latents, disparity, disparity_latents, raymaps, raymaps_abs, prompts, prompt_embeds, human_motions, videos_hands, hand_video_latents, videos_hands_gray, hand_video_gray_latents, videos_hands_gray_left, hand_video_gray_left_latents, videos_hands_gray_right, hand_video_gray_right_latents, videos_hands_mask, hand_video_mask_latents, videos_static, static_video_latents, warped_videos, warped_video_latents",
     )
     parser.add_argument(
         "--scene_filter",
@@ -303,7 +303,7 @@ def get_model_file_types(model_type: str) -> List[str]:
             "videos", "video_latents", "prompts", "prompt_embeds",
             "videos_hands", "hand_video_latents", "videos_hands_gray", "hand_video_gray_latents", 
             "videos_hands_gray_left", "hand_video_gray_left_latents", "videos_hands_gray_right", "hand_video_gray_right_latents",
-            "videos_hands_mask", "hand_video_mask_latents", "videos_static", "static_video_latents"
+            "videos_hands_mask", "hand_video_mask_latents", "videos_static", "static_video_latents", "warped_videos", "warped_video_latents"
         ]
     else:  # custom
         return []
@@ -480,6 +480,8 @@ def process_single_scene_action(
             "hand_video_mask_latents": "--save_latents_and_embeddings",
             "videos_static": "--save_latents_and_embeddings",
             "static_video_latents": "--save_latents_and_embeddings",
+            "warped_videos": "--save_latents_and_embeddings",
+            "warped_video_latents": "--save_latents_and_embeddings",
         }
         
         # Add flags for missing file types
@@ -500,7 +502,8 @@ def process_single_scene_action(
             "hand_video_gray_latents" in missing_file_types or "videos_hands_gray_left" in missing_file_types or
             "hand_video_gray_left_latents" in missing_file_types or "videos_hands_gray_right" in missing_file_types or
             "hand_video_gray_right_latents" in missing_file_types or "videos_hands_mask" in missing_file_types or
-            "hand_video_mask_latents" in missing_file_types or "videos_static" in missing_file_types or "static_video_latents" in missing_file_types):
+            "hand_video_mask_latents" in missing_file_types or "videos_static" in missing_file_types or "static_video_latents" in missing_file_types or
+            "warped_videos" in missing_file_types or "warped_video_latents" in missing_file_types):
             if "--save_latents_and_embeddings" not in cmd_parts:
                 cmd_parts.append("--save_latents_and_embeddings")
         
@@ -729,7 +732,7 @@ def main():
                 "prompts", "prompt_embeds", "human_motions", "videos_hands", "hand_video_latents",
                 "videos_hands_gray", "hand_video_gray_latents", "videos_hands_gray_left", 
                 "hand_video_gray_left_latents", "videos_hands_gray_right", "hand_video_gray_right_latents",
-                "videos_hands_mask", "videos_static", "static_video_latents"
+                "videos_hands_mask", "hand_video_mask_latents", "videos_static", "static_video_latents", "warped_videos", "warped_video_latents"
             ]
             if rank == 0:
                 print(f"   Will check all file types")
@@ -785,6 +788,8 @@ def main():
                     "hand_video_mask_latents": ".pt",
                     "videos_static": ".mp4",
                     "static_video_latents": ".pt",
+                    "warped_videos": ".mp4",
+                    "warped_video_latents": ".pt",
                 }
                 
                 expected_extension = file_type_extensions.get(file_type, "")
@@ -930,7 +935,7 @@ def main():
                                 "prompts", "prompt_embeds", "human_motions", "videos_hands", "hand_video_latents",
                                 "videos_hands_gray", "hand_video_gray_latents", "videos_hands_gray_left", 
                                 "hand_video_gray_left_latents", "videos_hands_gray_right", "hand_video_gray_right_latents",
-                                "videos_hands_mask", "hand_video_mask_latents", "videos_static", "static_video_latents"
+                                "videos_hands_mask", "hand_video_mask_latents", "videos_static", "static_video_latents", "warped_videos", "warped_video_latents"
                             ]
                         total_missing_files += len(file_types_to_check)
                     print()
@@ -985,7 +990,7 @@ def main():
                             "prompts", "prompt_embeds", "human_motions", "videos_hands", "hand_video_latents",
                             "videos_hands_gray", "hand_video_gray_latents", "videos_hands_gray_left", 
                             "hand_video_gray_left_latents", "videos_hands_gray_right", "hand_video_gray_right_latents",
-                            "videos_hands_mask", "videos_static", "static_video_latents"
+                            "videos_hands_mask", "hand_video_mask_latents", "videos_static", "static_video_latents", "warped_videos", "warped_video_latents"
                         ]
                     total_missing_files += len(file_types_to_check)
                 print()
