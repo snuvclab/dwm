@@ -92,7 +92,7 @@ scheduler = CogVideoXDPMScheduler.from_pretrained(
     subfolder="scheduler"
 )
 
-# proj_path = os.path.join(lora_path, "projection_layer_weights.pt")
+proj_path = os.path.join(lora_path, "projection_layer_weights.pt")
 non_lora_file = os.path.join(lora_path, "non_lora_weights.pt")
 proj_path = non_lora_file
 
@@ -189,7 +189,7 @@ for validation_video in validation_video_list:
 
     input_video_mask = torch.zeros_like(input_video[:, :1])
 
-    if proj_path is not None:
+    if os.path.exists(proj_path):
         # hand_video = iio.imread(os.path.join("/virtual_lab/jhb_vclab/world_model/data", hand_video_path)).astype(np.float32) / 255.0
         # hand_video = hand_video.transpose(3, 0, 1, 2)  # [F, H, W, C] -> [C, F, H, W]
         # hand_video = hand_video[np.newaxis, :]  # Add batch dimension: [C, F, H, W] -> [1, C, F, H, W]
@@ -202,40 +202,41 @@ for validation_video in validation_video_list:
     # input_video_mask = input_video_mask[:, :1]
     # input_video_mask = morph2d(input_video_mask, kernel_size=501, mode="dilate")
 
-    with torch.no_grad():
-        sample = pipeline(
-            prompt, 
-            num_frames = 49,
-            negative_prompt = negative_prompt,
-            height      = 480,
-            width       = 720,
-            generator   = generator,
-            guidance_scale = guidance_scale,
-            num_inference_steps = num_inference_steps,
-            video       = input_video,
-            mask_video  = input_video_mask,
-            hand_video = hand_video,
-            strength    = 1.0,
-            use_dynamic_cfg = False,
-        ).videos
+    for idx in range(3):
+        with torch.no_grad():
+            sample = pipeline(
+                prompt, 
+                num_frames = 49,
+                negative_prompt = negative_prompt,
+                height      = 480,
+                width       = 720,
+                # generator   = generator,
+                guidance_scale = guidance_scale,
+                num_inference_steps = num_inference_steps,
+                video       = input_video,
+                mask_video  = input_video_mask,
+                hand_video = hand_video,
+                strength    = 1.0,
+                use_dynamic_cfg = False,
+            ).videos
 
-        def save_results():
-            if not os.path.exists(save_path):
-                os.makedirs(save_path, exist_ok=True)
-            name = validation_video.replace("/", "_")
+            def save_results(idx):
+                if not os.path.exists(save_path):
+                    os.makedirs(save_path, exist_ok=True)
+                name = validation_video.replace("/", "_").replace(".mp4", f"_{idx}.mp4")
 
-            index = len([path for path in os.listdir(save_path)]) + 1
-            prefix = str(index).zfill(8)
-            if video_length == 1:
-                video_path = os.path.join(save_path, prefix + ".png")
+                index = len([path for path in os.listdir(save_path)]) + 1
+                prefix = str(index).zfill(8)
+                if video_length == 1:
+                    video_path = os.path.join(save_path, prefix + ".png")
 
-                image = sample[0, :, 0]
-                image = image.transpose(0, 1).transpose(1, 2)
-                image = (image * 255).numpy().astype(np.uint8)
-                image = Image.fromarray(image)
-                image.save(video_path)
-            else:
-                video_path = os.path.join(save_path, name)
-                save_videos_grid(sample, video_path, fps=fps)
+                    image = sample[0, :, 0]
+                    image = image.transpose(0, 1).transpose(1, 2)
+                    image = (image * 255).numpy().astype(np.uint8)
+                    image = Image.fromarray(image)
+                    image.save(video_path)
+                else:
+                    video_path = os.path.join(save_path, name)
+                    save_videos_grid(sample, video_path, fps=fps)
 
-        save_results()
+            save_results(idx)
