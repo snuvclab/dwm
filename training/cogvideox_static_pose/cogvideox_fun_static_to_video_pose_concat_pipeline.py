@@ -1422,6 +1422,49 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
         
         return hand_videos
 
+    def preprocess_mask_video(
+        self,
+        mask_video,
+        height,
+        width,
+        num_frames,
+    ):
+        """Preprocess mask video.
+        
+        Args:
+            mask_video: Input mask video tensor of shape [B, C, F, H, W]
+            height: Target height
+            width: Target width  
+            num_frames: Target number of frames
+            
+        Returns:
+            Preprocessed mask video tensor of shape [B, C, F, H, W]
+        """
+        # Convert to torch tensor if needed
+        if isinstance(mask_video, np.ndarray):
+            mask_video = torch.from_numpy(mask_video)
+        
+        # Ensure input is [B, C, F, H, W]
+        if mask_video.ndim == 4:  # [C, F, H, W] -> [1, C, F, H, W]
+            mask_video = mask_video.unsqueeze(0)
+        elif mask_video.ndim == 5:  # Already [B, C, F, H, W]
+            pass
+        else:
+            raise ValueError(f"Expected 4D or 5D tensor, got {mask_video.ndim}D tensor")
+        
+        # Input is already [B, C, F, H, W], no need to permute
+        
+        # Ensure correct number of frames
+        if mask_video.shape[2] != num_frames:
+            mask_video = F.interpolate(
+                mask_video,  # [B, C, F, H, W]
+                size=(num_frames, height, width),
+                mode='trilinear',
+                align_corners=False
+            )
+        
+        return mask_video
+
     def preprocess_smpl_pos_map(
         self,
         smpl_pos_map,
@@ -2004,6 +2047,7 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
                 inpaint_latents = torch.cat([mask_input, masked_video_latents_input], dim=2).to(latents.dtype)
             else:
                 # Prepare mask latent variables
+                mask_video = self.preprocess_mask_video(mask_video, height, width, num_frames)[:, :1]
                 mask_condition = self.mask_processor.preprocess(rearrange(mask_video, "b c f h w -> (b f) c h w"), height=height, width=width) 
                 mask_condition = mask_condition.to(dtype=torch.float32)
                 mask_condition = rearrange(mask_condition, "(b f) c h w -> b c f h w", f=video_length)
