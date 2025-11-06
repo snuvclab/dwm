@@ -1,0 +1,6 @@
+[submodule "thirdparty/DROID-SLAM/thirdparty/lietorch"]
+	path = thirdparty/DROID-SLAM/thirdparty/lietorch
+	url = https://github.com/princeton-vl/lietorch
+[submodule "thirdparty/DROID-SLAM/thirdparty/eigen"]
+	path = thirdparty/DROID-SLAM/thirdparty/eigen
+	url = https://gitlab.com/libeigen/eigen.git
