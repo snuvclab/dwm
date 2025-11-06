@@ -58,7 +58,9 @@ save_path = os.path.join(lora_path, "eval")
 os.makedirs(save_path, exist_ok=True)
 
 
-model_name = "/virtual_lab/jhb_vclab/taeksoo/.cache/huggingface/hub/models--alibaba-pai--CogVideoX-Fun-V1.1-5b-InP/snapshots/b3798d82878e57443314b29d73633a165dd4c008"
+model_name = "checkpoints/cvx_fun"
+trans_name = "outputs/251104/trumans_fun_static_hand_concat_lora_old_hand_new_prompt_slurm_80513/checkpoint-10500/"
+save_path = os.path.join(trans_name, "eval")
 weight_dtype = torch.bfloat16
 
 negative_prompt         = "The video is not of a high quality, it has a low resolution. Watermark present in each frame. The background is solid. Strange body and strange trajectory. Distortion. "
@@ -72,7 +74,7 @@ fps = 8
 
 
 transformer = CogVideoXTransformer3DModel.from_pretrained(
-    model_name, 
+    trans_name, 
     subfolder="transformer",
     low_cpu_mem_usage=True,
     torch_dtype=weight_dtype,
@@ -92,56 +94,56 @@ scheduler = CogVideoXDPMScheduler.from_pretrained(
     subfolder="scheduler"
 )
 
-proj_path = os.path.join(lora_path, "projection_layer_weights.pt")
-non_lora_file = os.path.join(lora_path, "non_lora_weights.pt")
-proj_path = non_lora_file
-
-if os.path.exists(proj_path) or os.path.exists(non_lora_file):
-    with torch.no_grad():
-        new_conv_in = torch.nn.Conv2d( # 1 for object mask
-            transformer.patch_embed.proj.in_channels + 16, transformer.patch_embed.proj.out_channels, \
-                transformer.patch_embed.proj.kernel_size, transformer.patch_embed.proj.stride, transformer.patch_embed.proj.padding
-        )
-        transformer.patch_embed.proj = new_conv_in
-    proj_dict = torch.load(proj_path, map_location="cpu")
-    proj_dict['weight'] = proj_dict['patch_embed.proj.weight']
-    proj_dict['bias'] = proj_dict['patch_embed.proj.bias']
-    model_state_dict = transformer.patch_embed.proj.state_dict()
-    loaded_keys = []
-    for name, param_data in proj_dict.items():
-        if name in model_state_dict:
-            model_state_dict[name].copy_(param_data)
-            loaded_keys.append(name)
-    # transformer.patch_embed.proj.load_state_dict(torch.load(proj_path, weights_only=True))
-    transformer.patch_embed.proj.to(dtype=torch.bfloat16, device="cuda")
-
-
-# Add LoRA to attention layers (same config as training)
-transformer_lora_config = LoraConfig(
-    r=64,
-    lora_alpha=64,
-    init_lora_weights=True,
-    target_modules=["to_q", "to_k", "to_v", "to_out.0"],
-)
-transformer.add_adapter(transformer_lora_config)
-
-# Try to load from safetensors first
-safetensors_path = os.path.join(lora_path, "pytorch_lora_weights.safetensors")
-if os.path.exists(safetensors_path):
-    from safetensors.torch import load_file
-    lora_state_dict = load_file(safetensors_path)
-transformer_state_dict = convert_unet_state_dict_to_peft(lora_state_dict)
-set_peft_model_state_dict(transformer, transformer_state_dict, adapter_name="default")
-
+# proj_path = os.path.join(lora_path, "projection_layer_weights.pt")
 # non_lora_file = os.path.join(lora_path, "non_lora_weights.pt")
-if os.path.exists(non_lora_file):
-    non_lora_state_dict = torch.load(non_lora_file, map_location="cpu")
-    model_state_dict = transformer.state_dict()
-    loaded_keys = []
-    for name, param_data in non_lora_state_dict.items():
-        if name in model_state_dict:
-            model_state_dict[name].copy_(param_data)
-            loaded_keys.append(name)
+# proj_path = non_lora_file
+
+# if os.path.exists(proj_path) or os.path.exists(non_lora_file):
+#     with torch.no_grad():
+#         new_conv_in = torch.nn.Conv2d( # 1 for object mask
+#             transformer.patch_embed.proj.in_channels + 16, transformer.patch_embed.proj.out_channels, \
+#                 transformer.patch_embed.proj.kernel_size, transformer.patch_embed.proj.stride, transformer.patch_embed.proj.padding
+#         )
+#         transformer.patch_embed.proj = new_conv_in
+#     proj_dict = torch.load(proj_path, map_location="cpu")
+#     proj_dict['weight'] = proj_dict['patch_embed.proj.weight']
+#     proj_dict['bias'] = proj_dict['patch_embed.proj.bias']
+#     model_state_dict = transformer.patch_embed.proj.state_dict()
+#     loaded_keys = []
+#     for name, param_data in proj_dict.items():
+#         if name in model_state_dict:
+#             model_state_dict[name].copy_(param_data)
+#             loaded_keys.append(name)
+#     # transformer.patch_embed.proj.load_state_dict(torch.load(proj_path, weights_only=True))
+#     transformer.patch_embed.proj.to(dtype=torch.bfloat16, device="cuda")
+
+
+# # Add LoRA to attention layers (same config as training)
+# transformer_lora_config = LoraConfig(
+#     r=64,
+#     lora_alpha=64,
+#     init_lora_weights=True,
+#     target_modules=["to_q", "to_k", "to_v", "to_out.0"],
+# )
+# transformer.add_adapter(transformer_lora_config)
+
+# # Try to load from safetensors first
+# safetensors_path = os.path.join(lora_path, "pytorch_lora_weights.safetensors")
+# if os.path.exists(safetensors_path):
+#     from safetensors.torch import load_file
+#     lora_state_dict = load_file(safetensors_path)
+# transformer_state_dict = convert_unet_state_dict_to_peft(lora_state_dict)
+# set_peft_model_state_dict(transformer, transformer_state_dict, adapter_name="default")
+
+# # non_lora_file = os.path.join(lora_path, "non_lora_weights.pt")
+# if os.path.exists(non_lora_file):
+#     non_lora_state_dict = torch.load(non_lora_file, map_location="cpu")
+#     model_state_dict = transformer.state_dict()
+#     loaded_keys = []
+#     for name, param_data in non_lora_state_dict.items():
+#         if name in model_state_dict:
+#             model_state_dict[name].copy_(param_data)
+#             loaded_keys.append(name)
 
 pipeline = CogVideoXFunInpaintPipeline(
         vae=vae,
@@ -170,7 +172,7 @@ with open(args.txt_path, "r") as f:
     lines = f.readlines()
 validation_video_list = [line.strip() for line in lines]
 
-for validation_video in validation_video_list:
+for validation_video in validation_video_list[6:]:
 
     # validation_video = "inpaint_video.mp4"
     # validation_video_mask = "inpaint_video_mask.mp4"

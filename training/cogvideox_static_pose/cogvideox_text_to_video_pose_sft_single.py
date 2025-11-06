@@ -136,6 +136,50 @@ Please adhere to the licensing terms as described [here](https://huggingface.co/
     model_card.save(os.path.join(repo_folder, "README.md"))
 
 
+# Copied from diffusers.pipelines.cogvideo.pipeline_cogvideox.CogVideoXPipeline._get_t5_prompt_embeds
+def get_t5_prompt_embeds(
+    prompt = None,
+    num_videos_per_prompt = 1,
+    max_sequence_length = 226,
+    device = None,
+    dtype = None,
+    tokenizer = None,
+    text_encoder = None,
+):
+    device = device or text_encoder.device
+    dtype = dtype or text_encoder.dtype
+
+    prompt = [prompt] if isinstance(prompt, str) else prompt
+    batch_size = len(prompt)
+
+    text_inputs = tokenizer(
+        prompt,
+        padding="max_length",
+        max_length=max_sequence_length,
+        truncation=True,
+        add_special_tokens=True,
+        return_tensors="pt",
+    )
+    text_input_ids = text_inputs.input_ids
+    untruncated_ids = tokenizer(prompt, padding="longest", return_tensors="pt").input_ids
+
+    if untruncated_ids.shape[-1] >= text_input_ids.shape[-1] and not torch.equal(text_input_ids, untruncated_ids):
+        removed_text = tokenizer.batch_decode(untruncated_ids[:, max_sequence_length - 1 : -1])
+        logger.warning(
+            "The following part of your input was truncated because `max_sequence_length` is set to "
+            f" {max_sequence_length} tokens: {removed_text}"
+        )
+
+    prompt_embeds = text_encoder(text_input_ids.to(device))[0]
+    prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
+
+    # duplicate text embeddings for each generation per prompt, using mps friendly method
+    _, seq_len, _ = prompt_embeds.shape
+    prompt_embeds = prompt_embeds.repeat(1, num_videos_per_prompt, 1)
+    prompt_embeds = prompt_embeds.view(batch_size * num_videos_per_prompt, seq_len, -1)
+
+    return prompt_embeds
+
 
 def log_validation_with_dataset(
     accelerator: Accelerator,
@@ -1193,6 +1237,12 @@ def main():
         disable=not accelerator.is_local_main_process,
     )
 
+    EMPTY_PROMPT_EMBED = get_t5_prompt_embeds(
+        prompt="",
+        tokenizer=tokenizer,
+        text_encoder=text_encoder,
+    )
+
     # For DeepSpeed training
     model_config = transformer.module.config if hasattr(transformer, "module") else transformer.config
 
@@ -1217,6 +1267,8 @@ def main():
                 prompts = batch["prompts"]
                 hand_videos = batch.get("hand_videos")
                 static_videos = batch.get("static_videos")
+
+                prompts = EMPTY_PROMPT_EMBED.repeat(prompts.shape[0], 1, 1).to(prompts)
 
                 # Encode videos
                 if not load_tensors:
