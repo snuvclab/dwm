@@ -392,6 +392,7 @@ def log_validation_with_dataset(
     elif pipeline_type in ["cogvideox_static_to_video", "cogvideox_static_to_video_pose_concat", 
                            "cogvideox_fun_static_to_video", "cogvideox_fun_static_to_video_pose_concat",
                            "cogvideox_fun_static_to_video_pose_adaln",
+                           "cogvideox_fun_static_to_video_pose_adaln_perframe",
                            "cogvideox_fun_static_to_video_posmap_concat", "cogvideox_fun_static_to_video_posmap_adapter",
                            "cogvideox_fun_static_to_video_raymap_pose_concat"]:
         # I2V-based pipelines with video conditioning
@@ -417,7 +418,7 @@ def log_validation_with_dataset(
                 pipeline_args["hand_videos"] = hand_video
                 pipeline_args["raymap"] = raymap
                 # Don't pass static_videos in I2V mode (will use image instead)
-            if pipeline_type == "cogvideox_fun_static_to_video_pose_adaln":
+            if pipeline_type in ["cogvideox_fun_static_to_video_pose_adaln", "cogvideox_fun_static_to_video_pose_adaln_perframe"]:
                 pipeline_args["pose_params"] = hand_motions
         # For other pipelines, don't pass video conditions in I2V mode
         else:
@@ -435,7 +436,7 @@ def log_validation_with_dataset(
             elif pipeline_type == "cogvideox_fun_static_to_video_pose_concat":
                 pipeline_args["static_videos"] = static_video
                 pipeline_args["hand_videos"] = hand_video
-            elif pipeline_type == "cogvideox_fun_static_to_video_pose_adaln":
+            elif pipeline_type in ["cogvideox_fun_static_to_video_pose_adaln", "cogvideox_fun_static_to_video_pose_adaln_perframe"]:
                 pipeline_args["static_videos"] = static_video
                 pipeline_args["pose_params"] = hand_motions
             elif pipeline_type == "cogvideox_fun_static_to_video_posmap_concat":
@@ -729,6 +730,20 @@ def run_validation(
         pose_dim = adaln_config.get("pose_dim", 102)
         pose_embed_dim = adaln_config.get("pose_embed_dim", 512)
         pipe = CogVideoXFunStaticToVideoPoseAdaLNPipeline.from_pretrained(
+            base_model_name_or_path=model_config_dict["base_model_name_or_path"],
+            transformer=unwrap_model(accelerator, transformer),
+            scheduler=scheduler,
+            revision=model_config_dict.get("revision"),
+            variant=model_config_dict.get("variant"),
+            torch_dtype=weight_dtype,
+            pose_dim=pose_dim,
+            pose_embed_dim=pose_embed_dim,
+        )
+    elif pipeline_config["type"] == "cogvideox_fun_static_to_video_pose_adaln_perframe":
+        adaln_config = pipeline_config.get("adaln", {})
+        pose_dim = adaln_config.get("pose_dim", 102)
+        pose_embed_dim = adaln_config.get("pose_embed_dim", 512)
+        pipe = CogVideoXFunStaticToVideoPoseAdaLNPerFramePipeline.from_pretrained(
             base_model_name_or_path=model_config_dict["base_model_name_or_path"],
             transformer=unwrap_model(accelerator, transformer),
             scheduler=scheduler,
