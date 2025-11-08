@@ -1,7 +1,7 @@
 import random
 import logging
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union, Sequence
 
 import numpy as np
 import pandas as pd
@@ -38,7 +38,7 @@ class VideoDataset(Dataset):
     def __init__(
         self,
         data_root: str,
-        dataset_file: Optional[str] = None,
+        dataset_file: Optional[Union[str, Sequence[str]]] = None,
         caption_column: str = "text",
         video_column: str = "video",
         max_num_frames: int = 49,
@@ -58,6 +58,12 @@ class VideoDataset(Dataset):
         super().__init__()
 
         self.data_root = Path(data_root)
+        if dataset_file is None:
+            self.dataset_file_list: Optional[List[str]] = None
+        elif isinstance(dataset_file, (list, tuple)):
+            self.dataset_file_list = [str(path) for path in dataset_file]
+        else:
+            self.dataset_file_list = [str(dataset_file)]
         self.dataset_file = dataset_file
         self.caption_column = caption_column  # not used
         self.video_column = video_column
@@ -92,7 +98,7 @@ class VideoDataset(Dataset):
         #     logic in CSV processing.
         #   - Using two files containing line-separate captions and relative paths to videos.
         # For a more detailed explanation about preparing dataset format, checkout the README.
-        if dataset_file is None:
+        if self.dataset_file_list is None:
             (
                 self.prompts,
                 self.video_paths,
@@ -216,8 +222,8 @@ class VideoDataset(Dataset):
             )
 
         with open(video_path, "r", encoding="utf-8") as file:
-            video_paths = [self.data_root.joinpath(line.strip()) for line in file.readlines() if len(line.strip()) > 0]
-            # video_paths = [self.data_root.parent.joinpath("processed2").joinpath(line.strip()) for line in file.readlines() if len(line.strip()) > 0]
+            # video_paths = [self.data_root.joinpath(line.strip()) for line in file.readlines() if len(line.strip()) > 0]
+            video_paths = [self.data_root.parent.joinpath("processed2").joinpath(line.strip()) for line in file.readlines() if len(line.strip()) > 0]
 
         # Derive prompt paths from video paths using configurable prompt_subdir
         prompt_paths = [path.parent.parent.joinpath(self.prompt_subdir, path.name.replace(".mp4", ".txt")) for path in video_paths]
@@ -246,17 +252,34 @@ class VideoDataset(Dataset):
 
     def _load_dataset_from_datafile(self) -> Tuple[List[str], List[Path], List[bool]]:
         # Load regular dataset
-        with open(self.data_root / self.dataset_file, "r") as f:
-            video_paths = [self.data_root.joinpath(line.strip()) for line in f.readlines() if len(line.strip()) > 0]
-        
-        # Use configurable prompt_subdir
-        prompt_paths = [path.parent.parent.joinpath(self.prompt_subdir, path.name.replace(".mp4", ".txt")) for path in video_paths]
-        prompts = [path.read_text() for path in prompt_paths]
-        
-        # Track source: False for regular dataset
-        is_i2v_sample = [False] * len(video_paths)
+        if not self.dataset_file_list:
+            raise ValueError("dataset_file should not be empty when provided.")
 
-        return prompts, video_paths, is_i2v_sample
+        all_prompts: List[str] = []
+        all_video_paths: List[Path] = []
+        is_i2v_sample: List[bool] = []
+
+        for dataset_file in self.dataset_file_list:
+            dataset_path = self.data_root / dataset_file
+            if not dataset_path.exists():
+                raise FileNotFoundError(f"Dataset file not found: {dataset_path}")
+
+            with open(dataset_path, "r", encoding="utf-8") as f:
+                file_video_paths = [
+                    self.data_root.joinpath(line.strip()) for line in f.readlines() if len(line.strip()) > 0
+                ]
+            
+            prompt_paths = [
+                path.parent.parent.joinpath(self.prompt_subdir, path.name.replace(".mp4", ".txt"))
+                for path in file_video_paths
+            ]
+            file_prompts = [path.read_text() for path in prompt_paths]
+
+            all_video_paths.extend(file_video_paths)
+            all_prompts.extend(file_prompts)
+            is_i2v_sample.extend([False] * len(file_video_paths))
+        
+        return all_prompts, all_video_paths, is_i2v_sample
 
     def _preprocess_video(self, path: Path) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         r"""
