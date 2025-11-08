@@ -4398,6 +4398,13 @@ def main():
                     if hand_motions is not None:
                         hand_motions = hand_motions.to(device=accelerator.device, dtype=weight_dtype)
                     condition_latents = None
+                elif pipeline_config["type"] == "cogvideox_fun_static_to_video_pose_adaln_perframe":
+                    # Per-frame AdaLN shares the same conditioning layout as the global AdaLN variant
+                    mask_input = _create_fun_mask_input(noisy_model_input, VAE_SCALING_FACTOR)
+                    transformer_input = torch.cat([noisy_model_input, mask_input, static_videos_latents], dim=2)
+                    if hand_motions is not None:
+                        hand_motions = hand_motions.to(device=accelerator.device, dtype=weight_dtype)
+                    condition_latents = None
                     
                 elif pipeline_config["type"] == "cogvideox_fun_static_to_video_posmap_concat":
                     # For VideoX-Fun static-to-video posmap concat pipeline, use static and SMPL pos map as conditions
