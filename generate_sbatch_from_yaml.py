@@ -49,6 +49,23 @@ def generate_sbatch_script(yaml_file, output_script=None, aicomputing=False):
     data = config.get('data', {})
     model = config.get('model', {})
     logging = config.get('logging', {})
+
+    # Normalize dataset and validation entries to lists (dataset_file may be str or list)
+    dataset_entries = data.get('dataset_file')
+    if dataset_entries is None:
+        dataset_files_list = []
+    elif isinstance(dataset_entries, (list, tuple)):
+        dataset_files_list = [str(item) for item in dataset_entries]
+    else:
+        dataset_files_list = [str(dataset_entries)]
+
+    validation_entries = data.get('validation_set')
+    if validation_entries is None:
+        validation_files_list = []
+    elif isinstance(validation_entries, (list, tuple)):
+        validation_files_list = [str(item) for item in validation_entries]
+    else:
+        validation_files_list = [str(validation_entries)]
     
     # Override SLURM settings for aicomputing
     if aicomputing:
@@ -71,10 +88,11 @@ def generate_sbatch_script(yaml_file, output_script=None, aicomputing=False):
         # Update data paths
         if 'data_root' in data:
             data['data_root'] = data['data_root'].replace('/virtual_lab/jhb_vclab/', '/fsx/')
-        if 'dataset_file' in data:
-            data['dataset_file'] = data['dataset_file'].replace('/virtual_lab/jhb_vclab/', '/fsx/')
-        if 'validation_set' in data:
-            data['validation_set'] = data['validation_set'].replace('/virtual_lab/jhb_vclab/', '/fsx/')
+
+        if dataset_files_list:
+            dataset_files_list = [path.replace('/virtual_lab/jhb_vclab/', '/fsx/') for path in dataset_files_list]
+        if validation_files_list:
+            validation_files_list = [path.replace('/virtual_lab/jhb_vclab/', '/fsx/') for path in validation_files_list]
         
         # Update model paths
         if 'output_dir' in model:
@@ -220,6 +238,13 @@ export OMP_NUM_THREADS={environment.get('omp_num_threads', 16)}
     if aicomputing:
         yaml_file_for_script = yaml_file.replace('/virtual_lab/jhb_vclab/', '/fsx/')
     
+    if not dataset_files_list:
+        dataset_file_env = ''
+    elif len(dataset_files_list) == 1:
+        dataset_file_env = dataset_files_list[0]
+    else:
+        dataset_file_env = ":".join(dataset_files_list)
+
     script_content += f"""
 EXPERIMENT_CONFIG="{yaml_file_for_script}"
 EXPERIMENT_NAME="{experiment.get('name', 'unknown')}"
@@ -228,7 +253,7 @@ LEARNING_RATE={training.get('learning_rate', 'unknown')}
 BATCH_SIZE={training.get('batch_size', 'unknown')}
 MAX_TRAIN_STEPS={training.get('max_train_steps', training.get('num_epochs', 'unknown'))}
 DATA_ROOT="{data.get('data_root', 'unknown')}"
-DATASET_FILE="{data.get('dataset_file', 'unknown')}"
+DATASET_FILE="{dataset_file_env}"
 BASE_OUTPUT_DIR="{model.get('output_dir', 'unknown')}"
 SLURM_JOB_NAME="{slurm.get('job_name', 'unknown')}"
 
@@ -345,7 +370,7 @@ echo "Learning Rate: $LEARNING_RATE"
 echo "Batch Size: $BATCH_SIZE per GPU (effective: $((BATCH_SIZE * NUM_GPUS)))"
 echo "Max Train Steps: $MAX_TRAIN_STEPS"
 echo "Data Root: $DATA_ROOT"
-echo "Dataset File: $DATASET_FILE"
+echo "Dataset File(s): $DATASET_FILE"
 echo "Base Output Directory: $BASE_OUTPUT_DIR"
 echo "Number of GPUs: $NUM_GPUS"
 echo "GPU IDs: $GPU_IDS"
@@ -358,10 +383,20 @@ if [ ! -d "$DATA_ROOT" ]; then
     exit 1
 fi
 
-# Check if dataset file exists
-if [ ! -f "$DATA_ROOT/$DATASET_FILE" ]; then
-    echo "Error: Dataset file not found: $DATA_ROOT/$DATASET_FILE"
-    exit 1
+# Check if dataset files exist
+if [ -n "$DATASET_FILE" ]; then
+    IFS=':' read -ra DATASET_FILE_ARRAY <<< "$DATASET_FILE"
+    for dataset_file in "${{DATASET_FILE_ARRAY[@]}}"; do
+        if [ -z "$dataset_file" ]; then
+            continue
+        fi
+        if [ ! -f "$DATA_ROOT/$dataset_file" ]; then
+            echo "Error: Dataset file not found: $DATA_ROOT/$dataset_file"
+            exit 1
+        fi
+    done
+else
+    echo "Warning: No dataset files specified."
 fi
 
 # Check if config file exists

@@ -22,7 +22,7 @@ import shutil
 import argparse
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 import numpy as np
 import imageio.v3 as iio
 
@@ -853,11 +853,18 @@ def run_validation(
 
     # Load validation set if provided
     data_config = config["data"]
-    if data_config.get("validation_set") is not None:
-        validation_set_path = os.path.join(data_config["data_root"], data_config["validation_set"])
-        with open(validation_set_path, "r") as f:
-            validation_set = f.readlines()
-        validation_set = [video.strip() for video in validation_set]
+    validation_entries = data_config.get("validation_set")
+    if validation_entries is not None:
+        if isinstance(validation_entries, (list, tuple)):
+            validation_set: List[str] = []
+            for entry in validation_entries:
+                validation_set_path = os.path.join(data_config["data_root"], entry)
+                with open(validation_set_path, "r") as f:
+                    validation_set.extend([video.strip() for video in f.readlines()])
+        else:
+            validation_set_path = os.path.join(data_config["data_root"], validation_entries)
+            with open(validation_set_path, "r") as f:
+                validation_set = [video.strip() for video in f.readlines()]
         
         # Apply validation stride
         validation_stride = training_config.get("custom_settings", {}).get("validation_stride", 1)
@@ -3823,23 +3830,24 @@ def main():
 
     # Generate empty prompt embedding for prompt dropout (classifier-free guidance training)
     EMPTY_PROMPT_EMBED = None
-    prompt_dropout_prob = training_config.get("prompt_dropout_prob", 0.0)
     
     load_tensors = training_config.get("custom_settings", {}).get("load_tensors", False)
     
-    if prompt_dropout_prob > 0 and not load_tensors:
-        # Only generate when text_encoder is available (not in load_tensors mode)
-        EMPTY_PROMPT_EMBED = get_t5_prompt_embeds(
-            prompt="",
-            tokenizer=tokenizer,
-            text_encoder=text_encoder,
-            device=accelerator.device,
-            dtype=weight_dtype,
-        )
-        logger.info(f"🎲 Prompt dropout enabled: {prompt_dropout_prob * 100:.1f}% probability")
-        logger.info(f"   EMPTY_PROMPT_EMBED shape: {EMPTY_PROMPT_EMBED.shape}")
-    elif prompt_dropout_prob > 0 and load_tensors:
-        logger.warning("⚠️  Prompt dropout is not supported in load_tensors mode (text_encoder not available)")
+    if prompt_dropout_prob > 0:
+        if text_encoder is None or tokenizer is None:
+            logger.warning("⚠️  Prompt dropout requested but tokenizer/text_encoder not available; disabling.")
+            prompt_dropout_prob = 0.0
+        else:
+            # Generate empty prompt embedding once before training loop
+            EMPTY_PROMPT_EMBED = get_t5_prompt_embeds(
+                prompt="",
+                tokenizer=tokenizer,
+                text_encoder=text_encoder,
+                device=accelerator.device,
+                dtype=weight_dtype,
+            )
+            logger.info(f"🎲 Prompt dropout enabled: {prompt_dropout_prob * 100:.1f}% probability")
+            logger.info(f"   EMPTY_PROMPT_EMBED shape: {EMPTY_PROMPT_EMBED.shape}")
 
     # Free up memory by deleting vae and text_encoder when using preprocessed tensors
     if load_tensors:
@@ -4026,6 +4034,7 @@ def main():
                 # Apply prompt dropout for classifier-free guidance training
                 if prompt_dropout_prob > 0 and EMPTY_PROMPT_EMBED is not None:
                     # Sample dropout mask: each sample in batch has independent dropout probability
+                    batch_size = prompt_embeds.shape[0]
                     dropout_mask = torch.rand(batch_size, device=accelerator.device) < prompt_dropout_prob
                     
                     if dropout_mask.any():
