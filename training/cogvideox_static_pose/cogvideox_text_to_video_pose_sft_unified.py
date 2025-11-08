@@ -4648,6 +4648,15 @@ def main():
                         pose_params=hand_motions,
                         return_dict=False,
                     )[0]
+                elif pipeline_config["type"] == "cogvideox_fun_static_to_video_pose_adaln_perframe":
+                    model_output = transformer(
+                        hidden_states=transformer_input,
+                        encoder_hidden_states=prompt_embeds,
+                        timestep=timesteps,
+                        image_rotary_emb=image_rotary_emb,
+                        pose_params=hand_motions,
+                        return_dict=False,
+                    )[0]
                 elif pipeline_config["type"] == "cogvideox_fun_static_to_video_cross":
                     # For VideoX-Fun CrossPipeline, use cross-attention transformer with ref_latents and control_latents
                     model_output = transformer(
