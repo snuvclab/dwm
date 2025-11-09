@@ -3969,6 +3969,7 @@ def main():
     # Run initial validation at step 0 (before training starts)
     if data_config.get("validation_set") is not None:
         logger.info("Running initial validation at step 0 (before training starts)")
+        should_run_max_validation = training_config.get("custom_settings", {}).get("should_run_max_validation", False)
         run_validation(
             config=config,
             accelerator=accelerator,
@@ -3977,7 +3978,7 @@ def main():
             model_config=transformer_config,
             weight_dtype=weight_dtype,
             step=initial_global_step,
-            should_run_max_validation=False
+            should_run_max_validation=should_run_max_validation
         )
 
     # Generate empty prompt embedding for prompt dropout (classifier-free guidance training)
