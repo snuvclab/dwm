@@ -55,7 +55,7 @@ parser.add_argument("--no_prompt", action='store_true', help="If set, do not use
 args = parser.parse_args()
 
 lora_path = args.lora_path
-save_path = os.path.join(lora_path, "eval")
+save_path = os.path.join(lora_path, "eval_for_qual")
 os.makedirs(save_path, exist_ok=True)
 
 
@@ -202,8 +202,6 @@ for validation_video in validation_video_list:
     # input_video_mask, _, _, _ = get_video_to_video_latent(os.path.join("/virtual_lab/jhb_vclab/world_model/data", video_mask_path), video_length=video_length, sample_size=sample_size, validation_video_mask=None, fps=fps)
     # input_video_mask = input_video_mask[:, :1]
     # input_video_mask = morph2d(input_video_mask, kernel_size=501, mode="dilate")
-
-    prompt = "The person in red sweater opens the oven."
 
     for idx in range(3):
         with torch.no_grad():
