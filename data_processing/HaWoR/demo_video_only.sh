@@ -34,7 +34,7 @@ echo "Processing video: $VIDEO_PATH"
 echo ""
 
 # Run process_hawor_single.py
-python process_hawor_single.py \
+python process_hawor_single_cam_only.py \
     --video_path "$VIDEO_PATH"
 
 # Check exit status

@@ -235,7 +235,7 @@ def create_video_from_frames(frames, output_path, fps=30):
         
         # Create video with ffmpeg
         ffmpeg_cmd = [
-            'ffmpeg', '-y',
+            '/usr/bin/ffmpeg', '-y',
             '-framerate', str(fps),
             '-i', os.path.join(temp_dir, 'frame_%06d.jpg'),
             '-c:v', 'libx264',
@@ -534,7 +534,7 @@ def main():
     parser.add_argument("--checkpoint", type=str, default='./weights/hawor/checkpoints/hawor.ckpt')
     parser.add_argument("--output_dir", type=str, default=None, help='Output directory (default: same as video)')
     parser.add_argument("--keep_intermediates", action='store_true', help='Keep intermediate files (tracks, images, etc.)')
-    parser.add_argument("--fps", type=int, default=10, help='Frames per second for video extraction')
+    parser.add_argument("--fps", type=int, default=8, help='Frames per second for video extraction')
     args = parser.parse_args()
     
     success = process_video(

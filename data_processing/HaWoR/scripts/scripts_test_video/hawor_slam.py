@@ -84,7 +84,6 @@ def hawor_slam(args, start_idx, end_idx):
     calib[:2] = focal
     
     # Droid-slam with masking
-    breakpoint()
     droid, traj = run_slam(imgfiles, masks=masks, calib=calib)
     n = droid.video.counter.value
     tstamp = droid.video.tstamp.cpu().int().numpy()[:n]

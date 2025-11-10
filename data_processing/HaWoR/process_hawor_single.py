@@ -232,7 +232,7 @@ def create_video_from_frames(frames, output_path, fps=30):
         
         # Create video with ffmpeg
         ffmpeg_cmd = [
-            'ffmpeg', '-y',
+            '/usr/bin/ffmpeg', '-y',
             '-framerate', str(fps),
             '-i', os.path.join(temp_dir, 'frame_%06d.jpg'),
             '-c:v', 'libx264',
@@ -260,6 +260,7 @@ def main():
     parser.add_argument("--infiller_weight", type=str, default='./weights/hawor/checkpoints/infiller.pt')
     parser.add_argument("--output_dir", type=str, default=None, help='Output directory (default: same as video)')
     parser.add_argument("--keep_intermediates", action='store_true', help='Keep intermediate files (tracks, images, etc.)')
+    parser.add_argument("--fps", type=int, default=8, help='Frames per second for video extraction')
     args = parser.parse_args()
     
     # Validate video exists
@@ -371,7 +372,7 @@ def main():
     height, width = img0.shape[:2]
     
     # Get FPS from input video
-    fps = 10
+    fps = 8
     cap = cv2.VideoCapture(args.video_path)
     if cap.isOpened():
         input_fps = cap.get(cv2.CAP_PROP_FPS)
