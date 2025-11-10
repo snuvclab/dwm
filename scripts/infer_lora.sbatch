@@ -11,9 +11,10 @@ source ~/.bashrc
 source $(conda info --base)/etc/profile.d/conda.sh
 conda activate world_model
 
-LIST_FILE="/virtual_lab/jhb_vclab/world_model/data/dataset_files/trumans_static_pose_all/test_selected_50.txt"
+# LIST_FILE="/virtual_lab/jhb_vclab/world_model/data/dataset_files/trumans_static_pose_all/test_selected_50.txt"
 # LIST_FILE="/virtual_lab/jhb_vclab/world_model/data/dataset_files/taste_rob/rob_test_selected_48.txt"
 # LIST_FILE="/virtual_lab/jhb_vclab/world_model/data/dataset_files/trumans_static_pose_all/temp.txt"
+LIST_FILE="/virtual_lab/jhb_vclab/world_model/data/dataset_files/qual/merged0.txt"
 LORA_PATH="/virtual_lab/jhb_vclab/world_model/outputs/251105/trumans_fun_static_hand_concat_lora_new_prompt_slurm_3783/checkpoint-6000/" # Ours
 # LORA_PATH="/virtual_lab/jhb_vclab/world_model/outputs/251027/trumans_fun_static_lora_slurm_76734/checkpoint-3000/" # CogVideoX Fun LoRA
 
