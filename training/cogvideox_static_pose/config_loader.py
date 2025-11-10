@@ -102,7 +102,9 @@ class ExperimentConfigLoader:
             "cogvideox_fun_static_to_video_posmap_adapter",
             "cogvideox_fun_static_to_video_pose_adapter",
             "cogvideox_fun_static_to_video_pose_cond_token",
-            "cogvideox_fun_static_to_video_cross_pose_adapter"
+            "cogvideox_fun_static_to_video_cross_pose_adapter",
+            "cogvideox_fun_static_to_video_pose_adaln",
+            "cogvideox_fun_static_to_video_pose_adaln_perframe",
         ]
         if pipeline_type not in supported_pipeline_types:
             raise ValueError(f"Unsupported pipeline type: {pipeline_type}. Supported types: {supported_pipeline_types}")

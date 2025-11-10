@@ -3131,3 +3131,1046 @@ class CrossTransformer3DModelWithAdapter(CogVideoXFunTransformer3DModelWithAdapt
         if not return_dict:
             return (output,)
         return Transformer2DModelOutput(sample=output)
+
+
+# ============================================================================
+# AdaLN Pose Conditioning Classes
+# ============================================================================
+
+class PoseEmbedding(nn.Module):
+    """Embedding layer for pose parameters with frame-wise projection and 1D conv for AdaLN conditioning"""
+    
+    def __init__(self, pose_dim=102, embed_dim=512, hidden_dim=1024, stride=4):
+        super().__init__()
+        self.pose_dim = pose_dim
+        self.embed_dim = embed_dim
+        self.stride = stride
+        
+        # Frame-wise projection: each frame's pose parameters are projected independently
+        self.frame_projection = nn.Sequential(
+            nn.Linear(pose_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, embed_dim),
+        )
+        
+        # 1D convolution to aggregate temporal features
+        self.temporal_conv = nn.Sequential(
+            nn.Conv1d(embed_dim, embed_dim, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv1d(embed_dim, embed_dim, kernel_size=3, padding=1),
+            nn.SiLU(),
+            nn.Conv1d(embed_dim, embed_dim, kernel_size=1),  # Final projection
+        )
+        
+        # Global average pooling to get single feature vector
+        self.global_pool = nn.AdaptiveAvgPool1d(1)
+        
+        # Layer normalization
+        self.layer_norm = nn.LayerNorm(embed_dim)
+        
+    def forward(self, pose_params: torch.Tensor) -> torch.Tensor:
+        """
+        Process pose parameters into embeddings using frame-wise projection and 1D conv.
+        
+        Args:
+            pose_params: Tensor of shape (batch_size, num_frames, pose_dim)
+            
+        Returns:
+            Tensor of shape (batch_size, embed_dim)
+        """
+        batch_size, num_frames, pose_dim = pose_params.shape
+        
+        # Frame-wise projection: (batch_size, num_frames, pose_dim) -> (batch_size, num_frames, embed_dim)
+        frame_features = self.frame_projection(pose_params)  # (B, T, embed_dim)
+        
+        # Transpose for 1D conv: (batch_size, embed_dim, num_frames)
+        frame_features = frame_features.transpose(1, 2)  # (B, embed_dim, T)
+        
+        # Apply 1D convolution for temporal aggregation
+        temporal_features = self.temporal_conv(frame_features)  # (B, embed_dim, T)
+        
+        # Global average pooling to get single feature vector
+        global_feature = self.global_pool(temporal_features)  # (B, embed_dim, 1)
+        global_feature = global_feature.squeeze(-1)  # (B, embed_dim)
+        
+        # Apply layer normalization
+        embeddings = self.layer_norm(global_feature)
+        
+        return embeddings
+
+
+class PoseConditionedCogVideoXLayerNormZero(CogVideoXLayerNormZero):
+    """Extended CogVideoXLayerNormZero with pose conditioning via AdaLN-zero"""
+    
+    def __init__(
+        self,
+        conditioning_dim: int,
+        embedding_dim: int,
+        pose_embed_dim: int,
+        elementwise_affine: bool = True,
+        eps: float = 1e-5,
+        bias: bool = True,
+    ) -> None:
+        super().__init__(conditioning_dim, embedding_dim, elementwise_affine, eps, bias)
+        
+        # Additional pose conditioning layers (zero-initialized for AdaLN-zero)
+        self.pose_linear = nn.Linear(pose_embed_dim, 6 * embedding_dim, bias=bias)
+        
+        # Zero initialization (AdaLN-zero key feature)
+        nn.init.zeros_(self.pose_linear.weight)
+        nn.init.zeros_(self.pose_linear.bias)
+        
+    def forward(
+        self, 
+        hidden_states: torch.Tensor, 
+        encoder_hidden_states: torch.Tensor, 
+        temb: torch.Tensor,
+        pose_emb: Optional[torch.Tensor] = None,
+        pose_emb_mask: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            hidden_states: Input hidden states
+            encoder_hidden_states: Input encoder hidden states  
+            temb: Time embedding (original CogVideoX conditioning)
+            pose_emb: pose embedding (additional conditioning)
+            pose_emb_mask: Mask to zero out pose conditioning for certain samples
+        Returns:
+            Tuple of (norm_hidden_states, norm_encoder_hidden_states, gate, enc_gate)
+        """
+        # Original time conditioning
+        time_shift, time_scale, time_gate, time_enc_shift, time_enc_scale, time_enc_gate = \
+            self.linear(self.silu(temb)).chunk(6, dim=1)
+        # pose conditioning (starts at zero due to initialization)
+        if pose_emb is not None:
+            pose_shift, pose_scale, pose_gate, pose_enc_shift, pose_enc_scale, pose_enc_gate = \
+                self.pose_linear(self.silu(pose_emb)).chunk(6, dim=1)
+            
+            # Apply mask to zero out pose conditioning for masked samples
+            if pose_emb_mask is not None:
+                # Expand mask to match the shape of pose parameters
+                # Use the same dtype as pose_emb for consistency
+                mask_expanded = pose_emb_mask.to(dtype=pose_emb.dtype)[:, None]  # (batch_size, 1)
+                pose_shift = pose_shift * mask_expanded
+                pose_scale = pose_scale * mask_expanded
+                pose_gate = pose_gate * mask_expanded
+                pose_enc_shift = pose_enc_shift * mask_expanded
+                pose_enc_scale = pose_enc_scale * mask_expanded
+                pose_enc_gate = pose_enc_gate * mask_expanded
+            
+            # Combine time + pose conditioning (AdaLN-zero)
+            shift = time_shift + pose_shift
+            scale = time_scale + pose_scale
+            gate = time_gate + pose_gate
+            enc_shift = time_enc_shift + pose_enc_shift
+            enc_scale = time_enc_scale + pose_enc_scale
+            enc_gate = time_enc_gate + pose_enc_gate
+        else:
+            # Fall back to original behavior (no pose conditioning (AdaLN-zero))
+            shift, scale, gate = time_shift, time_scale, time_gate
+            enc_shift, enc_scale, enc_gate = time_enc_shift, time_enc_scale, time_enc_gate
+        
+        # Apply modulation (same as original CogVideoXLayerNormZero)
+        hidden_states = self.norm(hidden_states) * (1 + scale)[:, None, :] + shift[:, None, :]
+        encoder_hidden_states = self.norm(encoder_hidden_states) * (1 + enc_scale)[:, None, :] + enc_shift[:, None, :]
+        
+        return hidden_states, encoder_hidden_states, gate[:, None, :], enc_gate[:, None, :]
+
+
+class PoseConditionedCogVideoXBlock(nn.Module):
+    """CogVideoXBlock with pose conditioning (AdaLN-zero) via extended LayerNormZero"""
+    
+    def __init__(
+        self,
+        dim: int,
+        num_attention_heads: int,
+        attention_head_dim: int,
+        time_embed_dim: int,
+        pose_embed_dim: int,
+        dropout: float = 0.0,
+        activation_fn: str = "gelu-approximate",
+        attention_bias: bool = False,
+        qk_norm: bool = True,
+        norm_elementwise_affine: bool = True,
+        norm_eps: float = 1e-5,
+        final_dropout: bool = True,
+        ff_inner_dim: Optional[int] = None,
+        ff_bias: bool = True,
+        attention_out_bias: bool = True,
+    ):
+        super().__init__()
+
+        # 1. Self Attention with pose-conditioned LayerNormZero (AdaLN-zero)
+        self.norm1 = PoseConditionedCogVideoXLayerNormZero(
+            time_embed_dim, dim, pose_embed_dim, norm_elementwise_affine, norm_eps, bias=True
+        )
+
+        self.attn1 = Attention(
+            query_dim=dim,
+            dim_head=attention_head_dim,
+            heads=num_attention_heads,
+            qk_norm="layer_norm" if qk_norm else None,
+            eps=1e-6,
+            bias=attention_bias,
+            out_bias=attention_out_bias,
+            processor=CogVideoXAttnProcessor2_0(),
+        )
+
+        # 2. Feed Forward with pose-conditioned LayerNormZero
+        self.norm2 = PoseConditionedCogVideoXLayerNormZero(
+            time_embed_dim, dim, pose_embed_dim, norm_elementwise_affine, norm_eps, bias=True
+        )
+
+        self.ff = FeedForward(
+            dim,
+            dropout=dropout,
+            activation_fn=activation_fn,
+            final_dropout=final_dropout,
+            inner_dim=ff_inner_dim,
+            bias=ff_bias,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        temb: torch.Tensor,
+        pose_emb: Optional[torch.Tensor] = None,
+        pose_emb_mask: Optional[torch.Tensor] = None,
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        attention_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        text_seq_length = encoder_hidden_states.size(1)
+        attention_kwargs = attention_kwargs or {}
+
+        # 1. Self Attention with pose conditioning
+        norm_hidden_states, norm_encoder_hidden_states, gate_msa, enc_gate_msa = self.norm1(
+            hidden_states, encoder_hidden_states, temb, pose_emb, pose_emb_mask
+        )
+
+        # Attention
+        attn_hidden_states, attn_encoder_hidden_states = self.attn1(
+            hidden_states=norm_hidden_states,
+            encoder_hidden_states=norm_encoder_hidden_states,
+            image_rotary_emb=image_rotary_emb,
+            **attention_kwargs,
+        )
+
+        hidden_states = hidden_states + gate_msa * attn_hidden_states
+        encoder_hidden_states = encoder_hidden_states + enc_gate_msa * attn_encoder_hidden_states
+
+        # 2. Feed Forward with pose conditioning
+        norm_hidden_states, norm_encoder_hidden_states, gate_ff, enc_gate_ff = self.norm2(
+            hidden_states, encoder_hidden_states, temb, pose_emb, pose_emb_mask
+        )
+
+        # Feed-forward
+        norm_combined = torch.cat([norm_encoder_hidden_states, norm_hidden_states], dim=1)
+        ff_output = self.ff(norm_combined)
+
+        hidden_states = hidden_states + gate_ff * ff_output[:, text_seq_length:]
+        encoder_hidden_states = encoder_hidden_states + enc_gate_ff * ff_output[:, :text_seq_length]
+
+        return hidden_states, encoder_hidden_states
+
+class CogVideoXFunTransformer3DModelWithAdaLNPose(CogVideoXFunTransformer3DModel):
+    """VideoX-Fun transformer with global AdaLN pose conditioning."""
+
+    def __init__(
+        self,
+        *args,
+        pose_dim: int = 102,
+        pose_embed_dim: int = 512,
+        **kwargs,
+    ):
+        if PoseEmbedding is None or PoseConditionedCogVideoXBlock is None:
+            raise ImportError(
+                "AdaLN pose conditioning helpers not available. Ensure cogvideox_transformer_with_conditions is importable."
+            )
+
+        self.pose_dim = pose_dim
+        self.pose_embed_dim = pose_embed_dim
+        super().__init__(*args, **kwargs)
+
+        self.pose_embedding = PoseEmbedding(
+            pose_dim=self.pose_dim,
+            embed_dim=self.pose_embed_dim,
+            stride=4,
+        )
+        self._replace_blocks_with_pose_conditioned()
+        self._ensure_pose_dtype()
+        self.register_to_config(
+            pose_dim=self.pose_dim,
+            pose_embed_dim=self.pose_embed_dim,
+        )
+
+    def _replace_blocks_with_pose_conditioned(self) -> None:
+        pose_blocks = []
+        for block in self.transformer_blocks:
+            pose_block = PoseConditionedCogVideoXBlock(
+                dim=block.norm1.norm.normalized_shape[0],
+                num_attention_heads=self.config.num_attention_heads,
+                attention_head_dim=self.config.attention_head_dim,
+                time_embed_dim=self.config.time_embed_dim,
+                pose_embed_dim=self.pose_embed_dim,
+                dropout=self.config.dropout,
+                activation_fn=self.config.activation_fn,
+                attention_bias=self.config.attention_bias,
+                norm_elementwise_affine=block.norm1.norm.elementwise_affine,
+                norm_eps=block.norm1.norm.eps,
+                final_dropout=True,
+                ff_inner_dim=None,
+                ff_bias=True,
+                attention_out_bias=True,
+            )
+            target_dtype = next(block.parameters()).dtype
+            pose_block = pose_block.to(dtype=target_dtype)
+
+            pose_block.attn1.load_state_dict(block.attn1.state_dict(), strict=False)
+            pose_block.ff.load_state_dict(block.ff.state_dict(), strict=False)
+            pose_block.norm1.norm.load_state_dict(block.norm1.norm.state_dict(), strict=False)
+            pose_block.norm2.norm.load_state_dict(block.norm2.norm.state_dict(), strict=False)
+            pose_block.norm1.linear.load_state_dict(block.norm1.linear.state_dict(), strict=False)
+            pose_block.norm2.linear.load_state_dict(block.norm2.linear.state_dict(), strict=False)
+
+            pose_blocks.append(pose_block)
+
+        self.transformer_blocks = nn.ModuleList(pose_blocks)
+
+    def _ensure_pose_dtype(self) -> None:
+        base_dtype = next(self.parameters()).dtype
+        self.pose_embedding = self.pose_embedding.to(dtype=base_dtype)
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path=None,
+        base_model_name_or_path="alibaba-pai/CogVideoX-Fun-V1.1-5b-InP",
+        pose_dim: int = 102,
+        pose_embed_dim: int = 512,
+        subfolder: str = "transformer",
+        **kwargs,
+    ):
+        if pretrained_model_name_or_path is not None:
+            print(f"📥 Loading fine-tuned Fun AdaLN transformer: {pretrained_model_name_or_path}")
+            config_path = os.path.join(pretrained_model_name_or_path, subfolder, "config.json")
+            if os.path.exists(config_path):
+                import json
+
+                with open(config_path, "r") as f:
+                    config = json.load(f)
+                model = cls(**config)
+            else:
+                model = cls(pose_dim=pose_dim, pose_embed_dim=pose_embed_dim)
+
+            weight_path = os.path.join(pretrained_model_name_or_path, subfolder, "diffusion_pytorch_model.safetensors")
+            if not os.path.exists(weight_path):
+                weight_path = os.path.join(pretrained_model_name_or_path, subfolder, "pytorch_model.bin")
+                if not os.path.exists(weight_path):
+                    raise FileNotFoundError(f"No transformer weights found in {pretrained_model_name_or_path}")
+
+            if weight_path.endswith(".safetensors"):
+                state_dict = load_file(weight_path)
+            else:
+                state_dict = torch.load(weight_path, map_location="cpu")
+
+            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            if missing:
+                print(f"⚠️ Missing keys (AdaLN layers): {missing}")
+            if unexpected:
+                print(f"⚠️ Unexpected keys: {unexpected}")
+            return model
+
+        print(f"🔧 Initializing Fun AdaLN transformer from base: {base_model_name_or_path}")
+        base_model = CogVideoXTransformer3DModel.from_pretrained(
+            base_model_name_or_path,
+            subfolder=subfolder,
+            torch_dtype=kwargs.get("torch_dtype", torch.bfloat16),
+            revision=kwargs.get("revision", None),
+            variant=kwargs.get("variant", None),
+        )
+
+        model = cls(
+            **base_model.config,
+            pose_dim=pose_dim,
+            pose_embed_dim=pose_embed_dim,
+        )
+
+        missing, unexpected = model.load_state_dict(base_model.state_dict(), strict=False)
+        if missing:
+            print(f"⚠️ Missing keys (AdaLN additions): {missing}")
+        if unexpected:
+            print(f"⚠️ Unexpected keys: {unexpected}")
+
+        return model
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        timestep: Union[int, float, torch.LongTensor],
+        timestep_cond: Optional[torch.Tensor] = None,
+        inpaint_latents: Optional[torch.Tensor] = None,
+        control_latents: Optional[torch.Tensor] = None,
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        return_dict: bool = True,
+        pose_params: Optional[torch.Tensor] = None,
+        pose_params_mask: Optional[torch.Tensor] = None,
+        attention_kwargs: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ):
+        batch_size, num_frames, channels, height, width = hidden_states.shape
+
+        if num_frames == 1 and self.patch_size_t is not None:
+            hidden_states = torch.cat([hidden_states, torch.zeros_like(hidden_states)], dim=1)
+            if inpaint_latents is not None:
+                inpaint_latents = torch.cat([inpaint_latents, torch.zeros_like(inpaint_latents)], dim=1)
+            if control_latents is not None:
+                control_latents = torch.cat([control_latents, torch.zeros_like(control_latents)], dim=1)
+            local_num_frames = num_frames + 1
+        else:
+            local_num_frames = num_frames
+
+        timesteps = timestep
+        t_emb = self.time_proj(timesteps).to(dtype=hidden_states.dtype)
+        emb = self.time_embedding(t_emb, timestep_cond)
+
+        if self.ofs_embedding is not None:
+            ofs = kwargs.get(
+                "ofs",
+                torch.ones((batch_size,), device=hidden_states.device, dtype=hidden_states.dtype) * 2.0,
+            )
+            ofs_emb = self.ofs_proj(ofs)
+            ofs_emb = self.ofs_embedding(ofs_emb.to(dtype=hidden_states.dtype))
+            emb = emb + ofs_emb
+
+        if inpaint_latents is not None:
+            hidden_states = torch.concat([hidden_states, inpaint_latents], 2)
+        if control_latents is not None:
+            hidden_states = torch.concat([hidden_states, control_latents], 2)
+
+        hidden_states = self.patch_embed(encoder_hidden_states, hidden_states)
+        hidden_states = self.embedding_dropout(hidden_states)
+
+        text_seq_length = encoder_hidden_states.shape[1]
+        encoder_hidden_states = hidden_states[:, :text_seq_length]
+        hidden_states = hidden_states[:, text_seq_length:]
+
+        pose_emb = None
+        pose_emb_mask = None
+        if pose_params is not None:
+            pose_emb = self.pose_embedding(pose_params.to(dtype=hidden_states.dtype))
+            if pose_params_mask is not None:
+                pose_emb_mask = pose_params_mask
+
+        for block in self.transformer_blocks:
+            if torch.is_grad_enabled() and self.gradient_checkpointing:
+                def create_custom_forward(module):
+                    def custom_forward(*inputs):
+                        return module(*inputs)
+
+                    return custom_forward
+
+                ckpt_kwargs = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
+                hidden_states, encoder_hidden_states = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(block),
+                    hidden_states,
+                    encoder_hidden_states,
+                    emb,
+                    pose_emb,
+                    pose_emb_mask,
+                    image_rotary_emb,
+                    attention_kwargs,
+                    **ckpt_kwargs,
+                )
+            else:
+                hidden_states, encoder_hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    temb=emb,
+                    pose_emb=pose_emb,
+                    pose_emb_mask=pose_emb_mask,
+                    image_rotary_emb=image_rotary_emb,
+                    attention_kwargs=attention_kwargs,
+                )
+
+        if not self.config.use_rotary_positional_embeddings:
+            hidden_states = self.norm_final(hidden_states)
+        else:
+            hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+            hidden_states = self.norm_final(hidden_states)
+            hidden_states = hidden_states[:, text_seq_length:]
+
+        hidden_states = self.norm_out(hidden_states, temb=emb)
+        hidden_states = self.proj_out(hidden_states)
+
+        p = self.config.patch_size
+        p_t = self.config.patch_size_t
+
+        if p_t is None:
+            output = hidden_states.reshape(batch_size, local_num_frames, height // p, width // p, -1, p, p)
+            output = output.permute(0, 1, 4, 2, 5, 3, 6).flatten(5, 6).flatten(3, 4)
+        else:
+            output = hidden_states.reshape(
+                batch_size,
+                (local_num_frames + p_t - 1) // p_t,
+                height // p,
+                width // p,
+                -1,
+                p_t,
+                p,
+                p,
+            )
+            output = output.permute(0, 1, 5, 4, 2, 6, 3, 7).flatten(6, 7).flatten(4, 5).flatten(1, 2)
+
+        if num_frames == 1:
+            output = output[:, :num_frames, :]
+
+        if not return_dict:
+            return (output,)
+        return Transformer2DModelOutput(sample=output)
+
+
+# ============================================================================
+# Per-Frame AdaLN Pose Conditioning Classes
+# ============================================================================
+
+class PoseEmbeddingPerFrame(nn.Module):
+    """Embedding layer for pose parameters with per-frame processing and 1D conv for AdaLN conditioning"""
+    
+    def __init__(self, pose_dim=102, embed_dim=512, hidden_dim=1024):
+        super().__init__()
+        self.pose_dim = pose_dim
+        self.embed_dim = embed_dim
+        
+        # Frame-wise projection: each frame's pose parameters are projected independently
+        self.frame_projection = nn.Sequential(
+            nn.Linear(pose_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, embed_dim),
+        )
+        
+        # 1D convolution to reduce temporal dimension: 49 -> 52 -> 26 -> 13 frames
+        # First conv with stride=2: 52 -> 26, then second conv with stride=2: 26 -> 13
+        self.temporal_conv = nn.Sequential(
+            nn.Conv1d(embed_dim, embed_dim, kernel_size=3, stride=2, padding=1),  # 52 -> 26
+            nn.SiLU(),
+            nn.Conv1d(embed_dim, embed_dim, kernel_size=3, stride=2, padding=1),  # 26 -> 13
+            nn.SiLU(),
+            nn.Conv1d(embed_dim, embed_dim, kernel_size=1),  # Final projection
+        )
+        
+        # Layer normalization
+        self.layer_norm = nn.LayerNorm(embed_dim)
+        
+        # Zero initialization for AdaLN-zero (start with no pose conditioning effect)
+        for layer in self.frame_projection:
+            if isinstance(layer, nn.Linear):
+                nn.init.zeros_(layer.weight)
+                nn.init.zeros_(layer.bias)
+        
+        # Initialize conv layers to identity-like behavior
+        for layer in self.temporal_conv:
+            if isinstance(layer, nn.Conv1d):
+                nn.init.zeros_(layer.weight)
+                nn.init.zeros_(layer.bias)
+        
+        # Initialize layer norm to identity (no effect initially)
+        nn.init.ones_(self.layer_norm.weight)
+        nn.init.zeros_(self.layer_norm.bias)
+        
+    def forward(self, pose_params: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            pose_params: Pose parameters of shape (batch_size, num_frames, pose_dim)
+        Returns:
+            pose_embedding: Embedded pose features of shape (batch_size, 13, embed_dim)
+        """
+        batch_size, num_frames, pose_dim = pose_params.shape
+        
+        # Frame-wise projection: (batch_size, num_frames, pose_dim) -> (batch_size, num_frames, embed_dim)
+        frame_features = self.frame_projection(pose_params)  # (B, T, embed_dim)
+        
+        # Pad with first frame to make 49 -> 52: copy first frame 3 times to the left
+        if num_frames == 49:
+            first_frame = frame_features[:, :1, :]  # (B, 1, embed_dim)
+            padding = first_frame.repeat(1, 3, 1)  # (B, 3, embed_dim)
+            frame_features = torch.cat([padding, frame_features], dim=1)  # (B, 52, embed_dim)
+        
+        # Transpose for 1D conv: (batch_size, embed_dim, num_frames)
+        frame_features = frame_features.transpose(1, 2)  # (B, embed_dim, T)
+        
+        # Apply 1D convolution to reduce temporal dimension: 52 -> 26 -> 13
+        temporal_features = self.temporal_conv(frame_features)  # (B, embed_dim, 13)
+        
+        # Transpose back: (batch_size, 13, embed_dim)
+        temporal_features = temporal_features.transpose(1, 2)  # (B, 13, embed_dim)
+        
+        # Apply layer normalization
+        pose_embedding = self.layer_norm(temporal_features)
+        
+        return pose_embedding
+
+
+class PoseConditionedCogVideoXLayerNormZeroPerFrame(CogVideoXLayerNormZero):
+    """Extended CogVideoXLayerNormZero with per-frame pose conditioning (AdaLN-zero) via AdaLN-zero"""
+    
+    def __init__(
+        self,
+        conditioning_dim: int,
+        embedding_dim: int,
+        pose_embed_dim: int,
+        elementwise_affine: bool = True,
+        eps: float = 1e-5,
+        bias: bool = True,
+    ) -> None:
+        super().__init__(conditioning_dim, embedding_dim, elementwise_affine, eps, bias)
+        
+        # Additional pose conditioning layers (zero-initialized for AdaLN-zero)
+        self.pose_linear = nn.Linear(pose_embed_dim, 6 * embedding_dim, bias=bias)
+        
+        # Zero initialization (AdaLN-zero key feature)
+        nn.init.zeros_(self.pose_linear.weight)
+        nn.init.zeros_(self.pose_linear.bias)
+        
+    def forward(
+        self, 
+        hidden_states: torch.Tensor, 
+        encoder_hidden_states: torch.Tensor, 
+        temb: torch.Tensor,
+        pose_emb: Optional[torch.Tensor] = None,
+        pose_emb_mask: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            hidden_states: Input hidden states of shape (batch_size, seq_len, embed_dim)
+            encoder_hidden_states: Input encoder hidden states  
+            temb: Time embedding (original CogVideoX conditioning) of shape (batch_size, time_embed_dim)
+            pose_emb: Pose embedding of shape (batch_size, num_sampled_frames, pose_embed_dim)
+            pose_emb_mask: Mask to zero out pose conditioning for certain samples
+        Returns:
+            Tuple of (norm_hidden_states, norm_encoder_hidden_states, gate, enc_gate)
+        """
+        # Original time conditioning
+        time_shift, time_scale, time_gate, time_enc_shift, time_enc_scale, time_enc_gate = \
+            self.linear(self.silu(temb)).chunk(6, dim=1)  # Each: (batch_size, embed_dim)
+        
+        # Pose conditioning (starts at zero due to initialization)
+        if pose_emb is not None:
+            batch_size, num_sampled_frames, pose_embed_dim = pose_emb.shape
+            
+            # Process each frame's pose embedding through shared linear layer
+            # Reshape to process all frames at once: (batch_size * num_sampled_frames, pose_embed_dim)
+            pose_emb_reshaped = pose_emb.reshape(-1, pose_embed_dim)
+            
+            # Apply linear transformation to each frame
+            pose_linear_output = self.pose_linear(pose_emb_reshaped)  # (batch_size * num_sampled_frames, 6 * embed_dim)
+            
+            # Reshape back and chunk: (batch_size, num_sampled_frames, embed_dim) for each component
+            pose_shift, pose_scale, pose_gate, pose_enc_shift, pose_enc_scale, pose_enc_gate = \
+                pose_linear_output.reshape(batch_size, num_sampled_frames, -1).chunk(6, dim=2)
+            
+            # Unsqueeze time conditioning to match per-frame pose conditioning
+            # time_*: (batch_size, embed_dim) -> (batch_size, 1, embed_dim)
+            time_shift = time_shift[:, None, :]  # (batch_size, 1, embed_dim)
+            time_scale = time_scale[:, None, :]  # (batch_size, 1, embed_dim)
+            time_gate = time_gate[:, None, :]    # (batch_size, 1, embed_dim)
+            time_enc_shift = time_enc_shift[:, None, :]  # (batch_size, 1, embed_dim)
+            time_enc_scale = time_enc_scale[:, None, :]  # (batch_size, 1, embed_dim)
+            time_enc_gate = time_enc_gate[:, None, :]    # (batch_size, 1, embed_dim)
+            
+            # Apply mask to zero out pose conditioning for masked samples
+            if pose_emb_mask is not None:
+                # Expand mask to match the shape of pose parameters
+                # Use the same dtype as pose_emb for consistency
+                mask_expanded = pose_emb_mask.to(dtype=pose_emb.dtype)[:, None, None]  # (batch_size, 1, 1)
+                pose_shift = pose_shift * mask_expanded
+                pose_scale = pose_scale * mask_expanded
+                pose_gate = pose_gate * mask_expanded
+                pose_enc_shift = pose_enc_shift * mask_expanded
+                pose_enc_scale = pose_enc_scale * mask_expanded
+                pose_enc_gate = pose_enc_gate * mask_expanded
+            
+            # Combine time + pose conditioning (per-frame)
+            # pose_*: (batch_size, num_sampled_frames, embed_dim)
+            # time_*: (batch_size, 1, embed_dim) -> broadcast to (batch_size, num_sampled_frames, embed_dim)
+            shift = time_shift + pose_shift  # (batch_size, num_sampled_frames, embed_dim)
+            scale = time_scale + pose_scale  # (batch_size, num_sampled_frames, embed_dim)
+            gate = time_gate + pose_gate     # (batch_size, num_sampled_frames, embed_dim)
+            enc_shift = time_enc_shift + pose_enc_shift  # (batch_size, num_sampled_frames, embed_dim)
+            enc_scale = time_enc_scale + pose_enc_scale  # (batch_size, num_sampled_frames, embed_dim)
+            enc_gate = time_enc_gate + pose_enc_gate     # (batch_size, num_sampled_frames, embed_dim)
+        else:
+            # Fall back to original behavior (no pose conditioning)
+            shift, scale, gate = time_shift, time_scale, time_gate
+            enc_shift, enc_scale, enc_gate = time_enc_shift, time_enc_scale, time_enc_gate
+        
+        # Apply modulation (same as original CogVideoXLayerNormZero)
+        # Note: shift, scale, gate now have shape (batch_size, num_sampled_frames, embed_dim) or (batch_size, embed_dim)
+        # We need to handle both cases in the modulation
+        if pose_emb is not None:
+            # Per-frame conditioning: average across frames for final modulation
+            shift = shift.mean(dim=1)  # (batch_size, embed_dim)
+            scale = scale.mean(dim=1)  # (batch_size, embed_dim)
+            gate = gate.mean(dim=1)    # (batch_size, embed_dim)
+            enc_shift = enc_shift.mean(dim=1)  # (batch_size, embed_dim)
+            enc_scale = enc_scale.mean(dim=1)  # (batch_size, embed_dim)
+            enc_gate = enc_gate.mean(dim=1)    # (batch_size, embed_dim)
+        
+        hidden_states = self.norm(hidden_states) * (1 + scale)[:, None, :] + shift[:, None, :]
+        encoder_hidden_states = self.norm(encoder_hidden_states) * (1 + enc_scale)[:, None, :] + enc_shift[:, None, :]
+        
+        return hidden_states, encoder_hidden_states, gate[:, None, :], enc_gate[:, None, :]
+
+
+class PoseConditionedCogVideoXBlockPerFrame(nn.Module):
+    """CogVideoXBlock with per-frame pose conditioning (AdaLN-zero) via extended LayerNormZero"""
+    
+    def __init__(
+        self,
+        dim: int,
+        num_attention_heads: int,
+        attention_head_dim: int,
+        time_embed_dim: int,
+        pose_embed_dim: int,
+        dropout: float = 0.0,
+        activation_fn: str = "gelu-approximate",
+        attention_bias: bool = False,
+        qk_norm: bool = True,
+        norm_elementwise_affine: bool = True,
+        norm_eps: float = 1e-5,
+        final_dropout: bool = True,
+        ff_inner_dim: Optional[int] = None,
+        ff_bias: bool = True,
+        attention_out_bias: bool = True,
+    ):
+        super().__init__()
+
+        # 1. Self Attention with per-frame pose-conditioned LayerNormZero (AdaLN-zero)
+        self.norm1 = PoseConditionedCogVideoXLayerNormZeroPerFrame(
+            time_embed_dim, dim, pose_embed_dim, norm_elementwise_affine, norm_eps, bias=True
+        )
+
+        self.attn1 = Attention(
+            query_dim=dim,
+            dim_head=attention_head_dim,
+            heads=num_attention_heads,
+            qk_norm="layer_norm" if qk_norm else None,
+            eps=1e-6,
+            bias=attention_bias,
+            out_bias=attention_out_bias,
+            processor=CogVideoXAttnProcessor2_0(),
+        )
+
+        # 2. Feed Forward with per-frame pose-conditioned LayerNormZero (AdaLN-zero)
+        self.norm2 = PoseConditionedCogVideoXLayerNormZeroPerFrame(
+            time_embed_dim, dim, pose_embed_dim, norm_elementwise_affine, norm_eps, bias=True
+        )
+
+        self.ff = FeedForward(
+            dim,
+            dropout=dropout,
+            activation_fn=activation_fn,
+            final_dropout=final_dropout,
+            inner_dim=ff_inner_dim,
+            bias=ff_bias,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        temb: torch.Tensor,
+        pose_emb: Optional[torch.Tensor] = None,
+        pose_emb_mask: Optional[torch.Tensor] = None,
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        attention_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        text_seq_length = encoder_hidden_states.size(1)
+        attention_kwargs = attention_kwargs or {}
+
+        # 1. Self Attention with pose conditioning (AdaLN-zero)
+        norm_hidden_states, norm_encoder_hidden_states, gate_msa, enc_gate_msa = self.norm1(
+            hidden_states, encoder_hidden_states, temb, pose_emb, pose_emb_mask
+        )
+
+        # Attention
+        attn_hidden_states, attn_encoder_hidden_states = self.attn1(
+            hidden_states=norm_hidden_states,
+            encoder_hidden_states=norm_encoder_hidden_states,
+            image_rotary_emb=image_rotary_emb,
+            **attention_kwargs,
+        )
+
+        hidden_states = hidden_states + gate_msa * attn_hidden_states
+        encoder_hidden_states = encoder_hidden_states + enc_gate_msa * attn_encoder_hidden_states
+
+        # 2. Feed Forward with pose conditioning (AdaLN-zero)
+        norm_hidden_states, norm_encoder_hidden_states, gate_ff, enc_gate_ff = self.norm2(
+            hidden_states, encoder_hidden_states, temb, pose_emb, pose_emb_mask
+        )
+
+        # Feed-forward
+        norm_combined = torch.cat([norm_encoder_hidden_states, norm_hidden_states], dim=1)
+        ff_output = self.ff(norm_combined)
+
+        hidden_states = hidden_states + gate_ff * ff_output[:, text_seq_length:]
+        encoder_hidden_states = encoder_hidden_states + enc_gate_ff * ff_output[:, :text_seq_length]
+
+        return hidden_states, encoder_hidden_states
+
+class CogVideoXFunTransformer3DModelWithAdaLNPosePerFrame(CogVideoXFunTransformer3DModel):
+    """VideoX-Fun transformer with per-frame AdaLN pose conditioning."""
+
+    def __init__(
+        self,
+        *args,
+        pose_dim: int = 102,
+        pose_embed_dim: int = 512,
+        **kwargs,
+    ):
+        if PoseEmbedding is None or PoseConditionedCogVideoXBlockPerFrame is None:
+            raise ImportError(
+                "Per-frame AdaLN pose conditioning helpers not available. Ensure cogvideox_transformer_with_conditions is importable."
+            )
+
+        self.pose_dim = pose_dim
+        self.pose_embed_dim = pose_embed_dim
+        super().__init__(*args, **kwargs)
+
+        self.pose_embedding = PoseEmbeddingPerFrame(
+            pose_dim=self.pose_dim,
+            embed_dim=self.pose_embed_dim,
+        )
+        self._replace_blocks_with_pose_conditioned()
+        self._ensure_pose_dtype()
+        self.register_to_config(
+            pose_dim=self.pose_dim,
+            pose_embed_dim=self.pose_embed_dim,
+        )
+
+    def _replace_blocks_with_pose_conditioned(self) -> None:
+        pose_blocks = []
+        for block in self.transformer_blocks:
+            pose_block = PoseConditionedCogVideoXBlockPerFrame(
+                dim=block.norm1.norm.normalized_shape[0],
+                num_attention_heads=self.config.num_attention_heads,
+                attention_head_dim=self.config.attention_head_dim,
+                time_embed_dim=self.config.time_embed_dim,
+                pose_embed_dim=self.pose_embed_dim,
+                dropout=self.config.dropout,
+                activation_fn=self.config.activation_fn,
+                attention_bias=self.config.attention_bias,
+                norm_elementwise_affine=block.norm1.norm.elementwise_affine,
+                norm_eps=block.norm1.norm.eps,
+            )
+            target_dtype = next(block.parameters()).dtype
+            pose_block = pose_block.to(dtype=target_dtype)
+
+            pose_block.attn1.load_state_dict(block.attn1.state_dict(), strict=False)
+            pose_block.ff.load_state_dict(block.ff.state_dict(), strict=False)
+            pose_block.norm1.norm.load_state_dict(block.norm1.norm.state_dict(), strict=False)
+            pose_block.norm2.norm.load_state_dict(block.norm2.norm.state_dict(), strict=False)
+            pose_block.norm1.linear.load_state_dict(block.norm1.linear.state_dict(), strict=False)
+            pose_block.norm2.linear.load_state_dict(block.norm2.linear.state_dict(), strict=False)
+
+            pose_blocks.append(pose_block)
+
+        self.transformer_blocks = nn.ModuleList(pose_blocks)
+
+    def _ensure_pose_dtype(self) -> None:
+        base_dtype = next(self.parameters()).dtype
+        self.pose_embedding = self.pose_embedding.to(dtype=base_dtype)
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path=None,
+        base_model_name_or_path="alibaba-pai/CogVideoX-Fun-V1.1-5b-InP",
+        pose_dim: int = 102,
+        pose_embed_dim: int = 512,
+        subfolder: str = "transformer",
+        **kwargs,
+    ):
+        if pretrained_model_name_or_path is not None:
+            print(f"📥 Loading fine-tuned Fun AdaLN per-frame transformer: {pretrained_model_name_or_path}")
+            config_path = os.path.join(pretrained_model_name_or_path, subfolder, "config.json")
+            if os.path.exists(config_path):
+                import json
+
+                with open(config_path, "r") as f:
+                    config = json.load(f)
+                model = cls(**config)
+            else:
+                model = cls(pose_dim=pose_dim, pose_embed_dim=pose_embed_dim)
+
+            weight_path = os.path.join(pretrained_model_name_or_path, subfolder, "diffusion_pytorch_model.safetensors")
+            if not os.path.exists(weight_path):
+                weight_path = os.path.join(pretrained_model_name_or_path, subfolder, "pytorch_model.bin")
+                if not os.path.exists(weight_path):
+                    raise FileNotFoundError(f"No transformer weights found in {pretrained_model_name_or_path}")
+
+            if weight_path.endswith(".safetensors"):
+                state_dict = load_file(weight_path)
+            else:
+                state_dict = torch.load(weight_path, map_location="cpu")
+
+            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            if missing:
+                print(f"⚠️ Missing keys (AdaLN layers): {missing}")
+            if unexpected:
+                print(f"⚠️ Unexpected keys: {unexpected}")
+            return model
+
+        print(f"🔧 Initializing Fun AdaLN per-frame transformer from base: {base_model_name_or_path}")
+        base_model = CogVideoXTransformer3DModel.from_pretrained(
+            base_model_name_or_path,
+            subfolder=subfolder,
+            torch_dtype=kwargs.get("torch_dtype", torch.bfloat16),
+            revision=kwargs.get("revision", None),
+            variant=kwargs.get("variant", None),
+        )
+
+        model = cls(
+            **base_model.config,
+            pose_dim=pose_dim,
+            pose_embed_dim=pose_embed_dim,
+        )
+
+        missing, unexpected = model.load_state_dict(base_model.state_dict(), strict=False)
+        if missing:
+            print(f"⚠️ Missing keys (AdaLN additions): {missing}")
+        if unexpected:
+            print(f"⚠️ Unexpected keys: {unexpected}")
+
+        return model
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        timestep: Union[int, float, torch.LongTensor],
+        timestep_cond: Optional[torch.Tensor] = None,
+        inpaint_latents: Optional[torch.Tensor] = None,
+        control_latents: Optional[torch.Tensor] = None,
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        return_dict: bool = True,
+        pose_params: Optional[torch.Tensor] = None,
+        pose_params_mask: Optional[torch.Tensor] = None,
+        attention_kwargs: Optional[Dict[str, Any]] = None,
+        **kwargs,
+    ):
+        batch_size, num_frames, channels, height, width = hidden_states.shape
+
+        if num_frames == 1 and self.patch_size_t is not None:
+            hidden_states = torch.cat([hidden_states, torch.zeros_like(hidden_states)], dim=1)
+            if inpaint_latents is not None:
+                inpaint_latents = torch.cat([inpaint_latents, torch.zeros_like(inpaint_latents)], dim=1)
+            if control_latents is not None:
+                control_latents = torch.cat([control_latents, torch.zeros_like(control_latents)], dim=1)
+            local_num_frames = num_frames + 1
+        else:
+            local_num_frames = num_frames
+
+        timesteps = timestep
+        t_emb = self.time_proj(timesteps).to(dtype=hidden_states.dtype)
+        emb = self.time_embedding(t_emb, timestep_cond)
+
+        if self.ofs_embedding is not None:
+            ofs = kwargs.get(
+                "ofs",
+                torch.ones((batch_size,), device=hidden_states.device, dtype=hidden_states.dtype) * 2.0,
+            )
+            ofs_emb = self.ofs_proj(ofs)
+            ofs_emb = self.ofs_embedding(ofs_emb.to(dtype=hidden_states.dtype))
+            emb = emb + ofs_emb
+
+        if inpaint_latents is not None:
+            hidden_states = torch.concat([hidden_states, inpaint_latents], 2)
+        if control_latents is not None:
+            hidden_states = torch.concat([hidden_states, control_latents], 2)
+
+        hidden_states = self.patch_embed(encoder_hidden_states, hidden_states)
+        hidden_states = self.embedding_dropout(hidden_states)
+
+        text_seq_length = encoder_hidden_states.shape[1]
+        encoder_hidden_states = hidden_states[:, :text_seq_length]
+        hidden_states = hidden_states[:, text_seq_length:]
+
+        pose_emb = None
+        pose_emb_mask = None
+        if pose_params is not None:
+            pose_emb = self.pose_embedding(pose_params.to(dtype=hidden_states.dtype))
+            if pose_params_mask is not None:
+                pose_emb_mask = pose_params_mask
+
+        for block in self.transformer_blocks:
+            if torch.is_grad_enabled() and self.gradient_checkpointing:
+                def create_custom_forward(module):
+                    def custom_forward(*inputs):
+                        return module(*inputs)
+
+                    return custom_forward
+
+                ckpt_kwargs = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
+                hidden_states, encoder_hidden_states = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(block),
+                    hidden_states,
+                    encoder_hidden_states,
+                    emb,
+                    pose_emb,
+                    pose_emb_mask,
+                    image_rotary_emb,
+                    attention_kwargs,
+                    **ckpt_kwargs,
+                )
+            else:
+                hidden_states, encoder_hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    temb=emb,
+                    pose_emb=pose_emb,
+                    pose_emb_mask=pose_emb_mask,
+                    image_rotary_emb=image_rotary_emb,
+                    attention_kwargs=attention_kwargs,
+                )
+
+        if not self.config.use_rotary_positional_embeddings:
+            hidden_states = self.norm_final(hidden_states)
+        else:
+            hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+            hidden_states = self.norm_final(hidden_states)
+            hidden_states = hidden_states[:, text_seq_length:]
+
+        hidden_states = self.norm_out(hidden_states, temb=emb)
+        hidden_states = self.proj_out(hidden_states)
+
+        p = self.config.patch_size
+        p_t = self.config.patch_size_t
+
+        if p_t is None:
+            output = hidden_states.reshape(batch_size, local_num_frames, height // p, width // p, -1, p, p)
+            output = output.permute(0, 1, 4, 2, 5, 3, 6).flatten(5, 6).flatten(3, 4)
+        else:
+            output = hidden_states.reshape(
+                batch_size,
+                (local_num_frames + p_t - 1) // p_t,
+                height // p,
+                width // p,
+                -1,
+                p_t,
+                p,
+                p,
+            )
+            output = output.permute(0, 1, 5, 4, 2, 6, 3, 7).flatten(6, 7).flatten(4, 5).flatten(1, 2)
+
+        if num_frames == 1:
+            output = output[:, :num_frames, :]
+
+        if not return_dict:
+            return (output,)
+        return Transformer2DModelOutput(sample=output)

@@ -416,6 +416,7 @@ class VideoDatasetWithConditions(VideoDataset):
         vae_scale_factor_spatial: int = 8,
         load_raymaps: bool = False,
         load_image_goal: bool = False,
+        load_hand_motions: bool = False,
         load_raw_videos_for_pixel_loss: bool = False,
         prompt_subdir: str = "prompts",
         prompt_embeds_subdir: str = "prompt_embeds",
@@ -463,6 +464,7 @@ class VideoDatasetWithConditions(VideoDataset):
         self.vae_scale_factor_spatial = vae_scale_factor_spatial
         self.load_raymaps = load_raymaps
         self.load_image_goal = load_image_goal
+        self.load_hand_motions = load_hand_motions
         self.load_raw_videos_for_pixel_loss = load_raw_videos_for_pixel_loss
         self.hand_video_subdir = hand_video_subdir
         self.hand_video_latents_subdir = hand_video_latents_subdir
@@ -498,6 +500,11 @@ class VideoDatasetWithConditions(VideoDataset):
             self.smpl_pos_map_paths = self._derive_condition_video_paths("smpl_pos_map_egoallo")
         else:
             self.smpl_pos_map_paths = None
+
+        if self.load_hand_motions:
+            self.hand_motions_paths = self._derive_hand_motions_paths()
+        else:
+            self.hand_motions_paths = None
         
         # Validate that all condition videos exist
         if not self.load_tensors:
@@ -542,6 +549,16 @@ class VideoDatasetWithConditions(VideoDataset):
                     missing_smpl_pos_maps = [path for path in self.smpl_pos_map_paths if not path.is_file()]
                     raise ValueError(
                         f"Some SMPL pos map files are missing. First few missing files: {missing_smpl_pos_maps[:5]}"
+                    )
+            if self.load_hand_motions and self.hand_motions_paths is not None:
+                missing_hand_motions = [
+                    path
+                    for idx, path in enumerate(self.hand_motions_paths)
+                    if not self.is_i2v_sample[idx] and not path.is_file()
+                ]
+                if missing_hand_motions:
+                    raise ValueError(
+                        f"Some hand_motions files are missing. First few missing files: {missing_hand_motions[:5]}"
                     )
                     
     def _merge_i2v_dataset(self):
@@ -603,6 +620,39 @@ class VideoDatasetWithConditions(VideoDataset):
             condition_paths.append(condition_path)
         
         return condition_paths
+
+    def _derive_hand_motions_paths(self) -> List[Path]:
+        """Derive hand_motions paths from main video paths."""
+        hand_motions_paths: List[Path] = []
+        for video_path in self.video_paths:
+            parent_dir = video_path.parent
+            filename_without_ext = video_path.stem
+            hand_motions_path = parent_dir.parent / "hand_motions" / f"{filename_without_ext}.pt"
+            hand_motions_paths.append(hand_motions_path)
+        return hand_motions_paths
+
+    @staticmethod
+    def _load_hand_motions(data: Union[Path, torch.Tensor]) -> torch.Tensor:
+        """Load hand pose parameters and extract body_pose."""
+        if isinstance(data, torch.Tensor):
+            return data
+        path = data
+        if not path.exists():
+            raise FileNotFoundError(f"Hand motions file not found: {path}")
+        hand_motions = torch.load(path, map_location="cpu")
+        if isinstance(hand_motions, dict):
+            if "body_pose" in hand_motions:
+                hand_motions = hand_motions["body_pose"]
+            elif "hand_pose" in hand_motions:
+                hand_motions = hand_motions["hand_pose"]
+            else:
+                available_keys = list(hand_motions.keys())
+                raise KeyError(
+                    f"Hand motions tensor not found in {path}. Available keys: {available_keys}"
+                )
+        if not isinstance(hand_motions, torch.Tensor):
+            raise TypeError(f"Unexpected hand_motions type from {path}: {type(hand_motions)}")
+        return hand_motions
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
         # if isinstance(index, list):
@@ -733,6 +783,23 @@ class VideoDatasetWithConditions(VideoDataset):
                 ones_mask = torch.ones(f_latent, 1, h_latent, w_latent)
                 main_data["masks"] = ones_mask
             
+            if self.load_hand_motions and self.hand_motions_paths is not None:
+                if not (self.is_i2v_sample[index] if hasattr(self, "is_i2v_sample") and index < len(self.is_i2v_sample) else False):
+                    try:
+                        hand_motions = self._load_hand_motions(self.hand_motions_paths[index])
+                        main_data["hand_motions"] = hand_motions
+                        main_data["human_motions"] = hand_motions  # backward compatibility
+                    except Exception as e:
+                        logger.warning(f"Failed to load hand_motions for index {index}: {e}")
+                        main_data["hand_motions"] = None
+                        main_data["human_motions"] = None
+                else:
+                    main_data["hand_motions"] = None
+                    main_data["human_motions"] = None
+            else:
+                main_data["hand_motions"] = None
+                main_data["human_motions"] = None
+
             # Load SMPL pos map if enabled
             if self.use_smpl_pos_map:
                 try:
@@ -944,6 +1011,24 @@ class VideoDatasetWithConditions(VideoDataset):
                 main_data["raw_video"] = None
         else:
             main_data["raw_video"] = None
+
+        if self.load_hand_motions and self.hand_motions_paths is not None:
+            is_i2v = self.is_i2v_sample[index] if hasattr(self, "is_i2v_sample") and index < len(self.is_i2v_sample) else False
+            if not is_i2v:
+                try:
+                    hand_motions = self._load_hand_motions(self.hand_motions_paths[index])
+                    main_data["hand_motions"] = hand_motions
+                    main_data["human_motions"] = hand_motions  # backward compatibility
+                except Exception as e:
+                    logger.warning(f"Failed to load hand_motions for index {index}: {e}")
+                    main_data["hand_motions"] = None
+                    main_data["human_motions"] = None
+            else:
+                main_data["hand_motions"] = None
+                main_data["human_motions"] = None
+        else:
+            main_data["hand_motions"] = None
+            main_data["human_motions"] = None
 
         return main_data
 
@@ -1300,21 +1385,14 @@ class VideoDatasetWithResizeAndRectangleCrop(VideoDataset):
 
 class VideoDatasetWithHumanMotions(VideoDatasetWithConditions):
     """
-    Extended VideoDatasetWithConditions that also supports human_motions data.
-    
-    This dataset loads:
-    - video_latents/*.pt: Main video latents
-    - prompt_embeds/*.pt: Text prompt embeddings  
-    - image_latents/*.pt: Image latents (for image-to-video)
-    - human_motions/*.pt: SMPL pose parameters for AdaLN conditioning
-    - raymaps/*.pt: Camera ray maps (optional)
-    - image_goal_latents/*.pt: Goal image latents (optional)
+    VideoDatasetWithConditions variant that automatically loads human_motions data.
     """
-    
+
     def __init__(
         self,
         data_root: str,
         dataset_file: Optional[str] = None,
+        dataset_file_i2v: Optional[str] = None,
         caption_column: str = "text",
         video_column: str = "video",
         max_num_frames: int = 49,
@@ -1338,11 +1416,13 @@ class VideoDatasetWithHumanMotions(VideoDatasetWithConditions):
         prompt_embeds_subdir: str = "prompt_embeds",
         hand_video_subdir: str = "videos_hands",
         hand_video_latents_subdir: str = "hand_video_latents",
+        start_i2v_training_iter: Optional[int] = None,
+        warped_videos_prob: float = 0.0,
     ) -> None:
-        # Initialize parent class with main video column
         super().__init__(
             data_root=data_root,
             dataset_file=dataset_file,
+            dataset_file_i2v=dataset_file_i2v,
             caption_column=caption_column,
             video_column=video_column,
             max_num_frames=max_num_frames,
@@ -1361,84 +1441,15 @@ class VideoDatasetWithHumanMotions(VideoDatasetWithConditions):
             vae_scale_factor_spatial=vae_scale_factor_spatial,
             load_raymaps=load_raymaps,
             load_image_goal=load_image_goal,
+            load_hand_motions=True,
             load_raw_videos_for_pixel_loss=load_raw_videos_for_pixel_loss,
             prompt_subdir=prompt_subdir,
             prompt_embeds_subdir=prompt_embeds_subdir,
             hand_video_subdir=hand_video_subdir,
             hand_video_latents_subdir=hand_video_latents_subdir,
+            start_i2v_training_iter=start_i2v_training_iter,
+            warped_videos_prob=warped_videos_prob,
         )
-        
-        # Automatically derive human_motions paths from main video paths
-        self.human_motions_paths = self._derive_human_motions_paths()
-        
-        # Validate that all human_motions files exist
-        if not self.load_tensors:
-            if any(not path.is_file() for path in self.human_motions_paths):
-                missing_human_motions = [path for path in self.human_motions_paths if not path.is_file()]
-                raise ValueError(
-                    f"Some human_motions files are missing. First few missing files: {missing_human_motions[:5]}"
-                )
-
-    def _derive_human_motions_paths(self) -> List[Path]:
-        """Derive human_motions paths from main video paths.
-        
-        Returns:
-            List of human_motions file paths
-        """
-        human_motions_paths = []
-        
-        for video_path in self.video_paths:
-            # Example: video_path = /path/to/sequences/videos/00001.mp4
-            # We want: /path/to/sequences/human_motions/00001.pt
-            
-            # Get the parent directory (sequences)
-            parent_dir = video_path.parent
-            # Get the filename without extension (00001)
-            filename_without_ext = video_path.stem
-            # Construct the human_motions path
-            human_motions_path = parent_dir.parent / "human_motions" / f"{filename_without_ext}.pt"
-            human_motions_paths.append(human_motions_path)
-        
-        return human_motions_paths
-
-    def __getitem__(self, index: int) -> Dict[str, Any]:
-        # if isinstance(index, list):
-        #     return index
-
-        # Get main video data from parent class
-        main_data = super().__getitem__(index)
-        
-        # Load human_motions data
-        if self.load_tensors:
-            # Load preprocessed human_motions latents
-            try:
-                human_motions = self._load_human_motions(self.human_motions_paths[index])
-                main_data["human_motions"] = human_motions
-            except Exception as e:
-                logger.warning(f"Failed to load human_motions for index {index}: {e}")
-                main_data["human_motions"] = None
-        else:
-            # For raw video mode, we don't load human_motions as it's SMPL data
-            main_data["human_motions"] = None
-
-        return main_data
-
-    def _load_human_motions(self, path: Path) -> torch.Tensor:
-        """Load preprocessed human_motions data and extract body_pose."""
-        if not path.exists():
-            raise FileNotFoundError(f"Human motions file not found: {path}")
-        
-        # Load SMPL pose parameters dictionary
-        human_motions_dict = torch.load(path, map_location="cpu", weights_only=True)
-        
-        # Extract body_pose from the dictionary
-        if isinstance(human_motions_dict, dict) and "body_pose" in human_motions_dict:
-            body_pose = human_motions_dict["body_pose"]
-            logger.debug(f"Loaded body_pose with shape: {body_pose.shape}")
-            return body_pose
-        else:
-            available_keys = list(human_motions_dict.keys()) if isinstance(human_motions_dict, dict) else 'Not a dict'
-            raise KeyError(f"body_pose not found in human_motions data: {path}. Available keys: {available_keys}")
 
 
 class VideoDatasetWithHumanMotionsAndResizing(VideoDatasetWithHumanMotions):

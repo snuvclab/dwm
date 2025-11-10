@@ -66,13 +66,25 @@ from training.cogvideox_static_pose.cogvideox_fun_transformer_with_conditions im
     CrossTransformer3DModel,
     CrossTransformer3DModelWithAdapter,
     CogVideoXFunTransformer3DModelWithAdapter,
-    CogVideoXFunTransformer3DModelWithCondToken
+    CogVideoXFunTransformer3DModelWithCondToken,
+    CogVideoXFunTransformer3DModelWithAdaLNPose,
 )
 from training.cogvideox_static_pose.cogvideox_pose_concat_pipeline import CogVideoXPoseConcatPipeline
 from training.cogvideox_static_pose.cogvideox_pose_adapter_pipeline import CogVideoXPoseAdapterPipeline
 from training.cogvideox_static_pose.cogvideox_pose_adaln_pipeline import CogVideoXPoseAdaLNPipeline,CogVideoXPoseAdaLNPerFramePipeline
 from training.cogvideox_static_pose.cogvideox_static_to_video_pose_concat_pipeline import CogVideoXStaticToVideoPipeline, CogVideoXStaticToVideoPoseConcatPipeline, CogVideoXStaticToVideoCrossPoseAdapterPipeline
-from training.cogvideox_static_pose.cogvideox_fun_static_to_video_pose_concat_pipeline import CogVideoXFunStaticToVideoPipeline, CogVideoXFunStaticToVideoCrossPipeline, CogVideoXFunStaticToVideoPoseTokenPipeline
+from training.cogvideox_static_pose.cogvideox_fun_static_to_video_pose_concat_pipeline import (
+    CogVideoXFunStaticToVideoPipeline,
+    CogVideoXFunStaticToVideoCrossPipeline,
+    CogVideoXFunStaticToVideoPoseTokenPipeline,
+)
+
+# Backward compatibility alias (legacy configs may reference the old name)
+CogVideoXFunStaticToVideoHandTokenPipeline = CogVideoXFunStaticToVideoPoseTokenPipeline
+from training.cogvideox_static_pose.cogvideox_fun_static_to_video_pose_adaln_pipeline import (
+    CogVideoXFunStaticToVideoPoseAdaLNPipeline,
+    CogVideoXFunStaticToVideoPoseAdaLNPerFramePipeline,
+)
 from training.cogvideox_static_pose.config_loader import load_experiment_config
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from diffusers.optimization import get_scheduler
@@ -153,6 +165,7 @@ def log_validation_with_dataset(
     else:
         # For concat/adapter, load hand and static videos
         split_hands = config.get("data", {}).get("split_hands", False)
+        hand_motions = None
         
         if split_hands:
             # Split hands mode: load left and right hand videos separately
@@ -212,6 +225,14 @@ def log_validation_with_dataset(
                 print(f"   ✅ Blur applied successfully (pixel blur is {validation_blur_strength/blur_strength:.1f}x stronger than latent blur)")
         else:
             static_video = None
+        
+        if pipeline_type == "cogvideox_fun_static_to_video_pose_adaln":
+            if validation_human_motions_path and os.path.exists(validation_human_motions_path):
+                human_motions = torch.load(validation_human_motions_path, map_location="cpu")
+                if isinstance(human_motions, dict) and "body_pose" in human_motions:
+                    human_motions = human_motions["body_pose"]
+            else:
+                human_motions = None
         
         # Load SMPL pos map if available
         if validation_smpl_pos_map_path and os.path.exists(validation_smpl_pos_map_path):
@@ -280,8 +301,6 @@ def log_validation_with_dataset(
             raymap = raymap.numpy()
         else:
             raymap = None
-        
-        human_motions = None
 
     # Check condition control flags (only for concat/adapter)
     if pipeline_type not in ["cogvideox_pose_adaln", "cogvideox_pose_adaln_perframe"]:
@@ -342,19 +361,19 @@ def log_validation_with_dataset(
     
     if pipeline_type in ["cogvideox_pose_adaln", "cogvideox_pose_adaln_perframe"]:
         # AdaLN pipeline uses SMPL pose parameters
-        if human_motions is not None:
+        if hand_motions is not None:
             # Convert to numpy and add batch dimension if needed
-            if isinstance(human_motions, torch.Tensor):
-                pose_params = human_motions.numpy()
+            if isinstance(hand_motions, torch.Tensor):
+                pose_params = hand_motions.numpy()
             else:
-                pose_params = human_motions
+                pose_params = hand_motions
             
             if pose_params.ndim == 2:
                 pose_params = pose_params[np.newaxis, :]  # Add batch dimension
             
             pipeline_args["pose_params"] = pose_params
         else:
-            # Use dummy pose parameters if human_motions is not available
+            # Use dummy pose parameters if hand_motions is not available
             dummy_pose_params = np.zeros((1, 49, 63))  # (batch_size, num_frames, pose_dim)
             pipeline_args["pose_params"] = dummy_pose_params
         
@@ -372,6 +391,8 @@ def log_validation_with_dataset(
         pipeline_args["image"] = dummy_image
     elif pipeline_type in ["cogvideox_static_to_video", "cogvideox_static_to_video_pose_concat", 
                            "cogvideox_fun_static_to_video", "cogvideox_fun_static_to_video_pose_concat",
+                           "cogvideox_fun_static_to_video_pose_adaln",
+                           "cogvideox_fun_static_to_video_pose_adaln_perframe",
                            "cogvideox_fun_static_to_video_posmap_concat", "cogvideox_fun_static_to_video_posmap_adapter",
                            "cogvideox_fun_static_to_video_raymap_pose_concat"]:
         # I2V-based pipelines with video conditioning
@@ -397,7 +418,9 @@ def log_validation_with_dataset(
                 pipeline_args["hand_videos"] = hand_video
                 pipeline_args["raymap"] = raymap
                 # Don't pass static_videos in I2V mode (will use image instead)
-            # For other pipelines, don't pass video conditions in I2V mode
+            if pipeline_type in ["cogvideox_fun_static_to_video_pose_adaln", "cogvideox_fun_static_to_video_pose_adaln_perframe"]:
+                pipeline_args["pose_params"] = hand_motions
+        # For other pipelines, don't pass video conditions in I2V mode
         else:
             # Static-to-video mode: use full static video
             if pipeline_type == "cogvideox_static_to_video":
@@ -413,6 +436,9 @@ def log_validation_with_dataset(
             elif pipeline_type == "cogvideox_fun_static_to_video_pose_concat":
                 pipeline_args["static_videos"] = static_video
                 pipeline_args["hand_videos"] = hand_video
+            elif pipeline_type in ["cogvideox_fun_static_to_video_pose_adaln", "cogvideox_fun_static_to_video_pose_adaln_perframe"]:
+                pipeline_args["static_videos"] = static_video
+                pipeline_args["pose_params"] = hand_motions
             elif pipeline_type == "cogvideox_fun_static_to_video_posmap_concat":
                 pipeline_args["static_videos"] = static_video
                 pipeline_args["smpl_pos_map"] = smpl_pos_map
@@ -698,6 +724,34 @@ def run_validation(
             condition_channels=condition_channels,
             use_adapter=False,
             split_hands=data_config.get("split_hands", False),
+        )
+    elif pipeline_config["type"] == "cogvideox_fun_static_to_video_pose_adaln":
+        adaln_config = pipeline_config.get("adaln", {})
+        pose_dim = adaln_config.get("pose_dim", 102)
+        pose_embed_dim = adaln_config.get("pose_embed_dim", 512)
+        pipe = CogVideoXFunStaticToVideoPoseAdaLNPipeline.from_pretrained(
+            base_model_name_or_path=model_config_dict["base_model_name_or_path"],
+            transformer=unwrap_model(accelerator, transformer),
+            scheduler=scheduler,
+            revision=model_config_dict.get("revision"),
+            variant=model_config_dict.get("variant"),
+            torch_dtype=weight_dtype,
+            pose_dim=pose_dim,
+            pose_embed_dim=pose_embed_dim,
+        )
+    elif pipeline_config["type"] == "cogvideox_fun_static_to_video_pose_adaln_perframe":
+        adaln_config = pipeline_config.get("adaln", {})
+        pose_dim = adaln_config.get("pose_dim", 102)
+        pose_embed_dim = adaln_config.get("pose_embed_dim", 512)
+        pipe = CogVideoXFunStaticToVideoPoseAdaLNPerFramePipeline.from_pretrained(
+            base_model_name_or_path=model_config_dict["base_model_name_or_path"],
+            transformer=unwrap_model(accelerator, transformer),
+            scheduler=scheduler,
+            revision=model_config_dict.get("revision"),
+            variant=model_config_dict.get("variant"),
+            torch_dtype=weight_dtype,
+            pose_dim=pose_dim,
+            pose_embed_dim=pose_embed_dim,
         )
     elif pipeline_config["type"] == "cogvideox_fun_static_to_video_cross":
         # Get cross-attention parameters from pipeline config
@@ -1000,6 +1054,10 @@ def run_validation(
                 video_path_obj = Path(validation_video)
                 human_motions_path = video_path_obj.parent.parent / "human_motions" / f"{video_path_obj.stem}.pt"
                 required_files = [validation_video, validation_prompt, human_motions_path]
+            elif pipeline_config["type"] == "cogvideox_fun_static_to_video_pose_adaln":
+                video_path_obj = Path(validation_video)
+                human_motions_path = video_path_obj.parent.parent / "hand_motions" / f"{video_path_obj.stem}.pt"
+                required_files = [validation_video, validation_prompt, validation_static_video, human_motions_path]
             else:
                 # For concat/adapter, check for hand/static videos
                 required_files = [validation_video, validation_prompt, validation_static_video]
@@ -1021,7 +1079,8 @@ def run_validation(
                         required_files.append(validation_hand_video)
             
             if not all(os.path.exists(f) for f in required_files):
-                print(f"Warning: Some validation files missing for {validation_video}. Skipping.")
+                missing_files = [str(f) for f in required_files if not os.path.exists(f)]
+                print(f"Warning: Missing validation files for {validation_video}: {missing_files}. Skipping.")
                 continue
                 
             # Load prompt
@@ -1083,6 +1142,20 @@ def run_validation(
                     step=step,
                     pipeline_type=config["pipeline"]["type"],
                     validation_mode="image_to_video",
+                )
+            elif pipeline_config["type"] == "cogvideox_fun_static_to_video_pose_adaln":
+                print(f"🎬 Testing VideoX-Fun static-to-video AdaLN pipeline for {validation_video.name}")
+                log_validation_with_dataset(
+                    pipe=pipe,
+                    config=config,
+                    accelerator=accelerator,
+                    validation_video_path=validation_video,
+                    validation_prompt=prompt_text,
+                    validation_static_video_path=validation_static_video,
+                    validation_human_motions_path=human_motions_path,
+                    step=step,
+                    pipeline_type=config["pipeline"]["type"],
+                    validation_mode="static_to_video",
                 )
             elif pipeline_config["type"] in ["cogvideox_fun_static_to_video", "cogvideox_fun_static_to_video_pose_concat"]:
                 # For VideoX-Fun static-to-video pipelines, test static-to-video mode
@@ -1497,6 +1570,9 @@ def setup_pipeline_from_config(config: Dict[str, Any]):
     pipeline_config = config["pipeline"]
     pipeline_type = pipeline_config.get("type", "cogvideox_pose_concat")
     data_config = config.get("data", {})
+    concat_config = config.get("concat", {})
+    adapter_config = config.get("adapter", {})
+    adaln_config = config.get("adaln", {})
     
     print(f"🔧 Setting up pipeline: {pipeline_type}")
     
@@ -1655,6 +1731,26 @@ def setup_pipeline_from_config(config: Dict[str, Any]):
             condition_channels=condition_channels,
             use_adapter=False,
             split_hands=data_config.get("split_hands", False),
+        )
+
+    elif pipeline_type == "cogvideox_fun_static_to_video_pose_adaln":
+        print("🔧 Setting up CogVideoX Fun Static-to-Video AdaLN pipeline")
+        pipeline = CogVideoXFunStaticToVideoPoseAdaLNPipeline.from_pretrained(
+            pretrained_model_name_or_path=None,
+            base_model_name_or_path=model_path,
+            torch_dtype=load_dtype,
+            revision=model_config.get("revision"),
+            variant=model_config.get("variant")
+        )
+
+    elif pipeline_type == "cogvideox_fun_static_to_video_pose_adaln_perframe":
+        print("🔧 Setting up CogVideoX Fun Static-to-Video AdaLN pipeline")
+        pipeline = CogVideoXFunStaticToVideoPoseAdaLNPerFramePipeline.from_pretrained(
+            pretrained_model_name_or_path=None,
+            base_model_name_or_path=model_path,
+            torch_dtype=load_dtype,
+            revision=model_config.get("revision"),
+            variant=model_config.get("variant")
         )
         
     elif pipeline_type == "cogvideox_fun_static_to_video_posmap_concat":
@@ -2150,6 +2246,11 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
                                 output_dir,
                                 transformer_lora_layers=transformer_lora_layers,
                             )
+                        elif pipeline_type == "cogvideox_fun_static_to_video_pose_adaln":
+                            CogVideoXFunStaticToVideoPoseAdaLNPipeline.save_lora_weights(
+                                output_dir,
+                                transformer_lora_layers=transformer_lora_layers,
+                            )
                         elif pipeline_type == "cogvideox_fun_static_to_video_raymap_pose_concat":
                             CogVideoXFunStaticToVideoPipeline.save_lora_weights(
                                 output_dir,
@@ -2301,6 +2402,12 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
                 pretrained_model_name_or_path=None,  # Always start from base model
                 base_model_name_or_path=config["model"]["base_model_name_or_path"],
                 condition_channels=condition_channels,
+                subfolder="transformer",
+            )
+        elif pipeline_type == "cogvideox_fun_static_to_video_pose_adaln":
+            transformer_ = CogVideoXFunTransformer3DModelWithAdaLNPose.from_pretrained(
+                pretrained_model_name_or_path=None,  # Always start from base model
+                base_model_name_or_path=config["model"]["base_model_name_or_path"],
                 subfolder="transformer",
             )
         elif pipeline_type == "cogvideox_fun_static_to_video_posmap_concat":
@@ -2479,6 +2586,8 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
                 lora_state_dict = CogVideoXFunStaticToVideoPipeline.lora_state_dict(input_dir)
             elif pipeline_type == "cogvideox_fun_static_to_video_raymap_pose_concat":
                 lora_state_dict = CogVideoXFunStaticToVideoPipeline.lora_state_dict(input_dir)
+            elif pipeline_type == "cogvideox_fun_static_to_video_pose_adaln":
+                lora_state_dict = CogVideoXFunStaticToVideoPoseAdaLNPipeline.lora_state_dict(input_dir)
             elif pipeline_type == "cogvideox_fun_static_to_video_posmap_adapter":
                 lora_state_dict = CogVideoXFunStaticToVideoPipeline.lora_state_dict(input_dir)
             elif pipeline_type == "cogvideox_fun_static_to_video_cross":
@@ -3371,12 +3480,16 @@ def main():
         "vae_scale_factor_spatial": data_config.get("vae_scale_factor_spatial", 8),
         "load_raymaps": data_config.get("load_raymaps", False),
         "load_image_goal": data_config.get("load_image_goal", False),
+        "load_hand_motions": data_config.get("load_hand_motions", False),
         "load_raw_videos_for_pixel_loss": training_config.get("use_pixel_loss", False),
         "prompt_subdir": data_config.get("prompt_subdir", "prompts"),
         "prompt_embeds_subdir": data_config.get("prompt_embeds_subdir", "prompt_embeds"),
         "hand_video_subdir": data_config.get("hand_video_subdir", "videos_hands"),
         "hand_video_latents_subdir": data_config.get("hand_video_latents_subdir", "hand_video_latents"),
     }
+
+    if data_config.get("load_hand_motions", False):
+        dataset_init_kwargs["load_hand_motions"] = True
     
     # Choose dataset class based on pipeline type
     if pipeline_config["type"] == "cogvideox_i2v":
@@ -3386,6 +3499,10 @@ def main():
     elif pipeline_config["type"] in ["cogvideox_pose_adaln", "cogvideox_pose_adaln_perframe"]:
         train_dataset = VideoDatasetWithHumanMotionsAndResizing(**dataset_init_kwargs)
         print("🔧 Using VideoDatasetWithHumanMotionsAndResizing for AdaLN pose training")
+    elif pipeline_config["type"] == "cogvideox_fun_static_to_video_pose_adaln":
+        dataset_init_kwargs["load_hand_motions"] = True
+        train_dataset = VideoDatasetWithConditionsAndResizing(**dataset_init_kwargs)
+        print("🔧 Using VideoDatasetWithConditionsAndResizing with human motions for Fun static-to-video AdaLN training")
     else:
         train_dataset = VideoDatasetWithConditionsAndResizing(**dataset_init_kwargs)
         print("🔧 Using VideoDatasetWithConditionsAndResizing for concat/adapter training")
@@ -3409,23 +3526,58 @@ def main():
     #     pin_memory=data_config.get("pin_memory", True),
     # )
     def collate_fn(batch):
-        return {
+        hand_motion_entries = []
+        for item in batch:
+            if "hand_motions" in item and item["hand_motions"] is not None:
+                hand_motion_entries.append(item["hand_motions"])
+            elif "human_motions" in item and item["human_motions"] is not None:
+                hand_motion_entries.append(item["human_motions"])
+            else:
+                hand_motion_entries.append(None)
+
+        def stack_or_none(key: str):
+            if key in batch[0] and batch[0][key] is not None:
+                first_tensor = batch[0][key]
+                stacked_items = []
+                for item in batch:
+                    value = item.get(key)
+                    if value is None:
+                        stacked_items.append(torch.zeros_like(first_tensor))
+                    else:
+                        stacked_items.append(value)
+                return torch.stack(stacked_items)
+            return None
+
+        collated = {
             "videos": torch.stack([item["video"] for item in batch]),
             "prompts": (
                 torch.stack([item["prompt"] for item in batch])
                 if isinstance(batch[0]["prompt"], torch.Tensor)
                 else [item["prompt"] for item in batch]
             ),
-            "images": torch.stack([item["image"] for item in batch]) if "image" in batch[0] and batch[0]["image"] is not None else None,
-            "hand_videos": torch.stack([item["hand_videos"] for item in batch]) if "hand_videos" in batch[0] and batch[0]["hand_videos"] is not None else None,
-            "static_videos": torch.stack([item["static_videos"] for item in batch]) if "static_videos" in batch[0] and batch[0]["static_videos"] is not None else None,
-            "smpl_pos_map": torch.stack([item["smpl_pos_map"] for item in batch]) if "smpl_pos_map" in batch[0] and batch[0]["smpl_pos_map"] is not None else None,
-            "human_motions": torch.stack([item["human_motions"] for item in batch]) if "human_motions" in batch[0] and batch[0]["human_motions"] is not None else None,
-            "raymaps": torch.stack([item["raymap"] for item in batch]) if "raymap" in batch[0] and batch[0]["raymap"] is not None else None,
-            "image_goal": torch.stack([item["image_goal"] for item in batch]) if "image_goal" in batch[0] and batch[0]["image_goal"] is not None else None,
-            "raw_video": torch.stack([item["raw_video"] for item in batch]) if "raw_video" in batch[0] and batch[0]["raw_video"] is not None else None,
-            "masks": torch.stack([item["masks"] for item in batch]) if "masks" in batch[0] else None,
+            "images": stack_or_none("image"),
+            "hand_videos": stack_or_none("hand_videos"),
+            "static_videos": stack_or_none("static_videos"),
+            "smpl_pos_map": stack_or_none("smpl_pos_map"),
+            "raymaps": stack_or_none("raymap"),
+            "image_goal": stack_or_none("image_goal"),
+            "raw_video": stack_or_none("raw_video"),
+            "masks": stack_or_none("masks"),
         }
+
+        if any(entry is not None for entry in hand_motion_entries):
+            first_entry = next(entry for entry in hand_motion_entries if entry is not None)
+            collated["hand_motions"] = torch.stack([
+                entry if entry is not None else torch.zeros_like(first_entry)
+                for entry in hand_motion_entries
+            ])
+        else:
+            collated["hand_motions"] = None
+
+        # Backward compatibility key
+        collated["human_motions"] = collated["hand_motions"]
+
+        return collated
     
     train_dataloader = DataLoader(
         train_dataset,
@@ -3817,6 +3969,7 @@ def main():
     # Run initial validation at step 0 (before training starts)
     if data_config.get("validation_set") is not None:
         logger.info("Running initial validation at step 0 (before training starts)")
+        should_run_max_validation = training_config.get("custom_settings", {}).get("should_run_max_validation", False)
         run_validation(
             config=config,
             accelerator=accelerator,
@@ -3825,7 +3978,7 @@ def main():
             model_config=transformer_config,
             weight_dtype=weight_dtype,
             step=initial_global_step,
-            should_run_max_validation=False
+            should_run_max_validation=should_run_max_validation
         )
 
     # Generate empty prompt embedding for prompt dropout (classifier-free guidance training)
@@ -3883,7 +4036,9 @@ def main():
                 hand_videos = batch.get("hand_videos")
                 static_videos = batch.get("static_videos")
                 smpl_pos_map = batch.get("smpl_pos_map")  # For SMPL pos map pipeline
-                human_motions = batch.get("human_motions")  # For AdaLN pipeline
+                hand_motions = batch.get("hand_motions")
+                if hand_motions is None:
+                    hand_motions = batch.get("human_motions")  # Backward compatibility
                 raymaps = batch.get("raymaps")  # For raymap camera condition
                 image_goal = batch.get("image_goal")  # For planning mode (future use)
                 
@@ -4145,12 +4300,13 @@ def main():
                     # For AdaLN pipeline, we pass the noisy latents directly
                     transformer_input = noisy_model_input
                     
-                    # Store human_motions for AdaLN conditioning
-                    if human_motions is not None:
-                        # Ensure human_motions is on the correct device and dtype
-                        human_motions = human_motions.to(device=accelerator.device, dtype=weight_dtype)
+                    # Store hand_motions for AdaLN conditioning
+                    if hand_motions is not None:
+                        # Ensure hand_motions is on the correct device and dtype
+                        hand_motions = hand_motions.to(device=accelerator.device, dtype=weight_dtype)
                         condition_latents = {
-                            "human_motions": human_motions,
+                            "hand_motions": hand_motions,
+                            "human_motions": hand_motions,  # backward compatibility
                         }
                     else:
                         condition_latents = None
@@ -4235,6 +4391,20 @@ def main():
                     mask_input = mask_input.to(device=accelerator.device, dtype=weight_dtype)
                     transformer_input = torch.cat([noisy_model_input, mask_input, 
                                                    static_videos_latents, hand_videos_latents], dim=2)
+                    condition_latents = None
+                elif pipeline_config["type"] == "cogvideox_fun_static_to_video_pose_adaln":
+                    # For VideoX-Fun static-to-video AdaLN pipeline, use static videos with pose parameters
+                    mask_input = _create_fun_mask_input(noisy_model_input, VAE_SCALING_FACTOR)
+                    transformer_input = torch.cat([noisy_model_input, mask_input, static_videos_latents], dim=2)
+                    if hand_motions is not None:
+                        hand_motions = hand_motions.to(device=accelerator.device, dtype=weight_dtype)
+                    condition_latents = None
+                elif pipeline_config["type"] == "cogvideox_fun_static_to_video_pose_adaln_perframe":
+                    # Per-frame AdaLN shares the same conditioning layout as the global AdaLN variant
+                    mask_input = _create_fun_mask_input(noisy_model_input, VAE_SCALING_FACTOR)
+                    transformer_input = torch.cat([noisy_model_input, mask_input, static_videos_latents], dim=2)
+                    if hand_motions is not None:
+                        hand_motions = hand_motions.to(device=accelerator.device, dtype=weight_dtype)
                     condition_latents = None
                     
                 elif pipeline_config["type"] == "cogvideox_fun_static_to_video_posmap_concat":
@@ -4417,14 +4587,17 @@ def main():
                             return_dict=False,
                         )[0]
                 elif pipeline_config["type"] in ["cogvideox_pose_adaln", "cogvideox_pose_adaln_perframe"]:
-                    # For AdaLN pipeline, use the transformer's forward method with human_motions
-                    if condition_latents is not None and "human_motions" in condition_latents:
+                    # For AdaLN pipeline, use the transformer's forward method with motion params
+                    pose_params = None
+                    if condition_latents is not None:
+                        pose_params = condition_latents.get("hand_motions") or condition_latents.get("human_motions")
+                    if pose_params is not None:
                         model_output = transformer(
                             hidden_states=transformer_input,
                             encoder_hidden_states=prompt_embeds,
                             timestep=timesteps,
                             image_rotary_emb=image_rotary_emb,
-                            pose_params=condition_latents["human_motions"],
+                            pose_params=pose_params,
                             return_dict=False,
                         )[0]
                     else:
@@ -4472,6 +4645,24 @@ def main():
                         timestep=timesteps,
                         image_rotary_emb=image_rotary_emb,
                         adapter_control=adapter_control,
+                        return_dict=False,
+                    )[0]
+                elif pipeline_config["type"] == "cogvideox_fun_static_to_video_pose_adaln":
+                    model_output = transformer(
+                        hidden_states=transformer_input,
+                        encoder_hidden_states=prompt_embeds,
+                        timestep=timesteps,
+                        image_rotary_emb=image_rotary_emb,
+                        pose_params=hand_motions,
+                        return_dict=False,
+                    )[0]
+                elif pipeline_config["type"] == "cogvideox_fun_static_to_video_pose_adaln_perframe":
+                    model_output = transformer(
+                        hidden_states=transformer_input,
+                        encoder_hidden_states=prompt_embeds,
+                        timestep=timesteps,
+                        image_rotary_emb=image_rotary_emb,
+                        pose_params=hand_motions,
                         return_dict=False,
                     )[0]
                 elif pipeline_config["type"] == "cogvideox_fun_static_to_video_cross":
@@ -4788,6 +4979,14 @@ def main():
                 transformer=transformer,
                 scheduler=scheduler,
             )
+        elif pipeline_config["type"] == "cogvideox_fun_static_to_video_pose_adaln":
+            pipeline = CogVideoXFunStaticToVideoPoseAdaLNPipeline(
+                tokenizer=tokenizer,
+                text_encoder=text_encoder,
+                vae=vae,
+                transformer=transformer,
+                scheduler=scheduler,
+            )
         elif pipeline_config["type"] == "cogvideox_fun_static_to_video_posmap_concat":
             # Get compress_smpl_pos_map_temporal from data config
             compress_smpl_pos_map_temporal = data_config.get("compress_smpl_pos_map_temporal", False)
@@ -4871,7 +5070,7 @@ def main():
             condition_channels = pipeline_config.get("condition_channels", 16)
             use_cond_token = pipeline_config.get("use_cond_token", True)
             
-            pipeline = CogVideoXFunStaticToVideoHandTokenPipeline(
+            pipeline = CogVideoXFunStaticToVideoPoseTokenPipeline(
                 tokenizer=tokenizer,
                 text_encoder=text_encoder,
                 vae=vae,
