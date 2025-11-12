@@ -4611,6 +4611,7 @@ def main():
                         )[0]
                 elif pipeline_config["type"] in ["cogvideox_static_to_video", "cogvideox_static_to_video_pose_concat"]:
                     # For static-to-video pipelines, use standard transformer forward (conditions already concatenated)
+                    transformer_input = torch.cat([noisy_model_input, static_videos_latents, hand_videos_latents], dim=2)
                     model_output = transformer(
                         hidden_states=transformer_input,
                         encoder_hidden_states=prompt_embeds,
