@@ -68,6 +68,7 @@ from training.cogvideox_static_pose.cogvideox_fun_transformer_with_conditions im
     CogVideoXFunTransformer3DModelWithAdapter,
     CogVideoXFunTransformer3DModelWithCondToken,
     CogVideoXFunTransformer3DModelWithAdaLNPose,
+    CogVideoXFunTransformer3DModelWithAdaLNPosePerFrame,
 )
 from training.cogvideox_static_pose.cogvideox_pose_concat_pipeline import CogVideoXPoseConcatPipeline
 from training.cogvideox_static_pose.cogvideox_pose_adapter_pipeline import CogVideoXPoseAdapterPipeline
@@ -2251,6 +2252,11 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
                                 output_dir,
                                 transformer_lora_layers=transformer_lora_layers,
                             )
+                        elif pipeline_type == "cogvideox_fun_static_to_video_pose_adaln_perframe":
+                            CogVideoXFunStaticToVideoPoseAdaLNPerFramePipeline.save_lora_weights(
+                                output_dir,
+                                transformer_lora_layers=transformer_lora_layers,
+                            )
                         elif pipeline_type == "cogvideox_fun_static_to_video_raymap_pose_concat":
                             CogVideoXFunStaticToVideoPipeline.save_lora_weights(
                                 output_dir,
@@ -2406,6 +2412,12 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
             )
         elif pipeline_type == "cogvideox_fun_static_to_video_pose_adaln":
             transformer_ = CogVideoXFunTransformer3DModelWithAdaLNPose.from_pretrained(
+                pretrained_model_name_or_path=None,  # Always start from base model
+                base_model_name_or_path=config["model"]["base_model_name_or_path"],
+                subfolder="transformer",
+            )
+        elif pipeline_type == "cogvideox_fun_static_to_video_pose_adaln_perframe":
+            transformer_ = CogVideoXFunTransformer3DModelWithAdaLNPosePerFrame.from_pretrained(
                 pretrained_model_name_or_path=None,  # Always start from base model
                 base_model_name_or_path=config["model"]["base_model_name_or_path"],
                 subfolder="transformer",
@@ -2588,6 +2600,8 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
                 lora_state_dict = CogVideoXFunStaticToVideoPipeline.lora_state_dict(input_dir)
             elif pipeline_type == "cogvideox_fun_static_to_video_pose_adaln":
                 lora_state_dict = CogVideoXFunStaticToVideoPoseAdaLNPipeline.lora_state_dict(input_dir)
+            elif pipeline_type == "cogvideox_fun_static_to_video_pose_adaln_perframe":
+                lora_state_dict = CogVideoXFunStaticToVideoPoseAdaLNPerFramePipeline.lora_state_dict(input_dir)
             elif pipeline_type == "cogvideox_fun_static_to_video_posmap_adapter":
                 lora_state_dict = CogVideoXFunStaticToVideoPipeline.lora_state_dict(input_dir)
             elif pipeline_type == "cogvideox_fun_static_to_video_cross":
@@ -4009,6 +4023,29 @@ def main():
         gc.collect()
         torch.cuda.empty_cache()
         torch.cuda.synchronize(accelerator.device)
+
+    # tempoary checkpoint save code here
+    save_path = os.path.join(experiment_config["output_dir"], f"checkpoint-{global_step}")
+    
+    # Save checkpoint with memory optimization
+    try:
+        logger.info(f"💾 Saving checkpoint to {save_path}")
+        # Use save_state for full checkpoint saving (save_model_hook handles LoRA vs full model logic)
+        accelerator.save_state(save_path)
+        logger.info(f"✅ Saved state to {save_path}")
+    except RuntimeError as e:
+        if "out of memory" in str(e).lower():
+            logger.warning(f"⚠️ OOM during checkpoint save, retrying with CPU offload...")
+            # Additional cleanup and retry
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize(accelerator.device)
+            
+            # Try saving again
+            accelerator.save_state(save_path)
+            logger.info(f"✅ Saved state to {save_path} (after retry)")
+        else:
+            raise e
 
     # Training loop - epoch based (like original CogVideoX)
     transformer.train()
