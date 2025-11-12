@@ -3992,13 +3992,14 @@ def main():
             prompt_dropout_prob = 0.0
         else:
             # Generate empty prompt embedding once before training loop
-            EMPTY_PROMPT_EMBED = get_t5_prompt_embeds(
-                prompt="",
-                tokenizer=tokenizer,
-                text_encoder=text_encoder,
-                device=accelerator.device,
-                dtype=weight_dtype,
-            )
+            with torch.no_grad():
+                EMPTY_PROMPT_EMBED = get_t5_prompt_embeds(
+                    prompt="",
+                    tokenizer=tokenizer,
+                    text_encoder=text_encoder,
+                    device=accelerator.device,
+                    dtype=weight_dtype,
+                )
             logger.info(f"🎲 Prompt dropout enabled: {prompt_dropout_prob * 100:.1f}% probability")
             logger.info(f"   EMPTY_PROMPT_EMBED shape: {EMPTY_PROMPT_EMBED.shape}")
 
