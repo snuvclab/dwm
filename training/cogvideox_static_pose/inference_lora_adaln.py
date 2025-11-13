@@ -14,6 +14,7 @@ import imageio.v3 as iio
 import numpy as np
 import torch
 from tqdm.auto import tqdm
+from safetensors.torch import load_file
 
 from diffusers.utils import convert_unet_state_dict_to_peft
 from peft import LoraConfig, set_peft_model_state_dict
@@ -21,10 +22,6 @@ from peft import LoraConfig, set_peft_model_state_dict
 from training.cogvideox_static_pose.config_loader import load_experiment_config
 from training.cogvideox_static_pose.cogvideox_text_to_video_pose_sft_unified import (
     setup_pipeline_from_config,
-)
-from training.cogvideox_static_pose.cogvideox_fun_static_to_video_pose_adaln_pipeline import (
-    CogVideoXFunStaticToVideoPoseAdaLNPipeline,
-    CogVideoXFunStaticToVideoPoseAdaLNPerFramePipeline,
 )
 
 
@@ -181,27 +178,20 @@ def _setup_lora_adapter(transformer, config: dict) -> None:
     transformer.add_adapter(lora_cfg)
 
 
-def _load_lora_weights(pipeline, checkpoint_dir: Path, pipeline_type: str, adapter_name: str = "default") -> None:
-    """Load LoRA weights using pipeline's lora_state_dict method, matching training script logic."""
-    # Use pipeline's lora_state_dict method (same as training script)
-    if pipeline_type == "cogvideox_fun_static_to_video_pose_adaln":
-        lora_state_dict = CogVideoXFunStaticToVideoPoseAdaLNPipeline.lora_state_dict(str(checkpoint_dir))
-    elif pipeline_type == "cogvideox_fun_static_to_video_pose_adaln_perframe":
-        lora_state_dict = CogVideoXFunStaticToVideoPoseAdaLNPerFramePipeline.lora_state_dict(str(checkpoint_dir))
+def _load_lora_weights(pipeline, checkpoint_dir: Path, adapter_name: str = "default") -> None:
+    safetensors_path = checkpoint_dir / "pytorch_lora_weights.safetensors"
+    pt_path = checkpoint_dir / "pytorch_lora_weights.bin"
+
+    if safetensors_path.exists():
+        lora_state_dict = load_file(safetensors_path)
+    elif pt_path.exists():
+        lora_state_dict = torch.load(pt_path, map_location="cpu")
     else:
-        raise ValueError(f"Unsupported pipeline type for LoRA loading: {pipeline_type}")
-    
-    if not lora_state_dict:
         print("⚠️ No LoRA weights found; running with base model weights.")
         return
-    
-    # Remove "transformer." prefix and convert to PEFT format (same as training script)
-    transformer_state_dict = {
-        f'{k.replace("transformer.", "")}': v for k, v in lora_state_dict.items() if k.startswith("transformer.")
-    }
-    transformer_state_dict = convert_unet_state_dict_to_peft(transformer_state_dict)
+
+    transformer_state_dict = convert_unet_state_dict_to_peft(lora_state_dict)
     set_peft_model_state_dict(pipeline.transformer, transformer_state_dict, adapter_name=adapter_name)
-    print(f"✅ Loaded LoRA weights from {checkpoint_dir}")
 
 
 def prepare_pipeline(args: argparse.Namespace):
@@ -219,7 +209,7 @@ def prepare_pipeline(args: argparse.Namespace):
 
     checkpoint_dir = Path(args.checkpoint)
     _setup_lora_adapter(pipeline.transformer, config)
-    _load_lora_weights(pipeline, checkpoint_dir, pipeline_type)
+    _load_lora_weights(pipeline, checkpoint_dir)
     _load_additional_weights(pipeline.transformer, checkpoint_dir)
 
     return pipeline, config
