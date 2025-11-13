@@ -424,6 +424,24 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Suffix to append to output filenames (e.g., '_no_prompt', '_cfg7.5')"
     )
+    parser.add_argument(
+        "--num_samples",
+        type=int,
+        default=1,
+        help="Number of samples to generate per video (default: 1)",
+    )
+    parser.add_argument(
+        "--seeds",
+        type=str,
+        default=None,
+        help="Comma-separated list of seeds to use (overrides num_samples if provided)",
+    )
+    parser.add_argument(
+        "--negative_prompt",
+        type=str,
+        default="The video is not of a high quality, it has a low resolution. Watermark present in each frame. The background is solid. Strange body and strange trajectory. Distortion. ",
+        help="Negative prompt for classifier-free guidance",
+    )
 
     return parser.parse_args()
 
@@ -731,7 +749,7 @@ def find_files_by_path(data_root: Path, video_path: str, custom_paths: Optional[
     return files
 
 
-def run_single_inference(args, pipeline, video_path, output_dir, psnr, ssim, lpips, config):
+def run_single_inference(args, pipeline, video_path, output_dir, psnr, ssim, lpips, config, seed=None, suffix="", compute_metrics=True):
     """Run inference for a single video."""
     
     logger.info(f"🎯 Processing: {video_path}")
@@ -740,21 +758,29 @@ def run_single_inference(args, pipeline, video_path, output_dir, psnr, ssim, lpi
     pipeline_type = args.pipeline_type or config.get("pipeline", {}).get("type", "cogvideox_pose_concat")
     
     # Prepare custom paths if provided
+    custom_input_mode = (
+        args.video_path is not None
+        or args.static_video_path is not None
+        or args.hand_video_path is not None
+        or args.mask_video_path is not None
+        or (args.prompt_file is not None)
+        or (args.prompt and args.prompt.strip())
+    )
     custom_paths = None
-    if args.video_path is not None:
-        # Custom paths mode
+    if custom_input_mode:
         custom_paths = {
-            'video': args.video_path,  # GT video for metrics
-            'static_video': args.static_video_path,
-            'hand_video': args.hand_video_path,
-            'mask_video': args.mask_video_path,
-            'prompt': args.prompt_file or args.prompt,  # Prompt file or text
-            'human_motions': None,  # Not supported yet via args
+            'video': str(args.video_path) if args.video_path else None,
+            'static_video': str(args.static_video_path) if args.static_video_path else None,
+            'hand_video': str(args.hand_video_path) if args.hand_video_path else None,
+            'mask_video': str(args.mask_video_path) if args.mask_video_path else None,
+            'prompt': str(args.prompt_file) if args.prompt_file else None,
+            'human_motions': None,
         }
     
     # Find related files (auto-derive or use custom paths)
     files = find_files_by_path(Path(args.data_root), video_path, custom_paths=custom_paths, config=config)
-    
+
+    print(files)
     # Load required data based on pipeline type
     if pipeline_type == "cogvideox_i2v":
         # I2V pipeline only needs an image (use first frame of hand video)
@@ -970,19 +996,23 @@ def run_single_inference(args, pipeline, video_path, output_dir, psnr, ssim, lpi
         }
     
     # Load prompt if available
-    if files['prompt'] is not None and not args.use_empty_prompts:
-        # Check if files['prompt'] is a file path or direct text
-        if Path(files['prompt']).exists() and Path(files['prompt']).is_file():
-            # It's a file path
-            with open(files['prompt'], 'r') as f:
-                prompt_text = f.read().strip()
-            pipeline_args["prompt"] = prompt_text
-        else:
-            # It's direct text (from --prompt argument)
-            pipeline_args["prompt"] = files['prompt']
+    if not args.use_empty_prompts:
+        if custom_input_mode and args.prompt and args.prompt.strip():
+            pipeline_args["prompt"] = args.prompt.strip()
+        elif files['prompt'] is not None:
+            prompt_entry = files['prompt']
+            prompt_path_obj = Path(prompt_entry)
+            if prompt_path_obj.exists() and prompt_path_obj.is_file():
+                with open(prompt_path_obj, 'r') as f:
+                    pipeline_args["prompt"] = f.read().strip()
+            else:
+                pipeline_args["prompt"] = prompt_entry
+    
+    # Add negative prompt to all pipeline args
+    pipeline_args["negative_prompt"] = args.negative_prompt
     
     # Generate video
-    generator = torch.Generator(device=device).manual_seed(args.seed)
+    generator = torch.Generator(device=device).manual_seed(seed)
     pipeline_args["generator"] = generator
     pipeline_args["output_type"] = "np"
     
@@ -1001,12 +1031,12 @@ def run_single_inference(args, pipeline, video_path, output_dir, psnr, ssim, lpi
     
     # Compute metrics
     metrics = {}
-    if args.compute_metrics and gt_video is not None:
+    if compute_metrics and gt_video is not None:
         metrics = compute_video_metrics(generated_video, gt_video, psnr, ssim, lpips)
         logger.info(f"📊 Metrics - PSNR: {metrics['psnr']:.3f}, SSIM: {metrics['ssim']:.3f}, LPIPS: {metrics['lpips']:.3f}")
     
     # Save outputs
-    save_inference_outputs(args, video_path, generated_video, gt_video, files, metrics, generation_time, output_dir, config)
+    save_inference_outputs(args, video_path, generated_video, gt_video, files, metrics, generation_time, output_dir, config, seed=seed, suffix=suffix)
     
     return {
         "video_path": video_path,
@@ -1025,7 +1055,7 @@ def run_single_inference(args, pipeline, video_path, output_dir, psnr, ssim, lpi
     #     }
 
 
-def save_inference_outputs(args, video_path, generated_video, gt_video, files, metrics, generation_time, output_dir, config):
+def save_inference_outputs(args, video_path, generated_video, gt_video, files, metrics, generation_time, output_dir, config, seed=None, suffix=""):
     """Save inference outputs including videos and metrics."""
     
     # Create output directory
@@ -1045,8 +1075,8 @@ def save_inference_outputs(args, video_path, generated_video, gt_video, files, m
     base_name = f"{scene_name}_{action_name}_{video_name}"
     
     # Add suffix to base_name if provided
-    if args.suffix:
-        base_name = f"{base_name}{args.suffix}"
+    if suffix:
+        base_name = f"{base_name}{suffix}"
     
     # Ensure videos have the same number of frames
     num_frames = min(len(generated_video), args.num_frames)
@@ -1095,8 +1125,10 @@ def save_inference_outputs(args, video_path, generated_video, gt_video, files, m
     logger.info(f"✅ Saved result metadata: {result_filename}")
     
     # Also add suffix info to result_data if provided
-    if args.suffix:
-        result_data["filename_suffix"] = args.suffix
+    if suffix:
+        result_data["filename_suffix"] = suffix
+    if seed is not None:
+        result_data["seed"] = seed
 
 
 def run_batch_inference(args, pipeline, video_paths, output_dir, psnr, ssim, lpips, config):
@@ -1107,17 +1139,38 @@ def run_batch_inference(args, pipeline, video_paths, output_dir, psnr, ssim, lpi
     results = []
     successful = 0
     failed = 0
-    
-    for i, video_path in enumerate(video_paths):
-        logger.info(f"\n📊 Progress: {i+1}/{len(video_paths)}")
-        
-        result = run_single_inference(args, pipeline, video_path, output_dir, psnr, ssim, lpips, config)
-        results.append(result)
-        
-        if result["success"]:
-            successful += 1
-        else:
-            failed += 1
+
+    if args.seeds:
+        seeds = [int(s.strip()) for s in args.seeds.split(",") if s.strip()]
+    else:
+        seeds = [args.seed + i for i in range(args.num_samples)]
+
+    for video_path in video_paths:
+        logger.info(f"📽️ Processing video: {video_path}")
+
+        for idx, current_seed in enumerate(seeds):
+            sample_suffix = args.suffix or ""
+            if len(seeds) > 1:
+                sample_suffix += f"_seed{current_seed}"
+
+            result = run_single_inference(
+                args,
+                pipeline,
+                video_path,
+                output_dir,
+                psnr,
+                ssim,
+                lpips,
+                config,
+                current_seed,
+                sample_suffix,
+                compute_metrics=args.compute_metrics and (idx == 0),
+            )
+            results.append(result)
+            if result["success"]:
+                successful += 1
+            else:
+                failed += 1
     
     # Get pipeline type from config
     pipeline_type = args.pipeline_type or config.get("pipeline", {}).get("type", "cogvideox_pose_concat")
@@ -1194,26 +1247,40 @@ def main():
             logger.info(f"🔧 Auto-generated output directory: {args.output_dir}")
         
         # Load dataset file or use custom paths
+        custom_input_mode = (
+            args.video_path is not None
+            or args.static_video_path is not None
+            or args.hand_video_path is not None
+            or args.mask_video_path is not None
+            or (args.prompt_file is not None)
+            or (args.prompt and args.prompt.strip())
+        )
+
+        # Load dataset file or use custom paths
         if args.dataset_file is not None:
             # Use dataset file
             dataset_file = Path(args.dataset_file)
             if not dataset_file.exists():
                 raise ValueError(f"Dataset file does not exist: {dataset_file}")
-            
             with dataset_file.open('r') as f:
                 video_paths = [line.strip() for line in f if line.strip()]
-            
-            # Limit batch size if specified
             if args.max_batch_size:
                 video_paths = video_paths[:args.max_batch_size]
-            
             logger.info(f"📋 Processing {len(video_paths)} video paths from dataset file")
         elif args.video_path is not None:
-            # Use custom single video path
             video_paths = [args.video_path]
             logger.info(f"📋 Processing single custom video path: {args.video_path}")
+        elif custom_input_mode:
+            fallback_path = (
+                args.static_video_path
+                or args.hand_video_path
+                or args.mask_video_path
+                or "custom_input"
+            )
+            video_paths = [fallback_path]
+            logger.info("📋 Processing custom inputs without dataset-derived video path")
         else:
-            raise ValueError("Either --dataset_file or --video_path must be provided")
+            raise ValueError("Either --dataset_file, --video_path, or other custom paths (e.g., --static_video_path) must be provided")
         
         # Get pipeline type from config if not provided
         pipeline_type = args.pipeline_type or config.get("pipeline", {}).get("type", "cogvideox_pose_concat")
