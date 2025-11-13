@@ -288,6 +288,26 @@ class CogVideoXFunStaticToVideoPoseAdaLNPipeline(CogVideoXFunStaticToVideoPipeli
 
         return CogVideoXFunStaticToVideoPoseAdaLNPipelineOutput(frames=frames)
 
+    @classmethod
+    def lora_state_dict(cls, input_dir: str) -> Dict[str, torch.Tensor]:
+        """Load LoRA state dict from a directory."""
+        lora_state_dict = {}
+        
+        # Try to load from safetensors first
+        import os
+        from safetensors.torch import load_file
+        
+        safetensors_path = os.path.join(input_dir, "pytorch_lora_weights.safetensors")
+        if os.path.exists(safetensors_path):
+            lora_state_dict = load_file(safetensors_path)
+        else:
+            # Try to load from pytorch format
+            pytorch_path = os.path.join(input_dir, "pytorch_lora_weights.bin")
+            if os.path.exists(pytorch_path):
+                lora_state_dict = torch.load(pytorch_path, map_location="cpu")
+        
+        return lora_state_dict
+
 
 class CogVideoXFunStaticToVideoPoseAdaLNPerFramePipeline(
     CogVideoXFunStaticToVideoPoseAdaLNPipeline
@@ -362,4 +382,10 @@ class CogVideoXFunStaticToVideoPoseAdaLNPerFramePipeline(
         )
 
         return pipeline
+
+    @classmethod
+    def lora_state_dict(cls, input_dir: str) -> Dict[str, torch.Tensor]:
+        """Load LoRA state dict from a directory."""
+        # Use parent class method
+        return CogVideoXFunStaticToVideoPoseAdaLNPipeline.lora_state_dict(input_dir)
 
