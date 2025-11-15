@@ -1127,23 +1127,23 @@ def run_validation(
                     validation_mode="static_to_video",
                 )
                 
-                # Mode 2: Image-to-Video (use first frame only)
-                print("   Mode 2: Image-to-Video (first frame only)")
-                log_validation_with_dataset(
-                    pipe=pipe,
-                    config=config,
-                    accelerator=accelerator,
-                    validation_video_path=validation_video,
-                    validation_prompt=prompt_text,
-                    validation_hand_video_path=None,  # Not used in I2V mode
-                    validation_static_video_path=None,  # Not used in I2V mode
-                    validation_human_motions_path=None,
-                    validation_hand_video_left_path=None,  # Not used in I2V mode
-                    validation_hand_video_right_path=None,  # Not used in I2V mode
-                    step=step,
-                    pipeline_type=config["pipeline"]["type"],
-                    validation_mode="image_to_video",
-                )
+                # # Mode 2: Image-to-Video (use first frame only)
+                # print("   Mode 2: Image-to-Video (first frame only)")
+                # log_validation_with_dataset(
+                #     pipe=pipe,
+                #     config=config,
+                #     accelerator=accelerator,
+                #     validation_video_path=validation_video,
+                #     validation_prompt=prompt_text,
+                #     validation_hand_video_path=None,  # Not used in I2V mode
+                #     validation_static_video_path=None,  # Not used in I2V mode
+                #     validation_human_motions_path=None,
+                #     validation_hand_video_left_path=None,  # Not used in I2V mode
+                #     validation_hand_video_right_path=None,  # Not used in I2V mode
+                #     step=step,
+                #     pipeline_type=config["pipeline"]["type"],
+                #     validation_mode="image_to_video",
+                # )
             elif pipeline_config["type"] == "cogvideox_fun_static_to_video_pose_adaln":
                 print(f"🎬 Testing VideoX-Fun static-to-video AdaLN pipeline for {validation_video.name}")
                 log_validation_with_dataset(
@@ -2358,10 +2358,11 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
             )
         elif pipeline_type == "cogvideox_pose_concat":
             # Get configuration for concat approach
+            condition_channels = config["pipeline"].get("condition_channels", 16)
             transformer_ = CogVideoXTransformer3DModelWithConcat.from_pretrained(
                 pretrained_model_name_or_path=None,  # Always start from base model
                 base_model_name_or_path=config["model"]["base_model_name_or_path"],
-                condition_channels=concat_config.get("condition_channels", 0),
+                condition_channels=condition_channels,
             )
         elif pipeline_type == "cogvideox_pose_adapter":
             # Get adapter configuration from pipeline config
@@ -4026,26 +4027,6 @@ def main():
 
     # tempoary checkpoint save code here
     save_path = os.path.join(experiment_config["output_dir"], f"checkpoint-{global_step}")
-    
-    # Save checkpoint with memory optimization
-    try:
-        logger.info(f"💾 Saving checkpoint to {save_path}")
-        # Use save_state for full checkpoint saving (save_model_hook handles LoRA vs full model logic)
-        accelerator.save_state(save_path)
-        logger.info(f"✅ Saved state to {save_path}")
-    except RuntimeError as e:
-        if "out of memory" in str(e).lower():
-            logger.warning(f"⚠️ OOM during checkpoint save, retrying with CPU offload...")
-            # Additional cleanup and retry
-            gc.collect()
-            torch.cuda.empty_cache()
-            torch.cuda.synchronize(accelerator.device)
-            
-            # Try saving again
-            accelerator.save_state(save_path)
-            logger.info(f"✅ Saved state to {save_path} (after retry)")
-        else:
-            raise e
 
     # Training loop - epoch based (like original CogVideoX)
     transformer.train()
