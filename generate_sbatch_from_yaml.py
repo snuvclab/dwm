@@ -326,7 +326,7 @@ elif [ "$SLURM_TEST_MODE" = true ]; then
     echo "🧪 Note: accelerate launch will use CUDA_VISIBLE_DEVICES automatically (no --gpu_ids needed)"
 else
     # SLURM mode - use GPU count from YAML
-    NUM_GPUS={slurm.get('gpus_per_node', 4)}
+    NUM_GPUS={slurm.get('gpus_per_node', slurm.get('gpus', 4))}
     
     # Use SLURM allocated GPU IDs
     if [ -n "$CUDA_VISIBLE_DEVICES" ]; then

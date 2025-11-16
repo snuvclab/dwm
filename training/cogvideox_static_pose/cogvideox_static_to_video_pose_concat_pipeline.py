@@ -1145,6 +1145,7 @@ class CogVideoXStaticToVideoPoseConcatPipeline(CogVideoXImageToVideoPipeline):
                 else:
                     static_videos_latents = 1 / self.vae_scaling_factor_image * static_videos_latents
                 static_videos_latents = static_videos_latents.to(dtype=dtype, device=device)
+                static_videos_latents = static_videos_latents.permute(0, 2, 1, 3, 4)  # [B, T, C, H, W]
             
             # Process hand_videos
             if hand_videos.shape[2] == self.vae.config.latent_channels:
@@ -1166,6 +1167,7 @@ class CogVideoXStaticToVideoPoseConcatPipeline(CogVideoXImageToVideoPipeline):
                 else:
                     hand_video_latents = 1 / self.vae_scaling_factor_image * hand_video_latents
                 hand_video_latents = hand_video_latents.to(dtype=dtype, device=device)
+                hand_video_latents = hand_video_latents.permute(0, 2, 1, 3, 4)  # [B, T, C, H, W]
         elif image is not None:
             # I2V fallback mode: use original I2V logic (first frame + zero padding)
             # Preprocess the image first
@@ -1421,8 +1423,8 @@ class CogVideoXStaticToVideoPoseConcatPipeline(CogVideoXImageToVideoPipeline):
         # # 4. Preprocess conditions
         if hand_videos is not None and static_videos is not None:
             hand_videos, static_videos = self.preprocess_conditions(
-                rearrange(hand_videos, "b c f h w -> b f h w c"),
-                rearrange(static_videos, "b c f h w -> b f h w c"),
+                rearrange(hand_videos, "b c f h w -> (b f) h w c"),
+                rearrange(static_videos, "b c f h w -> (b f) h w c"),
                 height,
                 width,
                 num_frames,

@@ -751,8 +751,8 @@ class CogVideoXPoseConcatPipeline(CogVideoXPipeline):
 
         # # 4. Preprocess conditions
         hand_videos, static_videos = self.preprocess_conditions(
-            rearrange(hand_videos, "b c f h w -> b f h w c"),
-            rearrange(static_videos, "b c f h w -> b f h w c"),
+            rearrange(hand_videos, "b c f h w -> (b f) h w c"),
+            rearrange(static_videos, "b c f h w -> (b f) h w c"),
             height,
             width,
             num_frames,
