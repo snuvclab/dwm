@@ -1190,7 +1190,11 @@ class CogVideoXFunTransformer3DModelWithConcat(CogVideoXFunTransformer3DModel):
     def __init__(self, *args, condition_channels: int = 0, add_control_adapter: bool = False, 
                  in_dim_control_adapter: int = 12, **kwargs):
         # Store original in_channels before modification
-        original_in_channels = kwargs.get("in_channels", 16)
+        if "original_in_channels" in kwargs:
+            original_in_channels = kwargs.pop("original_in_channels")
+            kwargs["in_channels"] = original_in_channels
+        else:
+            original_in_channels = kwargs.get("in_channels", 16)
         self.original_in_channels = original_in_channels
         
         # self.add_noise_in_inpaint_model = kwargs.pop("add_noise_in_inpaint_model", False)
@@ -1203,7 +1207,16 @@ class CogVideoXFunTransformer3DModelWithConcat(CogVideoXFunTransformer3DModel):
         
         # Setup conditional channels if specified
         if condition_channels > 0:
-            self._setup_condition_channels(condition_channels)
+            if original_in_channels == kwargs["in_channels"]:
+                print(f"✅ Extending transformer input channels for concat approach:")
+                print(f"  Original channels: {original_in_channels}")
+                print(f"  Condition channels: {condition_channels}")
+                print(f"  Total channels: {original_in_channels + condition_channels}")
+                self._setup_condition_channels(condition_channels)
+            else:
+                print(f"✅ Transformer input channels are already extended for concat approach:")
+                print(f"  Original channels: {original_in_channels}")
+                print(f"  Condition channels: {condition_channels}")
             self.condition_channels = condition_channels
         else:
             self.condition_channels = 0

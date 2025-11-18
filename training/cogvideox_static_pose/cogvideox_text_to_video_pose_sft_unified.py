@@ -1955,6 +1955,41 @@ def setup_full_training(transformer, config: Dict[str, Any]):
     """Setup full fine-tuning mode."""
     print("🔧 Setting up full fine-tuning...")
     
+    # Check for frozen parameters before enabling all
+    frozen_params = []
+    for name, param in transformer.named_parameters():
+        if not param.requires_grad:
+            frozen_params.append((name, param.numel()))
+    
+    if frozen_params:
+        print(f"⚠️  Found {len(frozen_params)} frozen parameter groups:")
+        # Group by module prefix for better readability
+        frozen_by_module = {}
+        for name, numel in frozen_params:
+            module_prefix = name.split('.')[0] if '.' in name else name
+            if module_prefix not in frozen_by_module:
+                frozen_by_module[module_prefix] = []
+            frozen_by_module[module_prefix].append((name, numel))
+        
+        # Print summary by module
+        total_frozen = sum(numel for _, numel in frozen_params)
+        for module_prefix in sorted(frozen_by_module.keys()):
+            module_params = frozen_by_module[module_prefix]
+            module_total = sum(numel for _, numel in module_params)
+            print(f"   📦 {module_prefix}: {len(module_params)} params, {module_total:,} elements")
+            # Show first few parameter names as examples
+            for name, numel in module_params[:3]:
+                print(f"      - {name} ({numel:,} elements)")
+            if len(module_params) > 3:
+                print(f"      ... and {len(module_params) - 3} more")
+        print(f"   📊 Total frozen: {total_frozen:,} elements")
+    else:
+        print("✅ All parameters are already trainable")
+    
+    # Explicitly enable all parameters for training
+    for name, param in transformer.named_parameters():
+        param.requires_grad_(True)
+    
     # Enable gradient checkpointing if specified
     if config["training"].get("custom_settings", {}).get("gradient_checkpointing", False):
         transformer.enable_gradient_checkpointing()
@@ -1962,7 +1997,9 @@ def setup_full_training(transformer, config: Dict[str, Any]):
     
     # Count trainable parameters
     trainable_params = sum(p.numel() for p in transformer.parameters() if p.requires_grad)
-    print(f"📊 Total trainable parameters: {trainable_params:,}")
+    total_params = sum(p.numel() for p in transformer.parameters())
+    print(f"📊 Total parameters: {total_params:,}")
+    print(f"📊 Trainable parameters: {trainable_params:,} ({100.0 * trainable_params / total_params:.2f}%)")
     
     return trainable_params
 
@@ -2781,7 +2818,8 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
                 from training.cogvideox_static_pose.cogvideox_fun_transformer_with_conditions import CogVideoXFunTransformer3DModelWithConcat
                 condition_channels = config["pipeline"].get("condition_channels", 16)
                 load_model = CogVideoXFunTransformer3DModelWithConcat.from_pretrained(
-                    pretrained_model_name_or_path=os.path.join(input_dir, "transformer"),
+                    pretrained_model_name_or_path=input_dir, 
+                    subfolder="transformer",
                     base_model_name_or_path=config["model"]["base_model_name_or_path"],
                     condition_channels=condition_channels
                 )
