@@ -2781,7 +2781,8 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
                 load_model = CogVideoXTransformer3DModel.from_pretrained(os.path.join(input_dir, "transformer"))
             elif pipeline_type == "cogvideox_pose_concat":
                 load_model = CogVideoXTransformer3DModelWithConcat.from_pretrained(
-                    pretrained_model_name_or_path=os.path.join(input_dir, "transformer"),
+                    pretrained_model_name_or_path=input_dir,
+                    subfolder="transformer",
                     base_model_name_or_path=config["model"]["base_model_name_or_path"],
                     condition_channels=concat_config.get("condition_channels", None)
                 )
