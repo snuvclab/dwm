@@ -8,6 +8,7 @@ from .wan_image_encoder import CLIPModel
 from .wan_text_encoder import WanT5EncoderModel
 from .wan_transformer3d import (Wan2_2Transformer3DModel, WanSelfAttention,
                                 WanTransformer3DModel)
+from .wan_transformer3d_with_conditions import WanTransformer3DModelWithConcat
 from .wan_vae import AutoencoderKLWan, AutoencoderKLWan_
 from .wan_vae3_8 import AutoencoderKLWan3_8, AutoencoderKLWan2_2_
 

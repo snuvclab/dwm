@@ -49,10 +49,21 @@ class VideoDataset(Dataset):
         random_flip: Optional[float] = None,
         image_to_video: bool = False,
         use_gray_hand_videos: bool = False,
+        prompt_subdir: str = "prompts",
+        prompt_embeds_subdir: str = "prompt_embeds",
+        hand_video_subdir: str = "videos_hands",
+        hand_video_latents_subdir: str = "hand_video_latents",
     ) -> None:
         super().__init__()
 
         self.data_root = Path(data_root)
+        # Handle dataset_file as list or single path
+        if dataset_file is None:
+            self.dataset_file_list: Optional[List[str]] = None
+        elif isinstance(dataset_file, (list, tuple)):
+            self.dataset_file_list = [str(path) for path in dataset_file]
+        else:
+            self.dataset_file_list = [str(dataset_file)]
         self.dataset_file = dataset_file
         self.caption_column = caption_column  # not used
         self.video_column = video_column
@@ -64,6 +75,10 @@ class VideoDataset(Dataset):
         self.load_tensors = load_tensors
         self.random_flip = random_flip
         self.image_to_video = image_to_video
+        self.prompt_subdir = prompt_subdir
+        self.prompt_embeds_subdir = prompt_embeds_subdir
+        self.hand_video_subdir = hand_video_subdir
+        self.hand_video_latents_subdir = hand_video_latents_subdir
         
         # Ensure buckets are lists
         if not isinstance(self.height_buckets, list):
@@ -83,7 +98,7 @@ class VideoDataset(Dataset):
         #     logic in CSV processing.
         #   - Using two files containing line-separate captions and relative paths to videos.
         # For a more detailed explanation about preparing dataset format, checkout the README.
-        if dataset_file is None:
+        if self.dataset_file_list is None:
             (
                 self.prompts,
                 self.video_paths,
@@ -232,13 +247,34 @@ class VideoDataset(Dataset):
 
         return prompts, video_paths
 
-    def _load_dataset_from_datafile(self) -> Tuple[List[str], List[str]]:
-        with open(self.data_root / self.dataset_file, "r") as f:
-            video_paths = [self.data_root.joinpath(line.strip()) for line in f.readlines() if len(line.strip()) > 0]
-        prompt_paths = [path.parent.parent.joinpath("prompts", path.name.replace(".mp4", ".txt")) for path in video_paths]
-        prompts = [path.read_text() for path in prompt_paths]
-
-        return prompts, video_paths
+    def _load_dataset_from_datafile(self) -> Tuple[List[str], List[Path]]:
+        """Load dataset from one or more datafiles (supports list of files)."""
+        if not self.dataset_file_list:
+            raise ValueError("dataset_file should not be empty when provided.")
+        
+        all_prompts: List[str] = []
+        all_video_paths: List[Path] = []
+        
+        for dataset_file in self.dataset_file_list:
+            dataset_path = self.data_root / dataset_file
+            if not dataset_path.exists():
+                raise FileNotFoundError(f"Dataset file not found: {dataset_path}")
+            
+            with open(dataset_path, "r", encoding="utf-8") as f:
+                file_video_paths = [
+                    self.data_root.joinpath(line.strip()) for line in f.readlines() if len(line.strip()) > 0
+                ]
+            
+            prompt_paths = [
+                path.parent.parent.joinpath(self.prompt_subdir, path.name.replace(".mp4", ".txt"))
+                for path in file_video_paths
+            ]
+            file_prompts = [path.read_text() for path in prompt_paths]
+            
+            all_video_paths.extend(file_video_paths)
+            all_prompts.extend(file_prompts)
+        
+        return all_prompts, all_video_paths
 
     def _preprocess_video(self, path: Path) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         r"""
@@ -355,6 +391,10 @@ class VideoDatasetWithConditions(VideoDataset):
         random_flip: Optional[float] = None,
         image_to_video: bool = False,
         use_gray_hand_videos: bool = False,
+        prompt_subdir: str = "prompts",
+        prompt_embeds_subdir: str = "prompt_embeds",
+        hand_video_subdir: str = "videos_hands",
+        hand_video_latents_subdir: str = "hand_video_latents",
     ) -> None:
         # Initialize parent class with main video column
         super().__init__(
@@ -370,6 +410,10 @@ class VideoDatasetWithConditions(VideoDataset):
             load_tensors=load_tensors,
             random_flip=random_flip,
             image_to_video=image_to_video,
+            prompt_subdir=prompt_subdir,
+            prompt_embeds_subdir=prompt_embeds_subdir,
+            hand_video_subdir=hand_video_subdir,
+            hand_video_latents_subdir=hand_video_latents_subdir,
         )
         
         # Store the use_gray_hand_videos flag
@@ -379,7 +423,7 @@ class VideoDatasetWithConditions(VideoDataset):
         if self.use_gray_hand_videos:
             self.hand_video_paths = self._derive_condition_video_paths("videos_hands_gray")
         else:
-            self.hand_video_paths = self._derive_condition_video_paths("videos_hands")
+            self.hand_video_paths = self._derive_condition_video_paths(self.hand_video_subdir)
         self.static_video_paths = self._derive_condition_video_paths("videos_static")
         # Validate that all condition videos exist
         if not self.load_tensors:
