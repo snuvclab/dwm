@@ -1573,6 +1573,500 @@ class CogVideoXFunTransformer3DModelWithConcat(CogVideoXFunTransformer3DModel):
                 **kwargs
             )
 
+class CogVideoXFunTransformer3DModelWithJointGeneration(CogVideoXFunTransformer3DModel):
+    """
+    VideoX-Fun Transformer with conditional input support via channel concatenation and joint generation.
+    
+    This class extends CogVideoXFunTransformer3DModel to support:
+    1. Conditional inputs via channel concatenation (like WithConcat)
+    2. Joint generation of two videos by doubling the output dimension
+    
+    Key differences from CogVideoXFunTransformer3DModelWithConcat:
+    1. No adapter support (simplified)
+    2. Output dimension is doubled (inner_dim * 2) for joint generation
+    3. setup_output_channels() extends proj_out to generate two videos simultaneously
+    """
+    
+    def __init__(self, *args, condition_channels: int = 0, num_output_videos: int = 1, **kwargs):
+        # Store original in_channels before modification
+        if "original_in_channels" in kwargs:
+            original_in_channels = kwargs.pop("original_in_channels")
+            kwargs["in_channels"] = original_in_channels
+        else:
+            original_in_channels = kwargs.get("in_channels", 16)
+        self.original_in_channels = original_in_channels
+        
+        self.register_to_config(
+            add_noise_in_inpaint_model=kwargs.pop("add_noise_in_inpaint_model", False),
+        )
+        super().__init__(*args, **kwargs)
+        
+        # Setup conditional channels if specified
+        if condition_channels > 0:
+            if original_in_channels == kwargs["in_channels"]:
+                print(f"✅ Extending transformer input channels for concat approach:")
+                print(f"  Original channels: {original_in_channels}")
+                print(f"  Condition channels: {condition_channels}")
+                print(f"  Total channels: {original_in_channels + condition_channels}")
+                self._setup_condition_channels(condition_channels)
+            else:
+                print(f"✅ Transformer input channels are already extended for concat approach:")
+                print(f"  Original channels: {original_in_channels}")
+                print(f"  Condition channels: {condition_channels}")
+            self.condition_channels = condition_channels
+        else:
+            self.condition_channels = 0
+        
+        # Setup input/output channels for joint generation (only if num_output_videos > 1)
+        self.num_output_videos = num_output_videos
+        if num_output_videos > 1:
+            # For joint generation, input channel needs to be expanded by adding latent channels
+            # because pipeline creates latents with C * num_output_videos channels
+            # Input = latent_channels * num_output_videos + condition_channels
+            current_in_channels = self.patch_embed.proj.in_channels
+            num_latent_channels = kwargs.get("num_latent_channels", 16)  # Default VAE latent channels
+            expected_in_channels = num_latent_channels * num_output_videos + self.condition_channels
+            if current_in_channels != expected_in_channels:
+                # Need to expand input channels for joint generation
+                self._setup_input_channels_for_joint_generation(num_output_videos, num_latent_channels)
+            
+            # Setup output channels
+            self._setup_output_channels(num_output_videos)
+        else:
+            # Store original output dim for reference
+            self.register_to_config(
+                original_output_dim=self.proj_out.out_features,
+            )
+    
+    def _setup_condition_channels(self, condition_channels: int, original_proj: Optional[nn.Conv2d] = None):
+        """Extend the transformer to handle conditional input channels.
+        
+        If `original_proj` is provided, use its weights as the source (for base→finetune case).
+        Otherwise fall back to self.patch_embed.proj (for reload case).
+        """
+        if original_proj is None:
+            original_proj = self.patch_embed.proj
+
+        original_in_channels = original_proj.in_channels
+        new_in_channels = original_in_channels + condition_channels
+
+        print(f"Extending transformer input channels for concat approach:")
+        print(f"  Original channels: {original_in_channels}")
+        print(f"  Condition channels: {condition_channels}")
+        print(f"  Total channels: {new_in_channels}")
+
+        new_proj = nn.Conv2d(
+            in_channels=new_in_channels,
+            out_channels=original_proj.out_channels,
+            kernel_size=original_proj.kernel_size,
+            stride=original_proj.stride,
+            padding=original_proj.padding,
+            bias=original_proj.bias is not None,
+        )
+
+        with torch.no_grad():
+            # copy pretrained weights into the original channels
+            new_proj.weight[:, :original_in_channels] = original_proj.weight
+            # init condition channels to zeros
+            new_proj.weight[:, original_in_channels:] = 0.0
+            if original_proj.bias is not None:
+                new_proj.bias.data = original_proj.bias.data
+
+        self.patch_embed.proj = new_proj
+        self.register_to_config(
+            in_channels=new_in_channels,
+            original_in_channels=original_in_channels,
+            condition_channels=condition_channels,
+        )
+        self._conditioning_channels_added = True
+        print(f"✅ Successfully extended transformer for {condition_channels} condition channels")
+    
+    def _setup_input_channels_for_joint_generation(self, num_output_videos: int, num_latent_channels: int = 16, original_proj: Optional[nn.Conv2d] = None):
+        """Extend the input projection to handle joint generation (multiple videos in input).
+        
+        Args:
+            num_output_videos: Number of videos to generate jointly (e.g., 2 for joint generation)
+            num_latent_channels: Number of latent channels per video (default: 16, VAE latent channels)
+            original_proj: Original projection layer. If None, uses self.patch_embed.proj.
+        """
+        if original_proj is None:
+            original_proj = self.patch_embed.proj
+        
+        current_in_channels = original_proj.in_channels
+        # Calculate condition channels (if any)
+        condition_channels = current_in_channels - num_latent_channels
+        # New input = latent_channels * num_output_videos + condition_channels
+        new_in_channels = num_latent_channels * num_output_videos + condition_channels
+        
+        print(f"Extending transformer input channels for joint generation:")
+        print(f"  Current channels: {current_in_channels}")
+        print(f"  Latent channels (per video): {num_latent_channels}")
+        print(f"  Condition channels: {condition_channels}")
+        print(f"  Number of output videos: {num_output_videos}")
+        print(f"  New input channels: {new_in_channels} (= {num_latent_channels} * {num_output_videos} + {condition_channels})")
+        
+        new_proj = nn.Conv2d(
+            in_channels=new_in_channels,
+            out_channels=original_proj.out_channels,
+            kernel_size=original_proj.kernel_size,
+            stride=original_proj.stride,
+            padding=original_proj.padding,
+            bias=original_proj.bias is not None,
+        )
+        
+        with torch.no_grad():
+            # Copy weights: duplicate latent channel weights for each video, keep condition channels as-is
+            # Structure: [latent_video1, latent_video2, ..., condition_channels]
+            # Conv2d weight shape: [out_channels, in_channels, kernel_h, kernel_w]
+            # Use .data to avoid in-place operation on leaf variable view
+            for i in range(num_output_videos):
+                start_idx = i * num_latent_channels
+                end_idx = (i + 1) * num_latent_channels
+                # Copy latent channel weights (first num_latent_channels channels)
+                new_proj.weight.data[:, start_idx:end_idx] = original_proj.weight.data[:, :num_latent_channels]
+            
+            # Copy condition channel weights (if any)
+            if condition_channels > 0:
+                condition_start_idx = num_latent_channels * num_output_videos
+                condition_end_idx = condition_start_idx + condition_channels
+                new_proj.weight.data[:, condition_start_idx:condition_end_idx] = original_proj.weight.data[:, num_latent_channels:]
+            
+            if original_proj.bias is not None:
+                new_proj.bias.data = original_proj.bias.data
+        
+        self.patch_embed.proj = new_proj
+        self.register_to_config(
+            in_channels=new_in_channels,
+        )
+        print(f"✅ Successfully extended transformer input for joint generation (num_output_videos={num_output_videos})")
+    
+    def _setup_output_channels(self, num_output_videos: int = 2, original_proj_out: Optional[nn.Linear] = None):
+        """Extend the output projection to support joint generation (multiple videos).
+        
+        Args:
+            num_output_videos: Number of videos to generate jointly (e.g., 2 for joint generation)
+            original_proj_out: Original projection layer (for base→finetune case). If None, uses self.proj_out.
+        """
+        if original_proj_out is None:
+            original_proj_out = self.proj_out
+        
+        inner_dim = original_proj_out.in_features
+        output_dim = original_proj_out.out_features
+        new_output_dim = output_dim * num_output_videos
+        
+        print(f"Extending transformer output channels for joint generation:")
+        print(f"  Original output dim: {output_dim}")
+        print(f"  Number of output videos: {num_output_videos}")
+        print(f"  New output dim: {new_output_dim}")
+        
+        new_proj_out = nn.Linear(inner_dim, new_output_dim, bias=original_proj_out.bias is not None)
+        
+        with torch.no_grad():
+            # Copy original weights to each output segment
+            for i in range(num_output_videos):
+                start_idx = i * output_dim
+                end_idx = (i + 1) * output_dim
+                new_proj_out.weight[start_idx:end_idx] = original_proj_out.weight
+                if original_proj_out.bias is not None:
+                    new_proj_out.bias[start_idx:end_idx] = original_proj_out.bias
+        
+        self.proj_out = new_proj_out
+        self.register_to_config(
+            out_channels=new_output_dim,
+            original_out_channels=output_dim,
+            num_output_videos=num_output_videos,
+        )
+        print(f"✅ Successfully extended transformer output for joint generation (num_output_videos={num_output_videos})")
+    
+    @classmethod
+    def from_pretrained(
+        cls,
+        pretrained_model_name_or_path=None,
+        base_model_name_or_path="alibaba-pai/CogVideoX-Fun-V1.1-5b-InP",
+        subfolder="transformer",
+        condition_channels: Optional[int] = None,
+        num_output_videos: int = 2,
+        **kwargs
+    ):
+        """
+        Load a CogVideoXFunTransformer3DModelWithJointGeneration from a pretrained model.
+
+        Args:
+            pretrained_model_name_or_path (str): Fine-tuned checkpoint path
+            base_model_name_or_path (str): Base CogVideoX-Fun model path
+            condition_channels (int): Number of extra condition channels to add
+            num_output_videos (int): Number of videos to generate jointly (default: 2 for joint generation)
+        """
+        if pretrained_model_name_or_path is not None:
+            # === Load fine-tuned checkpoint ===
+            print(f"📥 Loading fine-tuned joint generation transformer: {pretrained_model_name_or_path}")
+
+            # 1) Create child class structure first
+            config_path = os.path.join(pretrained_model_name_or_path, subfolder, "config.json")
+            if os.path.exists(config_path):
+                import json
+                with open(config_path, "r") as f:
+                    config = json.load(f)
+                model = cls(**config)
+            else:
+                # Use base config
+                if condition_channels is None:
+                    condition_channels = 32  # default
+                model = cls(condition_channels=condition_channels, num_output_videos=num_output_videos)
+
+            # 2) Load checkpoint state_dict directly
+            # Try to find all safetensors files first
+            safetensors_files = glob.glob(os.path.join(pretrained_model_name_or_path, subfolder, "*.safetensors"))
+            if safetensors_files:
+                print(f"🔧 Loading weights from {len(safetensors_files)} safetensors files")
+                # Load and merge all safetensors files
+                state_dict = {}
+                for file_path in safetensors_files:
+                    print(f"   Loading: {os.path.basename(file_path)}")
+                    file_state_dict = load_file(file_path)
+                    state_dict.update(file_state_dict)
+            else:
+                # Fallback to single file approach
+                state_dict_path = os.path.join(pretrained_model_name_or_path, subfolder, "diffusion_pytorch_model.safetensors")
+                if not os.path.exists(state_dict_path):
+                    # Try alternative paths
+                    state_dict_path = os.path.join(pretrained_model_name_or_path, subfolder, "pytorch_model.bin")
+                    if not os.path.exists(state_dict_path):
+                        raise FileNotFoundError(f"No model file found in {pretrained_model_name_or_path}")
+                
+                if state_dict_path.endswith(".safetensors"):
+                    state_dict = load_file(state_dict_path)
+                else:
+                    state_dict = torch.load(state_dict_path, map_location="cpu")
+
+            # 3) Load with strict=False for flexibility
+            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            if missing:
+                print(f"⚠️ Missing keys (new layers, need initialization during training): {missing}")
+            if unexpected:
+                print(f"⚠️ Unexpected keys (replaced layers, etc.): {unexpected}")
+
+            return model
+
+        else:
+            # === Initialize from base model ===
+            print(f"🔧 Initializing from base model: {base_model_name_or_path}")
+            # First load the base CogVideoX transformer
+            base_model = CogVideoXTransformer3DModel.from_pretrained(
+                base_model_name_or_path,
+                subfolder=subfolder,
+                torch_dtype=kwargs.get("torch_dtype", torch.bfloat16),
+                revision=kwargs.get("revision", None),
+                variant=kwargs.get("variant", None),
+            )
+            
+            # Then create CogVideoXFun transformer and copy state_dict
+            fun_model = CogVideoXFunTransformer3DModel(**base_model.config)
+            fun_model.load_state_dict(base_model.state_dict())
+            base_model = fun_model
+
+            # Determine condition_channels
+            if condition_channels is None:
+                condition_channels = getattr(base_model.config, "condition_channels", 32)
+
+            # Create extended model with num_output_videos=1 first (to match base model shape)
+            model = cls(
+                **base_model.config, 
+                condition_channels=0,
+                num_output_videos=1,  # Start with 1 to match base model
+            )
+
+            # Load base weights into extended model (now shapes match)
+            missing, unexpected = model.load_state_dict(base_model.state_dict(), strict=False)
+            if missing:
+                print(f"⚠️ Missing keys (new condition/output layers): {missing}")
+            if unexpected:
+                print(f"⚠️ Unexpected keys (replaced existing layers): {unexpected}")
+
+            # Expand input projection for condition channels
+            if condition_channels > 0:
+                print(f"🔗 Expanding projection layer for {condition_channels} condition channels")
+                model._setup_condition_channels(
+                    condition_channels,
+                    original_proj=base_model.patch_embed.proj
+                )
+            
+            # Setup input/output channels for joint generation (only if num_output_videos > 1)
+            if num_output_videos > 1:
+                # Expand input channels for joint generation
+                num_latent_channels = kwargs.get("num_latent_channels", 16)  # Default VAE latent channels
+                current_in_channels = model.patch_embed.proj.in_channels
+                condition_channels = model.condition_channels
+                expected_in_channels = num_latent_channels * num_output_videos + condition_channels
+                if current_in_channels != expected_in_channels:
+                    print(f"🔗 Expanding input projection for {num_output_videos} videos joint generation")
+                    model._setup_input_channels_for_joint_generation(
+                        num_output_videos,
+                        num_latent_channels,
+                        original_proj=model.patch_embed.proj
+                    )
+                
+                # Expand output projection for joint generation
+                print(f"🔗 Expanding output projection for {num_output_videos} videos joint generation")
+                model._setup_output_channels(
+                    num_output_videos,
+                    original_proj_out=base_model.proj_out
+                )
+
+            return model
+    
+    def get_condition_info(self) -> Dict[str, Any]:
+        """Get information about the conditional setup."""
+        info = {
+            "approach": "concat",
+            "has_conditions": hasattr(self, 'condition_channels') and self.condition_channels > 0,
+            "condition_channels": getattr(self, 'condition_channels', 0),
+            "total_input_channels": self.patch_embed.proj.in_channels,
+            "base_channels": getattr(self, 'original_in_channels', self.patch_embed.proj.in_channels),
+            "output_dim": self.proj_out.out_features,
+            "original_output_dim": getattr(self.config, 'original_output_dim', self.proj_out.out_features // 2),
+        }
+        return info
+    
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        timestep: Union[int, float, torch.LongTensor],
+        timestep_cond: Optional[torch.Tensor] = None,
+        inpaint_latents: Optional[torch.Tensor] = None,
+        control_latents: Optional[torch.Tensor] = None,
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        return_dict: bool = True,
+        **kwargs
+    ):
+        """
+        Forward pass with VideoX-Fun specific inputs and conditional concatenation.
+        Output dimension is doubled for joint generation.
+        
+        Args:
+            hidden_states: Input tensor with shape [batch, frames, channels, height, width]
+            encoder_hidden_states: Text embeddings
+            timestep: Timestep tensor
+            timestep_cond: Timestep condition tensor
+            inpaint_latents: Inpainting latents (VideoX-Fun specific)
+            control_latents: Control latents (VideoX-Fun specific)
+            image_rotary_emb: Rotary embeddings
+            return_dict: Whether to return a dict
+            **kwargs: Additional arguments
+            
+        Returns:
+            Transformer2DModelOutput with sample shape [batch, frames, channels*2, height, width]
+            The output should be split in the pipeline for two separate videos.
+        """
+        # Validate input dimensions if condition channels are expected
+        if hasattr(self, 'condition_channels') and self.condition_channels > 0:
+            expected_channels = self.patch_embed.proj.in_channels
+            actual_channels = hidden_states.shape[2]
+            
+            if actual_channels != expected_channels:
+                raise ValueError(
+                    f"Expected {expected_channels} channels (base + condition), "
+                    f"but got {actual_channels} channels in hidden_states"
+                )
+        
+        # Use parent class forward (no adapter logic)
+        batch_size, num_frames, channels, height, width = hidden_states.shape
+        
+        # Handle single frame case (VideoX-Fun specific)
+        if num_frames == 1 and self.patch_size_t is not None:
+            hidden_states = torch.cat([hidden_states, torch.zeros_like(hidden_states)], dim=1)
+            if inpaint_latents is not None:
+                inpaint_latents = torch.concat([inpaint_latents, torch.zeros_like(inpaint_latents)], dim=1)
+            if control_latents is not None:
+                control_latents = torch.concat([control_latents, torch.zeros_like(control_latents)], dim=1)
+            local_num_frames = num_frames + 1
+        else:
+            local_num_frames = num_frames
+        
+        # Time embedding
+        timesteps = timestep
+        t_emb = self.time_proj(timesteps)
+        t_emb = t_emb.to(dtype=hidden_states.dtype)
+        emb = self.time_embedding(t_emb, timestep_cond)
+        
+        # Patch embedding with VideoX-Fun specific concatenation
+        if inpaint_latents is not None:
+            hidden_states = torch.concat([hidden_states, inpaint_latents], 2)
+        if control_latents is not None:
+            hidden_states = torch.concat([hidden_states, control_latents], 2)
+        
+        hidden_states = self.patch_embed(encoder_hidden_states, hidden_states)
+        hidden_states = self.embedding_dropout(hidden_states)
+        
+        text_seq_length = encoder_hidden_states.shape[1]
+        encoder_hidden_states = hidden_states[:, :text_seq_length]
+        hidden_states = hidden_states[:, text_seq_length:]
+        
+        # Transformer blocks
+        for i, block in enumerate(self.transformer_blocks):
+            if torch.is_grad_enabled() and self.gradient_checkpointing:
+                def create_custom_forward(module):
+                    def custom_forward(*inputs):
+                        return module(*inputs)
+                    return custom_forward
+                
+                ckpt_kwargs: Dict[str, Any] = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
+                hidden_states, encoder_hidden_states = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(block),
+                    hidden_states,
+                    encoder_hidden_states,
+                    emb,
+                    image_rotary_emb,
+                    **ckpt_kwargs,
+                )
+            else:
+                hidden_states, encoder_hidden_states = block(
+                    hidden_states=hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    temb=emb,
+                    image_rotary_emb=image_rotary_emb,
+                )
+        
+        # Final normalization (VideoX-Fun specific)
+        if not self.config.use_rotary_positional_embeddings:
+            # CogVideoX-2B
+            hidden_states = self.norm_final(hidden_states)
+        else:
+            # CogVideoX-5B
+            hidden_states = torch.cat([encoder_hidden_states, hidden_states], dim=1)
+            hidden_states = self.norm_final(hidden_states)
+            hidden_states = hidden_states[:, text_seq_length:]
+        
+        # Final block - output will be doubled
+        hidden_states = self.norm_out(hidden_states, temb=emb)
+        hidden_states = self.proj_out(hidden_states)  # [B, seq_len, inner_dim * 2]
+        
+        # Unpatchify - output has doubled channels
+        p = self.config.patch_size
+        p_t = self.config.patch_size_t
+        
+        if p_t is None:
+            # hidden_states: [B, seq_len, inner_dim * 2]
+            # After reshape: [B, F, H', W', inner_dim * 2, p, p]
+            output = hidden_states.reshape(batch_size, local_num_frames, height // p, width // p, -1, p, p)
+            output = output.permute(0, 1, 4, 2, 5, 3, 6).flatten(5, 6).flatten(3, 4)
+            # output: [B, F, inner_dim * 2, H, W]
+        else:
+            output = hidden_states.reshape(
+                batch_size, (local_num_frames + p_t - 1) // p_t, height // p, width // p, -1, p_t, p, p
+            )
+            output = output.permute(0, 1, 5, 4, 2, 6, 3, 7).flatten(6, 7).flatten(4, 5).flatten(1, 2)
+            # output: [B, F, inner_dim * 2, H, W]
+        
+        # Handle single frame case (VideoX-Fun specific)
+        if num_frames == 1:
+            output = output[:, :num_frames, :]
+        
+        if not return_dict:
+            return (output,)
+        return Transformer2DModelOutput(sample=output)
+
 class CogVideoXPatchEmbedWithAdapter(CogVideoXPatchEmbed):
     """
     VideoX-Fun Patch Embed with conditional input support via adapter.

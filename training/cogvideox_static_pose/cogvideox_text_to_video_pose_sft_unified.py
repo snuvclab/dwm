@@ -76,8 +76,8 @@ from training.cogvideox_static_pose.cogvideox_pose_adaln_pipeline import CogVide
 from training.cogvideox_static_pose.cogvideox_static_to_video_pose_concat_pipeline import CogVideoXStaticToVideoPipeline, CogVideoXStaticToVideoPoseConcatPipeline, CogVideoXStaticToVideoCrossPoseAdapterPipeline
 from training.cogvideox_static_pose.cogvideox_fun_static_to_video_pose_concat_pipeline import (
     CogVideoXFunStaticToVideoPipeline,
-    CogVideoXFunStaticToVideoCrossPipeline,
     CogVideoXFunStaticToVideoPoseTokenPipeline,
+    CogVideoXFunStaticToVideoJointGenerationPipeline,
 )
 
 # Backward compatibility alias (legacy configs may reference the old name)
@@ -472,27 +472,70 @@ def log_validation_with_dataset(
         pipeline_args["static_videos"] = static_video
 
     output = pipe(**pipeline_args, generator=generator)
-    generated_video = output.frames[0]
-    if isinstance(generated_video, torch.Tensor):
-        generated_video = generated_video.cpu().numpy()
-
-    # Ensure all videos have the same number of frames (49 frames at 8fps)
-    # Only consider non-None videos for frame calculation
-    frame_shapes = [generated_video.shape[0], gt_video.shape[0]]
-    if static_video is not None:
-        static_video = static_video[0].transpose(1, 2, 3, 0)  # [1, C, F, H, W] -> [C, F, H, W] -> [F, H, W, C]
-        frame_shapes.append(static_video.shape[0])
-    if hand_video is not None:
-        hand_video = hand_video[0].transpose(1, 2, 3, 0)  # [1, C, F, H, W] -> [C, F, H, W] -> [F, H, W, C]
-        frame_shapes.append(hand_video.shape[0])
     
-    num_frames = min(*frame_shapes, 49)
-    generated_video = generated_video[:num_frames]
-    gt_video = gt_video[:num_frames]
-    if hand_video is not None:
-        hand_video = hand_video[:num_frames]
-    if static_video is not None:
-        static_video = static_video[:num_frames]
+    # Handle joint generation pipeline (returns list of videos)
+    if pipeline_type == "cogvideox_fun_static_to_video_joint_generation":
+        # Joint generation returns list of videos: [video1, video2]
+        # Handle both dict and tuple return types
+        if isinstance(output, dict):
+            generated_videos = output["frames"] if isinstance(output["frames"], list) else [output["frames"]]
+        elif isinstance(output, tuple):
+            generated_videos = list(output)  # (video1, video2) -> [video1, video2]
+        else:
+            # PipelineOutput object
+            generated_videos = output.frames if isinstance(output.frames, list) else [output.frames]
+        # Convert to numpy and remove batch dimension: [B, F, H, W, C] -> [F, H, W, C]
+        generated_videos = [v.cpu().numpy() if isinstance(v, torch.Tensor) else v for v in generated_videos]
+        generated_videos = [v[0] if len(v.shape) == 5 and v.shape[0] == 1 else v for v in generated_videos]
+    else:
+        # Single video output
+        # Handle both dict and tuple return types
+        if isinstance(output, dict):
+            generated_video = output["frames"][0] if isinstance(output["frames"], list) else output["frames"]
+        elif isinstance(output, tuple):
+            generated_video = output[0]
+        else:
+            # PipelineOutput object
+            generated_video = output.frames[0] if isinstance(output.frames, list) else output.frames
+        if isinstance(generated_video, torch.Tensor):
+            generated_video = generated_video.cpu().numpy()
+
+    # Handle joint generation: process both videos
+    if pipeline_type == "cogvideox_fun_static_to_video_joint_generation":
+        # Process both videos for frame alignment
+        frame_shapes = [generated_videos[0].shape[0], generated_videos[1].shape[0], gt_video.shape[0]]
+        if static_video is not None:
+            static_video = static_video[0].transpose(1, 2, 3, 0)  # [1, C, F, H, W] -> [C, F, H, W] -> [F, H, W, C]
+            frame_shapes.append(static_video.shape[0])
+        if hand_video is not None:
+            hand_video = hand_video[0].transpose(1, 2, 3, 0)  # [1, C, F, H, W] -> [C, F, H, W] -> [F, H, W, C]
+            frame_shapes.append(hand_video.shape[0])
+        
+        num_frames = min(*frame_shapes, 49)
+        generated_videos = [v[:num_frames] for v in generated_videos]
+        gt_video = gt_video[:num_frames]
+        if hand_video is not None:
+            hand_video = hand_video[:num_frames]
+        if static_video is not None:
+            static_video = static_video[:num_frames]
+    else:
+        # Ensure all videos have the same number of frames (49 frames at 8fps)
+        # Only consider non-None videos for frame calculation
+        frame_shapes = [generated_video.shape[0], gt_video.shape[0]]
+        if static_video is not None:
+            static_video = static_video[0].transpose(1, 2, 3, 0)  # [1, C, F, H, W] -> [C, F, H, W] -> [F, H, W, C]
+            frame_shapes.append(static_video.shape[0])
+        if hand_video is not None:
+            hand_video = hand_video[0].transpose(1, 2, 3, 0)  # [1, C, F, H, W] -> [C, F, H, W] -> [F, H, W, C]
+            frame_shapes.append(hand_video.shape[0])
+        
+        num_frames = min(*frame_shapes, 49)
+        generated_video = generated_video[:num_frames]
+        gt_video = gt_video[:num_frames]
+        if hand_video is not None:
+            hand_video = hand_video[:num_frames]
+        if static_video is not None:
+            static_video = static_video[:num_frames]
 
     # Create comparison video: only include non-None videos
     video_components = []
@@ -517,7 +560,12 @@ def log_validation_with_dataset(
         else:
             # Regular mode: use as is
             video_components.append(hand_video)
-    video_components.extend([generated_video, gt_video])
+    
+    if pipeline_type == "cogvideox_fun_static_to_video_joint_generation":
+        # For joint generation, include both generated videos in comparison
+        video_components.extend([generated_videos[0], generated_videos[1], gt_video])
+    else:
+        video_components.extend([generated_video, gt_video])
     
     comparison_video = np.concatenate(video_components, axis=2)  # Concatenate along width
 
@@ -545,23 +593,43 @@ def log_validation_with_dataset(
     output_dir = config["experiment"]["output_dir"]
     os.makedirs(output_dir, exist_ok=True)
     
-    # Save generated video
-    generated_filename = os.path.join(output_dir, f"step_{step}_{phase_name}_generated_{save_name}_{mode_suffix}{gpu_suffix}.mp4")
-    export_to_video(generated_video, generated_filename, fps=8)
-    
-    # Save comparison video (static | hand | generated | gt)
-    comparison_filename = os.path.join(output_dir, f"step_{step}_{phase_name}_comparison_{save_name}_{mode_suffix}{gpu_suffix}.mp4")
-    export_to_video(comparison_video, comparison_filename, fps=8)
-    
-    print(f"📹 GPU {accelerator.process_index}: Saved validation videos for {save_name}")
-    print(f"   Generated: {generated_filename}")
-    print(f"   Comparison (static|hand|generated|gt): {comparison_filename}")
+    # Save generated video(s)
+    if pipeline_type == "cogvideox_fun_static_to_video_joint_generation":
+        # Save both videos for joint generation
+        generated_filename_v1 = os.path.join(output_dir, f"step_{step}_{phase_name}_generated_v1_{save_name}_{mode_suffix}{gpu_suffix}.mp4")
+        generated_filename_v2 = os.path.join(output_dir, f"step_{step}_{phase_name}_generated_v2_{save_name}_{mode_suffix}{gpu_suffix}.mp4")
+        export_to_video(generated_videos[0], generated_filename_v1, fps=8)
+        export_to_video(generated_videos[1], generated_filename_v2, fps=8)
+        
+        # Save comparison video (static | hand | generated_v1 | generated_v2 | gt)
+        comparison_filename = os.path.join(output_dir, f"step_{step}_{phase_name}_comparison_{save_name}_{mode_suffix}{gpu_suffix}.mp4")
+        export_to_video(comparison_video, comparison_filename, fps=8)
+        
+        print(f"📹 GPU {accelerator.process_index}: Saved validation videos for {save_name}")
+        print(f"   Generated v1: {generated_filename_v1}")
+        print(f"   Generated v2: {generated_filename_v2}")
+        print(f"   Comparison (static|hand|generated_v1|generated_v2|gt): {comparison_filename}")
+    else:
+        # Single video output
+        generated_filename = os.path.join(output_dir, f"step_{step}_{phase_name}_generated_{save_name}_{mode_suffix}{gpu_suffix}.mp4")
+        export_to_video(generated_video, generated_filename, fps=8)
+        
+        # Save comparison video (static | hand | generated | gt)
+        comparison_filename = os.path.join(output_dir, f"step_{step}_{phase_name}_comparison_{save_name}_{mode_suffix}{gpu_suffix}.mp4")
+        export_to_video(comparison_video, comparison_filename, fps=8)
+        
+        print(f"📹 GPU {accelerator.process_index}: Saved validation videos for {save_name}")
+        print(f"   Generated: {generated_filename}")
+        print(f"   Comparison (static|hand|generated|gt): {comparison_filename}")
 
     # Log to wandb if available
     if accelerator.is_main_process:
         for tracker in accelerator.trackers:
             if tracker.name == "wandb":
-                caption = f"step_{step}_{phase_name}_{video_name}_comparison{mode_suffix} (static|hand|generated|gt)"
+                if pipeline_type == "cogvideox_fun_static_to_video_joint_generation":
+                    caption = f"step_{step}_{phase_name}_{video_name}_comparison{mode_suffix} (static|hand|generated_v1|generated_v2|gt)"
+                else:
+                    caption = f"step_{step}_{phase_name}_{video_name}_comparison{mode_suffix} (static|hand|generated|gt)"
                 tracker.log(
                     {
                         phase_name: [
@@ -570,7 +638,6 @@ def log_validation_with_dataset(
                     }
                 )
 
-    return generated_video
 
 
 def run_validation(
@@ -888,6 +955,21 @@ def run_validation(
             variant=model_config_dict.get("variant"),
             torch_dtype=weight_dtype,
             condition_channels=condition_channels,
+        )
+    elif pipeline_config["type"] == "cogvideox_fun_static_to_video_joint_generation":
+        # Get condition_channels and num_output_videos from pipeline config
+        condition_channels = pipeline_config.get("condition_channels", 16)
+        num_output_videos = pipeline_config.get("num_output_videos", 2)
+        
+        pipe = CogVideoXFunStaticToVideoJointGenerationPipeline.from_pretrained(
+            base_model_name_or_path=model_config_dict["base_model_name_or_path"],
+            transformer=unwrap_model(accelerator, transformer),
+            scheduler=scheduler,
+            revision=model_config_dict.get("revision"),
+            variant=model_config_dict.get("variant"),
+            torch_dtype=weight_dtype,
+            condition_channels=condition_channels,
+            num_output_videos=num_output_videos,
         )
     else:
         raise ValueError(f"Unsupported pipeline type: {pipeline_config['type']}")
@@ -1919,7 +2001,23 @@ def setup_pipeline_from_config(config: Dict[str, Any]):
             variant=model_config.get("variant"),
             condition_channels=condition_channels,
         )
+    elif pipeline_type == "cogvideox_fun_static_to_video_joint_generation":
+        # Setup CogVideoX Fun Static-to-Video Joint Generation Pipeline
+        print("🔧 Setting up CogVideoX Fun Static-to-Video Joint Generation Pipeline")
         
+        # Get condition_channels and num_output_videos from pipeline config
+        condition_channels = pipeline_config.get("condition_channels", 16)
+        num_output_videos = pipeline_config.get("num_output_videos", 2)
+        
+        pipeline = CogVideoXFunStaticToVideoJointGenerationPipeline.from_pretrained(
+            pretrained_model_name_or_path=None,  # Always start from base model
+            base_model_name_or_path=model_path,
+            torch_dtype=load_dtype,
+            revision=model_config.get("revision"),
+            variant=model_config.get("variant"),
+            condition_channels=condition_channels,
+            num_output_videos=num_output_videos,
+        )
     else:
         raise ValueError(f"Unsupported pipeline type: {pipeline_type}")
     
@@ -4211,7 +4309,10 @@ def main():
                 videos = latent_dist.sample() * VAE_SCALING_FACTOR
                 videos = videos.permute(0, 2, 1, 3, 4)  # [B, F, C, H, W]
                 videos = videos.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
-                model_input = videos
+                if pipeline_config["type"] == "cogvideox_fun_static_to_video_joint_generation":
+                    model_input = torch.cat([videos, static_videos_latents], dim=2)
+                else:
+                    model_input = videos
 
                 # Use already processed condition videos from _process_condition_videos
                 # Note: hand_dropout is already applied to hand_videos_latents above
@@ -4442,6 +4543,17 @@ def main():
                     
                 elif pipeline_config["type"] == "cogvideox_fun_static_to_video_pose_concat":
                     # For VideoX-Fun static-to-video pose concat pipeline, use both static and hand videos as conditions
+                    # Use preprocessed condition latents
+                    # Use warped_mask if available (for I2V training)
+                    mask_input = _create_fun_mask_input(noisy_model_input, VAE_SCALING_FACTOR, 
+                                                        warped_mask=warped_mask)
+                    mask_input = mask_input.to(device=accelerator.device, dtype=weight_dtype)
+                    transformer_input = torch.cat([noisy_model_input, mask_input, 
+                                                   static_videos_latents, hand_videos_latents], dim=2)
+                    condition_latents = None
+                elif pipeline_config["type"] == "cogvideox_fun_static_to_video_joint_generation":
+                    # For VideoX-Fun static-to-video joint generation pipeline, use both static and hand videos as conditions
+                    # Same as cogvideox_fun_static_to_video_pose_concat, but transformer outputs two videos
                     # Use preprocessed condition latents
                     # Use warped_mask if available (for I2V training)
                     mask_input = _create_fun_mask_input(noisy_model_input, VAE_SCALING_FACTOR, 
@@ -4766,22 +4878,33 @@ def main():
                         control_latents=control_latents,
                         return_dict=False,
                     )[0]
+                elif pipeline_config["type"] == "cogvideox_fun_static_to_video_joint_generation":
+                    # For VideoX-Fun joint generation pipeline, transformer returns doubled output channels
+                    model_output = transformer(
+                        hidden_states=transformer_input,
+                        encoder_hidden_states=prompt_embeds,
+                        timestep=timesteps,
+                        image_rotary_emb=image_rotary_emb,
+                        return_dict=False,
+                    )[0]
                         
 
-                model_pred = scheduler.get_velocity(model_output, noisy_model_input, timesteps)
-
+                target = model_input
+                noisy_target = noisy_model_input
+                
+                # Get velocity prediction
+                model_pred = scheduler.get_velocity(model_output, noisy_target, timesteps)
+                
+                # Compute weights
                 weights = 1 / (1 - alphas_cumprod[timesteps])
                 while len(weights.shape) < len(model_pred.shape):
                     weights = weights.unsqueeze(-1)
-
-                target = model_input
-
-                # Compute latent space loss (standard velocity matching)
+                
+                # Compute latent space loss
                 latent_loss = torch.mean(
                     (weights * (model_pred - target) ** 2).reshape(batch_size, -1),
                     dim=1,
-                )
-                latent_loss = latent_loss.mean()
+                ).mean()
                 
                 # Compute pixel space loss if enabled
                 use_pixel_loss = training_config.get("use_pixel_loss", False)
