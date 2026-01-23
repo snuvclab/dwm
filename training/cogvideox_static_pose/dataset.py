@@ -104,11 +104,13 @@ class VideoDataset(Dataset):
                 self.video_paths,
             ) = self._load_dataset_from_local_path()
             self.is_i2v_sample = [False] * len(self.video_paths)  # Track source for each sample
+            self.dataset_type = ["unknown"] * len(self.video_paths)  # Track dataset type for each sample
         else:
             (
                 self.prompts,
                 self.video_paths,
                 self.is_i2v_sample,
+                self.dataset_type,
             ) = self._load_dataset_from_datafile()
             # ) = self._load_dataset_from_csv()
 
@@ -250,7 +252,7 @@ class VideoDataset(Dataset):
 
         return prompts, video_paths
 
-    def _load_dataset_from_datafile(self) -> Tuple[List[str], List[Path], List[bool]]:
+    def _load_dataset_from_datafile(self) -> Tuple[List[str], List[Path], List[bool], List[str]]:
         # Load regular dataset
         if not self.dataset_file_list:
             raise ValueError("dataset_file should not be empty when provided.")
@@ -258,11 +260,23 @@ class VideoDataset(Dataset):
         all_prompts: List[str] = []
         all_video_paths: List[Path] = []
         is_i2v_sample: List[bool] = []
+        dataset_type: List[str] = []
 
         for dataset_file in self.dataset_file_list:
             dataset_path = self.data_root / dataset_file
             if not dataset_path.exists():
                 raise FileNotFoundError(f"Dataset file not found: {dataset_path}")
+
+            # Extract dataset type from dataset_file path (simple check)
+            # e.g., "dataset_files/trumans_static_pose_all/train.txt" -> "trumans"
+            # e.g., "dataset_files/taste_rob/double_train.txt" -> "taste_rob"
+            dataset_file_str = str(dataset_file)
+            if "taste_rob" in dataset_file_str:
+                dataset_type_name = "taste_rob"
+            elif "trumans" in dataset_file_str:
+                dataset_type_name = "trumans"
+            else:
+                dataset_type_name = "unknown"
 
             with open(dataset_path, "r", encoding="utf-8") as f:
                 file_video_paths = [
@@ -278,8 +292,9 @@ class VideoDataset(Dataset):
             all_video_paths.extend(file_video_paths)
             all_prompts.extend(file_prompts)
             is_i2v_sample.extend([False] * len(file_video_paths))
+            dataset_type.extend([dataset_type_name] * len(file_video_paths))
         
-        return all_prompts, all_video_paths, is_i2v_sample
+        return all_prompts, all_video_paths, is_i2v_sample, dataset_type
 
     def _preprocess_video(self, path: Path) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         r"""
@@ -389,6 +404,7 @@ class VideoDatasetWithConditions(VideoDataset):
     Extended VideoDataset that supports additional condition videos:
     - hand_videos: Egocentric hand mesh videos (automatically derived from main video paths)
     - static_videos: Static scene videos (automatically derived from main video paths)
+    - videos_object: Object videos (automatically derived from main video paths)
     - raymaps: Camera ray maps for 3D scene understanding
     - image_goal_latents: Goal image latents for navigation tasks
     """
@@ -489,6 +505,9 @@ class VideoDatasetWithConditions(VideoDataset):
         
         self.static_video_paths = self._derive_condition_video_paths("videos_static")
         
+        # Derive videos_object paths
+        self.videos_object_paths = self._derive_condition_video_paths("videos_object")
+        
         # Derive warped videos paths
         self.warped_video_paths = self._derive_condition_video_paths("warped_videos")
         
@@ -535,6 +554,13 @@ class VideoDatasetWithConditions(VideoDataset):
                     f"Some static video files are missing. First few missing files: {missing_static_videos[:5]}"
                 )
             
+            # Validate videos_object if they exist (optional, so just warn)
+            if any(not path.is_file() for path in self.videos_object_paths):
+                missing_videos_object = [path for path in self.videos_object_paths if not path.is_file()]
+                logger.warning(
+                    f"Some videos_object files are missing. First few missing files: {missing_videos_object[:5]}"
+                )
+            
             # Validate warped videos if they exist (optional, so just warn)
             if any(not path.is_file() for path in self.warped_video_paths):
                 missing_warped_videos = [path for path in self.warped_video_paths if not path.is_file()]
@@ -574,6 +600,15 @@ class VideoDatasetWithConditions(VideoDataset):
         i2v_prompt_paths = [path.parent.parent.joinpath(self.prompt_subdir, path.name.replace(".mp4", ".txt")) for path in i2v_video_paths]
         i2v_prompts = [path.read_text() for path in i2v_prompt_paths]
         
+        # Extract dataset type from i2v dataset file name (simple check)
+        i2v_dataset_file_str = str(self.dataset_file_i2v)
+        if "taste_rob" in i2v_dataset_file_str:
+            i2v_dataset_type_name = "taste_rob"
+        elif "trumans" in i2v_dataset_file_str:
+            i2v_dataset_type_name = "trumans"
+        else:
+            i2v_dataset_type_name = "unknown"
+        
         # Append to existing lists
         self.video_paths.extend(i2v_video_paths)
         self.prompts.extend(i2v_prompts)
@@ -581,6 +616,10 @@ class VideoDatasetWithConditions(VideoDataset):
         # Mark i2v samples as True (existing samples are False)
         i2v_is_i2v_sample = [True] * len(i2v_video_paths)
         self.is_i2v_sample.extend(i2v_is_i2v_sample)
+        
+        # Add dataset type for i2v samples
+        i2v_dataset_type = [i2v_dataset_type_name] * len(i2v_video_paths)
+        self.dataset_type.extend(i2v_dataset_type)
         
         logger.info(
             f"Merged i2v dataset: {len(i2v_video_paths)} samples from {self.dataset_file_i2v} "
@@ -690,6 +729,16 @@ class VideoDatasetWithConditions(VideoDataset):
             except Exception as e:
                 logger.warning(f"Failed to load static video latents for index {index}: {e}")
                 main_data["static_videos"] = None
+            
+            try:
+                object_video_latents = self._load_condition_video_latents_or_encode(self.videos_object_paths[index], "object_video_latents")
+                main_data["object_videos"] = object_video_latents
+            except Exception as e:
+                # Only log warning for non-taste_rob datasets (taste_rob doesn't have videos_object)
+                current_dataset_type = self.dataset_type[index] if hasattr(self, 'dataset_type') and index < len(self.dataset_type) else "unknown"
+                if current_dataset_type != "taste_rob":
+                    logger.warning(f"Failed to load object video latents for index {index}: {e}")
+                main_data["object_videos"] = None
             
             # Handle warped_videos and masks if this sample is from i2v dataset
             # Use is_i2v_sample to determine if warped should be used (based on dataset_file_i2v)
@@ -887,6 +936,16 @@ class VideoDatasetWithConditions(VideoDataset):
                 logger.warning(f"Failed to load static video for index {index}: {e}")
                 main_data["static_videos"] = None
             
+            try:
+                _, videos_object, _ = self._preprocess_video(self.videos_object_paths[index])
+                main_data["object_videos"] = videos_object
+            except Exception as e:
+                # Only log warning for non-taste_rob datasets (taste_rob doesn't have videos_object)
+                current_dataset_type = self.dataset_type[index] if hasattr(self, 'dataset_type') and index < len(self.dataset_type) else "unknown"
+                if current_dataset_type != "taste_rob":
+                    logger.warning(f"Failed to load videos_object for index {index}: {e}")
+                main_data["object_videos"] = None
+            
             # Handle warped_videos and masks if this sample is from i2v dataset (raw mode)
             # Use is_i2v_sample to determine if warped should be used (based on dataset_file_i2v)
             # Only use i2v if global_step >= start_i2v_training_iter
@@ -1049,14 +1108,21 @@ class VideoDatasetWithConditions(VideoDataset):
             # Construct the latents path
             latents_path = action_dir / "processed2" / latent_folder
             
+            # Suppress warning for taste_rob dataset when loading object_video_latents
+            path_str = str(path)
+            is_taste_rob = "taste_rob" in path_str
+            is_object_latents = latent_folder == "object_video_latents"
+            
             if not latents_path.exists():
-                logger.warning(f"Latents folder not found: {latents_path}")
+                if not (is_taste_rob and is_object_latents):
+                    logger.warning(f"Latents folder not found: {latents_path}")
                 raise FileNotFoundError(f"Latents folder not found: {latents_path}")
             
             latent_filepath = latents_path.joinpath(pt_filename)
             
             if not latent_filepath.is_file():
-                logger.warning(f"Latent file not found: {latent_filepath}")
+                if not (is_taste_rob and is_object_latents):
+                    logger.warning(f"Latent file not found: {latent_filepath}")
                 raise FileNotFoundError(f"Latent file not found: {latent_filepath}")
             
             try:
@@ -1070,7 +1136,12 @@ class VideoDatasetWithConditions(VideoDataset):
             if self.split_hands:
                 logger.debug(f"Latents not found for {path}, will load raw video: {e}")
             else:
-                logger.error(f"Error in _load_condition_video_latents for {path} in {latent_folder}: {e}")
+                # Suppress error log for taste_rob dataset when loading object_video_latents
+                path_str = str(path)
+                is_taste_rob = "taste_rob" in path_str
+                is_object_latents = latent_folder == "object_video_latents"
+                if not (is_taste_rob and is_object_latents):
+                    logger.error(f"Error in _load_condition_video_latents for {path} in {latent_folder}: {e}")
             raise e
 
     def _load_condition_video_latents_or_encode(self, path: Path, latent_folder: str) -> torch.Tensor:
@@ -1080,7 +1151,13 @@ class VideoDatasetWithConditions(VideoDataset):
             # First try to load preprocessed latents
             return self._load_condition_video_latents(path, latent_folder)
         except (FileNotFoundError, Exception) as e:
-            logger.info(f"Preprocessed latents not found for {path}, will encode from raw video in training: {e}")
+            # Suppress info log for taste_rob dataset when loading object_video_latents
+            path_str = str(path)
+            is_taste_rob = "taste_rob" in path_str
+            is_object_latents = latent_folder == "object_video_latents"
+            
+            if not (is_taste_rob and is_object_latents):
+                logger.info(f"Preprocessed latents not found for {path}, will encode from raw video in training: {e}")
             
             # Fallback: return raw video tensor
             try:

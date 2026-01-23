@@ -1580,14 +1580,21 @@ class CogVideoXFunTransformer3DModelWithJointGeneration(CogVideoXFunTransformer3
     This class extends CogVideoXFunTransformer3DModel to support:
     1. Conditional inputs via channel concatenation (like WithConcat)
     2. Joint generation of two videos by doubling the output dimension
+    3. Optional input channel expansion for joint generation (via expand_input_channels flag)
     
     Key differences from CogVideoXFunTransformer3DModelWithConcat:
     1. No adapter support (simplified)
     2. Output dimension is doubled (inner_dim * 2) for joint generation
     3. setup_output_channels() extends proj_out to generate two videos simultaneously
+    4. Optional input channel expansion when expand_input_channels=True
+    
+    Args:
+        expand_input_channels: If True, expands input channels for joint generation.
+            When True, input channels = latent_channels * num_output_videos + condition_channels.
+            When False (default), only output channels are expanded.
     """
     
-    def __init__(self, *args, condition_channels: int = 0, num_output_videos: int = 1, **kwargs):
+    def __init__(self, *args, condition_channels: int = 0, num_output_videos: int = 1, expand_input_channels: bool = False, **kwargs):
         # Store original in_channels before modification
         if "original_in_channels" in kwargs:
             original_in_channels = kwargs.pop("original_in_channels")
@@ -1598,6 +1605,7 @@ class CogVideoXFunTransformer3DModelWithJointGeneration(CogVideoXFunTransformer3
         
         self.register_to_config(
             add_noise_in_inpaint_model=kwargs.pop("add_noise_in_inpaint_model", False),
+            expand_input_channels=expand_input_channels,
         )
         super().__init__(*args, **kwargs)
         
@@ -1620,15 +1628,17 @@ class CogVideoXFunTransformer3DModelWithJointGeneration(CogVideoXFunTransformer3
         # Setup input/output channels for joint generation (only if num_output_videos > 1)
         self.num_output_videos = num_output_videos
         if num_output_videos > 1:
-            # For joint generation, input channel needs to be expanded by adding latent channels
-            # because pipeline creates latents with C * num_output_videos channels
+            # For joint generation, input channel can be expanded by adding latent channels
+            # if expand_input_channels is True. This is because pipeline creates latents with 
+            # C * num_output_videos channels when expand_input_channels=True
             # Input = latent_channels * num_output_videos + condition_channels
-            current_in_channels = self.patch_embed.proj.in_channels
-            num_latent_channels = kwargs.get("num_latent_channels", 16)  # Default VAE latent channels
-            expected_in_channels = num_latent_channels * num_output_videos + self.condition_channels
-            if current_in_channels != expected_in_channels:
-                # Need to expand input channels for joint generation
-                self._setup_input_channels_for_joint_generation(num_output_videos, num_latent_channels)
+            if expand_input_channels:
+                current_in_channels = self.patch_embed.proj.in_channels
+                num_latent_channels = kwargs.get("num_latent_channels", 16)  # Default VAE latent channels
+                expected_in_channels = num_latent_channels * num_output_videos + self.condition_channels
+                if current_in_channels != expected_in_channels:
+                    # Need to expand input channels for joint generation
+                    self._setup_input_channels_for_joint_generation(num_output_videos, num_latent_channels)
             
             # Setup output channels
             self._setup_output_channels(num_output_videos)
@@ -1715,15 +1725,19 @@ class CogVideoXFunTransformer3DModelWithJointGeneration(CogVideoXFunTransformer3
         )
         
         with torch.no_grad():
-            # Copy weights: duplicate latent channel weights for each video, keep condition channels as-is
+            # Copy weights: first video uses original weights, additional videos use zero initialization
             # Structure: [latent_video1, latent_video2, ..., condition_channels]
             # Conv2d weight shape: [out_channels, in_channels, kernel_h, kernel_w]
             # Use .data to avoid in-place operation on leaf variable view
-            for i in range(num_output_videos):
+            
+            # First video: copy original latent channel weights
+            new_proj.weight.data[:, :num_latent_channels] = original_proj.weight.data[:, :num_latent_channels]
+            
+            # Additional videos: zero initialization
+            for i in range(1, num_output_videos):
                 start_idx = i * num_latent_channels
                 end_idx = (i + 1) * num_latent_channels
-                # Copy latent channel weights (first num_latent_channels channels)
-                new_proj.weight.data[:, start_idx:end_idx] = original_proj.weight.data[:, :num_latent_channels]
+                new_proj.weight.data[:, start_idx:end_idx] = 0.0
             
             # Copy condition channel weights (if any)
             if condition_channels > 0:
@@ -1786,6 +1800,7 @@ class CogVideoXFunTransformer3DModelWithJointGeneration(CogVideoXFunTransformer3
         subfolder="transformer",
         condition_channels: Optional[int] = None,
         num_output_videos: int = 2,
+        expand_input_channels: bool = False,
         **kwargs
     ):
         """
@@ -1796,6 +1811,7 @@ class CogVideoXFunTransformer3DModelWithJointGeneration(CogVideoXFunTransformer3
             base_model_name_or_path (str): Base CogVideoX-Fun model path
             condition_channels (int): Number of extra condition channels to add
             num_output_videos (int): Number of videos to generate jointly (default: 2 for joint generation)
+            expand_input_channels (bool): If True, expands input channels for joint generation (default: False)
         """
         if pretrained_model_name_or_path is not None:
             # === Load fine-tuned checkpoint ===
@@ -1812,7 +1828,11 @@ class CogVideoXFunTransformer3DModelWithJointGeneration(CogVideoXFunTransformer3
                 # Use base config
                 if condition_channels is None:
                     condition_channels = 32  # default
-                model = cls(condition_channels=condition_channels, num_output_videos=num_output_videos)
+                model = cls(
+                    condition_channels=condition_channels,
+                    num_output_videos=num_output_videos,
+                    expand_input_channels=expand_input_channels,
+                )
 
             # 2) Load checkpoint state_dict directly
             # Try to find all safetensors files first
@@ -1893,18 +1913,19 @@ class CogVideoXFunTransformer3DModelWithJointGeneration(CogVideoXFunTransformer3
             
             # Setup input/output channels for joint generation (only if num_output_videos > 1)
             if num_output_videos > 1:
-                # Expand input channels for joint generation
-                num_latent_channels = kwargs.get("num_latent_channels", 16)  # Default VAE latent channels
-                current_in_channels = model.patch_embed.proj.in_channels
-                condition_channels = model.condition_channels
-                expected_in_channels = num_latent_channels * num_output_videos + condition_channels
-                if current_in_channels != expected_in_channels:
-                    print(f"🔗 Expanding input projection for {num_output_videos} videos joint generation")
-                    model._setup_input_channels_for_joint_generation(
-                        num_output_videos,
-                        num_latent_channels,
-                        original_proj=model.patch_embed.proj
-                    )
+                # Expand input channels for joint generation if expand_input_channels is True
+                if expand_input_channels:
+                    num_latent_channels = kwargs.get("num_latent_channels", 16)  # Default VAE latent channels
+                    current_in_channels = model.patch_embed.proj.in_channels
+                    condition_channels = model.condition_channels
+                    expected_in_channels = num_latent_channels * num_output_videos + condition_channels
+                    if current_in_channels != expected_in_channels:
+                        print(f"🔗 Expanding input projection for {num_output_videos} videos joint generation")
+                        model._setup_input_channels_for_joint_generation(
+                            num_output_videos,
+                            num_latent_channels,
+                            original_proj=model.patch_embed.proj
+                        )
                 
                 # Expand output projection for joint generation
                 print(f"🔗 Expanding output projection for {num_output_videos} videos joint generation")
@@ -2066,6 +2087,7 @@ class CogVideoXFunTransformer3DModelWithJointGeneration(CogVideoXFunTransformer3
         if not return_dict:
             return (output,)
         return Transformer2DModelOutput(sample=output)
+
 
 class CogVideoXPatchEmbedWithAdapter(CogVideoXPatchEmbed):
     """

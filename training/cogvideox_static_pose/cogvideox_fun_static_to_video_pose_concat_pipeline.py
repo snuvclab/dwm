@@ -2310,6 +2310,8 @@ class CogVideoXFunStaticToVideoJointGenerationPipeline(CogVideoXFunStaticToVideo
         vae: AutoencoderKLCogVideoX,
         transformer: CogVideoXFunTransformer3DModelWithJointGeneration,
         scheduler: Union[CogVideoXDDIMScheduler, CogVideoXDPMScheduler],
+        expand_input_channels: Optional[bool] = None,
+        use_same_noise: Optional[bool] = None,
     ):
         super().__init__(
             tokenizer=tokenizer,
@@ -2321,6 +2323,19 @@ class CogVideoXFunStaticToVideoJointGenerationPipeline(CogVideoXFunStaticToVideo
             compress_smpl_pos_map_temporal=False,
             add_control_adapter=False,  # Joint generation doesn't support adapter
         )
+        if expand_input_channels is None:
+            expand_input_channels = getattr(transformer.config, "expand_input_channels", False)
+        if use_same_noise is None:
+            use_same_noise = getattr(transformer.config, "use_same_noise", False)
+
+        # Register to config for consistency with transformer and pipeline save/load
+        self.register_to_config(
+            expand_input_channels=expand_input_channels,
+            use_same_noise=use_same_noise,
+        )
+        # Also store as instance variables for direct access
+        self.expand_input_channels = expand_input_channels
+        self.use_same_noise = use_same_noise
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path=None, 
@@ -2328,6 +2343,8 @@ class CogVideoXFunStaticToVideoJointGenerationPipeline(CogVideoXFunStaticToVideo
                         transformer=None, 
                         condition_channels=None, 
                         num_output_videos=2,
+                        expand_input_channels=False,
+                        use_same_noise: bool = False,
                         *args, **kwargs):
         """
         Load a CogVideoXFunStaticToVideoJointGenerationPipeline from a saved directory or base model.
@@ -2337,6 +2354,8 @@ class CogVideoXFunStaticToVideoJointGenerationPipeline(CogVideoXFunStaticToVideo
             base_model_name_or_path: Optional base model path for creating pose-conditioned pipeline
             transformer: Optional transformer to use (for validation with trained transformer)
             condition_channels: Number of condition channels (0 or None for base model, >0 for concat model)
+            num_output_videos: Number of videos to generate jointly (default: 2)
+            expand_input_channels: If True, expands input channels for joint generation (default: False)
         """
         # Check if this is a base model path (for creating pose-conditioned pipeline)
         if base_model_name_or_path is not None:
@@ -2357,6 +2376,7 @@ class CogVideoXFunStaticToVideoJointGenerationPipeline(CogVideoXFunStaticToVideo
                 subfolder="transformer",
                 condition_channels=condition_channels,
                 num_output_videos=num_output_videos,
+                expand_input_channels=expand_input_channels,
                 torch_dtype=kwargs.get("torch_dtype", torch.bfloat16),
                 revision=kwargs.get("revision", None),
                 variant=kwargs.get("variant", None),
@@ -2370,6 +2390,7 @@ class CogVideoXFunStaticToVideoJointGenerationPipeline(CogVideoXFunStaticToVideo
             transformer = CogVideoXFunTransformer3DModelWithJointGeneration.from_pretrained(
                 pretrained_model_name_or_path,
                 subfolder="transformer",
+                expand_input_channels=expand_input_channels,
                 torch_dtype=load_dtype,
                 revision=kwargs.get("revision", None),
                 variant=kwargs.get("variant", None),
@@ -2382,6 +2403,8 @@ class CogVideoXFunStaticToVideoJointGenerationPipeline(CogVideoXFunStaticToVideo
             vae=original_pipeline.vae,
             transformer=transformer,
             scheduler=original_pipeline.scheduler,
+            expand_input_channels=expand_input_channels,
+            use_same_noise=use_same_noise,
         )
         
         return pipeline
@@ -2403,14 +2426,20 @@ class CogVideoXFunStaticToVideoJointGenerationPipeline(CogVideoXFunStaticToVideo
         hand_videos: Optional[torch.Tensor] = None,
         timestep: Optional[torch.Tensor] = None,
         is_strength_max: bool = True,
+        use_same_noise: bool = False,
     ):
         """Prepare latents for the pipeline with static conditions."""
         # Calculate latent dimensions
         latent_height = height // self.vae_scale_factor_spatial
         latent_width = width // self.vae_scale_factor_spatial
 
-        num_channels_latents_total = self.vae.config.latent_channels * self.transformer.config.num_output_videos
-        shape = (batch_size, num_frames, num_channels_latents_total, latent_height, latent_width)
+        base_num_channels_latents = self.vae.config.latent_channels
+        base_shape = (batch_size, num_frames, base_num_channels_latents, latent_height, latent_width)
+        if self.expand_input_channels:
+            num_channels_latents = base_num_channels_latents * 2
+        else:
+            num_channels_latents = base_num_channels_latents
+        shape = (batch_size, num_frames, num_channels_latents, latent_height, latent_width)
         if isinstance(generator, list) and len(generator) != batch_size:
             raise ValueError(
                 f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
@@ -2418,7 +2447,11 @@ class CogVideoXFunStaticToVideoJointGenerationPipeline(CogVideoXFunStaticToVideo
             )
 
         if latents is None:
-            noise = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+            if self.expand_input_channels and use_same_noise:
+                base_noise = randn_tensor(base_shape, generator=generator, device=device, dtype=dtype)
+                noise = torch.cat([base_noise, base_noise], dim=2)
+            else:
+                noise = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
             # if strength is 1. then initialise the latents to noise, else initial to image + noise
             if static_videos is not None and not is_strength_max:
                 # Use static_videos as the reference for strength-based initialization
@@ -2435,6 +2468,8 @@ class CogVideoXFunStaticToVideoJointGenerationPipeline(CogVideoXFunStaticToVideo
                 video_latents = video_latents.repeat(batch_size // video_latents.shape[0], 1, 1, 1, 1)
                 video_latents = video_latents.to(device=device, dtype=dtype)
                 video_latents = rearrange(video_latents, "b c f h w -> b f c h w")
+                if self.expand_input_channels and video_latents.shape[2] == base_num_channels_latents:
+                    video_latents = torch.cat([video_latents, video_latents], dim=2)
                 latents = self.scheduler.add_noise(video_latents, noise, timestep)
             else:
                 latents = noise
@@ -2530,6 +2565,7 @@ class CogVideoXFunStaticToVideoJointGenerationPipeline(CogVideoXFunStaticToVideo
         max_sequence_length: int = 226,
         strength: float = 1,
         noise_aug_strength: float = 0.0563,
+        use_same_noise: bool = False,  # for overriding the use_same_noise parameter in the pipeline
         comfyui_progressbar: bool = False,
     ) -> Union[CogVideoXFunPipelineOutput, Tuple]:
         """
@@ -2680,6 +2716,7 @@ class CogVideoXFunStaticToVideoJointGenerationPipeline(CogVideoXFunStaticToVideo
             hand_videos=processed_hand_videos,
             timestep=latent_timestep,
             is_strength_max=is_strength_max,
+            use_same_noise=self.use_same_noise or use_same_noise,
         )
         latents, static_videos_latents, hand_videos_latents = latents_outputs
         
@@ -2692,7 +2729,7 @@ class CogVideoXFunStaticToVideoJointGenerationPipeline(CogVideoXFunStaticToVideo
             control_latents = (
                 torch.cat([control_latents] * 2) if do_classifier_free_guidance else control_latents
             )
-        
+
         inpaint_latents = None
         if mask_video is not None:
             if (mask_video == 255).all():
@@ -2805,28 +2842,78 @@ class CogVideoXFunStaticToVideoJointGenerationPipeline(CogVideoXFunStaticToVideo
 
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             old_pred_original_sample = None
+            old_pred_original_sample_v1 = None
+            old_pred_original_sample_v2 = None
+
+            if not self.expand_input_channels:
+                # Keep two latent trajectories (video1/video2) without stacking for the forward pass.
+                # We will run the transformer ONCE on video1 latents and use its [2C] output:
+                # - first half -> update video1 latents
+                # - second half -> update video2 latents
+                latents_video1 = latents
+
+                # Initialize video2 latents
+                if self.use_same_noise or use_same_noise:
+                    latents_video2 = latents_video1.clone()
+                else:
+                    noise2 = randn_tensor(latents_video1.shape, generator=generator, device=device, dtype=latents_video1.dtype)
+                    if is_strength_max:
+                        latents_video2 = noise2 * self.scheduler.init_noise_sigma
+                    elif static_videos_latents is not None:
+                        # Use the same strength-based base latents, but with different noise
+                        latents_video2 = self.scheduler.add_noise(
+                            static_videos_latents.to(device=device, dtype=latents_video1.dtype),
+                            noise2,
+                            latent_timestep,
+                        )
+                    else:
+                        latents_video2 = noise2
+            else:
+                # expand_input_channels=True: both videos are in channel dim
+                latents_both = latents  # [B, F, 2C, H, W]
+            
             for i, t in enumerate(timesteps):
                 if self.interrupt:
                     continue
 
-                latent_model_input = (
-                    torch.cat([latents] * 2) if do_classifier_free_guidance else latents
-                )
-                latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+                if not self.expand_input_channels:
+                    # Prepare input for transformer (single forward on video1 latents)
+                    latent_model_input = (
+                        torch.cat([latents_video1] * 2, dim=0) if do_classifier_free_guidance else latents_video1
+                    )
+                    latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+                    timestep = t.expand(latent_model_input.shape[0])
 
-                timestep = t.expand(latent_model_input.shape[0])
+                    # predict noise model_output (expects output [B, F, 2C, H, W])
+                    noise_pred = self.transformer(
+                        hidden_states=latent_model_input,
+                        encoder_hidden_states=prompt_embeds,
+                        timestep=timestep,
+                        image_rotary_emb=image_rotary_emb,
+                        return_dict=False,
+                        inpaint_latents=inpaint_latents,
+                        control_latents=control_latents,
+                    )[0]
+                    noise_pred = noise_pred.float()
+                else:
+                    # Prepare input for transformer
+                    latent_model_input = (
+                        torch.cat([latents_both] * 2, dim=0) if do_classifier_free_guidance else latents_both
+                    )
+                    latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+                    timestep = t.expand(latent_model_input.shape[0])
 
-                # predict noise model_output
-                noise_pred = self.transformer(
-                    hidden_states=latent_model_input,
-                    encoder_hidden_states=prompt_embeds,
-                    timestep=timestep,
-                    image_rotary_emb=image_rotary_emb,
-                    return_dict=False,
-                    inpaint_latents=inpaint_latents,
-                    control_latents=control_latents,
-                )[0]
-                noise_pred = noise_pred.float()
+                    # predict noise model_output
+                    noise_pred = self.transformer(
+                        hidden_states=latent_model_input,
+                        encoder_hidden_states=prompt_embeds,
+                        timestep=timestep,
+                        image_rotary_emb=image_rotary_emb,
+                        return_dict=False,
+                        inpaint_latents=inpaint_latents,
+                        control_latents=control_latents,
+                    )[0]
+                    noise_pred = noise_pred.float()
 
                 # perform guidance
                 if use_dynamic_cfg:
@@ -2841,28 +2928,74 @@ class CogVideoXFunStaticToVideoJointGenerationPipeline(CogVideoXFunStaticToVideo
                     )
 
                 # compute the previous noisy sample x_t -> x_t-1
-                if not isinstance(self.scheduler, CogVideoXDPMScheduler):
-                    latents = self.scheduler.step(
-                        noise_pred, t, latents, **extra_step_kwargs, return_dict=False
-                    )[0]
+                if not self.expand_input_channels:
+                    if not isinstance(self.scheduler, CogVideoXDPMScheduler):
+                        noise_pred_v1 = noise_pred[:, :, :num_channels_latents, :, :]
+                        noise_pred_v2 = noise_pred[:, :, num_channels_latents:, :, :]
+
+                        latents_video1 = self.scheduler.step(
+                            noise_pred_v1, t, latents_video1, **extra_step_kwargs, return_dict=False
+                        )[0]
+                        latents_video2 = self.scheduler.step(
+                            noise_pred_v2, t, latents_video2, **extra_step_kwargs, return_dict=False
+                        )[0]
+                    else:
+                        noise_pred_v1 = noise_pred[:, :, :num_channels_latents, :, :]
+                        noise_pred_v2 = noise_pred[:, :, num_channels_latents:, :, :]
+
+                        latents_video1, old_pred_original_sample_v1 = self.scheduler.step(
+                            noise_pred_v1,
+                            old_pred_original_sample_v1,
+                            t,
+                            timesteps[i - 1] if i > 0 else None,
+                            latents_video1,
+                            **extra_step_kwargs,
+                            return_dict=False,
+                        )
+                        latents_video2, old_pred_original_sample_v2 = self.scheduler.step(
+                            noise_pred_v2,
+                            old_pred_original_sample_v2,
+                            t,
+                            timesteps[i - 1] if i > 0 else None,
+                            latents_video2,
+                            **extra_step_kwargs,
+                            return_dict=False,
+                        )
                 else:
-                    latents, old_pred_original_sample = self.scheduler.step(
-                        noise_pred,
-                        old_pred_original_sample,
-                        t,
-                        timesteps[i - 1] if i > 0 else None,
-                        latents,
-                        **extra_step_kwargs,
-                        return_dict=False,
-                    )
-                latents = latents.to(prompt_embeds.dtype)
+                    # expand_input_channels=True: standard diffusion on [B, F, 2C, H, W]
+                    if not isinstance(self.scheduler, CogVideoXDPMScheduler):
+                        latents_both = self.scheduler.step(
+                            noise_pred, t, latents_both, **extra_step_kwargs, return_dict=False
+                        )[0]
+                    else:
+                        latents_both, old_pred_original_sample = self.scheduler.step(
+                            noise_pred,
+                            old_pred_original_sample,
+                            t,
+                            timesteps[i - 1] if i > 0 else None,
+                            latents_both,
+                            **extra_step_kwargs,
+                            return_dict=False,
+                        )
+                if not self.expand_input_channels:
+                    latents_video1 = latents_video1.to(prompt_embeds.dtype)
+                    latents_video2 = latents_video2.to(prompt_embeds.dtype)
+                    latents = latents_video1
+                else:
+                    latents_both = latents_both.to(prompt_embeds.dtype)
+                    latents = latents_both
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
                     for k in callback_on_step_end_tensor_inputs:
                         callback_kwargs[k] = locals()[k]
                     callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
-                    latents = callback_outputs.pop("latents", latents)
+                    if not self.expand_input_channels:
+                        latents_video1 = callback_outputs.pop("latents", latents_video1)
+                        latents = latents_video1
+                    else:
+                        latents_both = callback_outputs.pop("latents", latents_both)
+                        latents = latents_both
                     prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
                     negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
 
@@ -2871,10 +3004,16 @@ class CogVideoXFunStaticToVideoJointGenerationPipeline(CogVideoXFunStaticToVideo
                 if comfyui_progressbar:
                     pbar.update(1)
 
-        # Split latents along channel dimension to get two videos
-        # latents: [B, F, C*2, H, W] -> video1: [B, F, C, H, W], video2: [B, F, C, H, W]
-        latents_video1 = latents[:, :, :num_channels_latents, :, :]
-        latents_video2 = latents[:, :, num_channels_latents:, :, :]
+        # Split latents to get two videos
+        if not self.expand_input_channels:
+            # Not expanded input channels: we maintained two latent trajectories explicitly.
+            # `latents_video1` and `latents_video2` are already [B, F, C, H, W].
+            pass
+        else:
+            # latents_both: [B, F, 2C, H, W] -> video1: [B, F, C, H, W], video2: [B, F, C, H, W]
+            # Split along channel dimension
+            latents_video1 = latents_both[:, :, :num_channels_latents, :, :]
+            latents_video2 = latents_both[:, :, num_channels_latents:, :, :]
         
         # Decode both videos
         if not output_type == "latent":

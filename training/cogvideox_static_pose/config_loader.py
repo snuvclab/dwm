@@ -105,6 +105,7 @@ class ExperimentConfigLoader:
             "cogvideox_fun_static_to_video_cross_pose_adapter",
             "cogvideox_fun_static_to_video_pose_adaln",
             "cogvideox_fun_static_to_video_pose_adaln_perframe",
+            "cogvideox_fun_static_to_video_joint_generation",
         ]
         if pipeline_type not in supported_pipeline_types:
             raise ValueError(f"Unsupported pipeline type: {pipeline_type}. Supported types: {supported_pipeline_types}")

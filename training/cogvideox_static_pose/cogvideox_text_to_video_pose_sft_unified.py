@@ -20,6 +20,7 @@ import os
 import random
 import shutil
 import argparse
+import time
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Dict, List
@@ -150,7 +151,22 @@ def log_validation_with_dataset(
     generator = torch.Generator(device=accelerator.device).manual_seed(config.get("seed", 42)) if config.get("seed") else None
 
     # Load ground truth video
-    gt_video = iio.imread(validation_video_path).astype(np.float32) / 255.0
+    output_type = config.get("pipeline", {}).get("output_type", "interaction")
+    gt_video_path = validation_video_path
+    if pipeline_type != "cogvideox_fun_static_to_video_joint_generation" and output_type == "object":
+        # Object-only training: compare against object video ground truth when available.
+        # Expected layout: .../processed2/videos/<name>.mp4 -> .../processed2/videos_object/<name>.mp4
+        try:
+            video_path_obj = Path(validation_video_path)
+            object_gt_path = video_path_obj.parent.parent / "videos_object" / video_path_obj.name
+            if object_gt_path.exists():
+                gt_video_path = object_gt_path.as_posix()
+            else:
+                logger.warning(f"Object GT video not found, falling back to interaction GT: {object_gt_path}")
+        except Exception as e:
+            logger.warning(f"Failed to derive object GT path, falling back to interaction GT: {e}")
+
+    gt_video = iio.imread(gt_video_path).astype(np.float32) / 255.0
 
     # Load condition data based on pipeline type
     if pipeline_type in ["cogvideox_pose_adaln", "cogvideox_pose_adaln_perframe"]:
@@ -499,6 +515,9 @@ def log_validation_with_dataset(
             generated_video = output.frames[0] if isinstance(output.frames, list) else output.frames
         if isinstance(generated_video, torch.Tensor):
             generated_video = generated_video.cpu().numpy()
+        # Remove batch dimension if present: [B, F, H, W, C] -> [F, H, W, C] for B==1
+        if isinstance(generated_video, np.ndarray) and generated_video.ndim == 5 and generated_video.shape[0] == 1:
+            generated_video = generated_video[0]
 
     # Handle joint generation: process both videos
     if pipeline_type == "cogvideox_fun_static_to_video_joint_generation":
@@ -960,6 +979,8 @@ def run_validation(
         # Get condition_channels and num_output_videos from pipeline config
         condition_channels = pipeline_config.get("condition_channels", 16)
         num_output_videos = pipeline_config.get("num_output_videos", 2)
+        expand_input_channels = pipeline_config.get("expand_input_channels", False)
+        use_same_noise = pipeline_config.get("use_same_noise", False)
         
         pipe = CogVideoXFunStaticToVideoJointGenerationPipeline.from_pretrained(
             base_model_name_or_path=model_config_dict["base_model_name_or_path"],
@@ -970,6 +991,8 @@ def run_validation(
             torch_dtype=weight_dtype,
             condition_channels=condition_channels,
             num_output_videos=num_output_videos,
+            expand_input_channels=expand_input_channels,
+            use_same_noise=use_same_noise,
         )
     else:
         raise ValueError(f"Unsupported pipeline type: {pipeline_config['type']}")
@@ -2008,7 +2031,9 @@ def setup_pipeline_from_config(config: Dict[str, Any]):
         # Get condition_channels and num_output_videos from pipeline config
         condition_channels = pipeline_config.get("condition_channels", 16)
         num_output_videos = pipeline_config.get("num_output_videos", 2)
-        
+        expand_input_channels = pipeline_config.get("expand_input_channels", False)
+        use_same_noise = pipeline_config.get("use_same_noise", False)
+
         pipeline = CogVideoXFunStaticToVideoJointGenerationPipeline.from_pretrained(
             pretrained_model_name_or_path=None,  # Always start from base model
             base_model_name_or_path=model_path,
@@ -2017,6 +2042,8 @@ def setup_pipeline_from_config(config: Dict[str, Any]):
             variant=model_config.get("variant"),
             condition_channels=condition_channels,
             num_output_videos=num_output_videos,
+            expand_input_channels=expand_input_channels,
+            use_same_noise=use_same_noise,
         )
     else:
         raise ValueError(f"Unsupported pipeline type: {pipeline_type}")
@@ -2422,6 +2449,11 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
                                 output_dir,
                                 transformer_lora_layers=transformer_lora_layers,
                             )
+                        elif pipeline_type == "cogvideox_fun_static_to_video_joint_generation":
+                            CogVideoXFunStaticToVideoJointGenerationPipeline.save_lora_weights(
+                                output_dir,
+                                transformer_lora_layers=transformer_lora_layers,
+                            )
                         elif pipeline_type == "cogvideox_static_to_video_pose_concat":
                             CogVideoXStaticToVideoPoseConcatPipeline.save_lora_weights(
                                 output_dir,
@@ -2658,6 +2690,24 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
                 condition_channels=condition_channels,
                 subfolder="transformer",
             )
+        elif pipeline_type == "cogvideox_fun_static_to_video_joint_generation":
+            # For VideoX-Fun JointGenerationPipeline, use joint generation transformer
+            from training.cogvideox_static_pose.cogvideox_fun_transformer_with_conditions import (
+                CogVideoXFunTransformer3DModelWithJointGeneration,
+            )
+
+            condition_channels = config["pipeline"].get("condition_channels", 16)
+            num_output_videos = config["pipeline"].get("num_output_videos", 2)
+            expand_input_channels = config["pipeline"].get("expand_input_channels", False)
+
+            transformer_ = CogVideoXFunTransformer3DModelWithJointGeneration.from_pretrained(
+                pretrained_model_name_or_path=None,  # Always start from base model
+                base_model_name_or_path=config["model"]["base_model_name_or_path"],
+                condition_channels=condition_channels,
+                num_output_videos=num_output_videos,
+                expand_input_channels=expand_input_channels,
+                subfolder="transformer",
+            )
         elif pipeline_type == "cogvideox_static_to_video_pose_concat":
             # For static-to-video pose concat, use concat transformer
             condition_channels = concat_config.get("condition_channels", 16)
@@ -2748,6 +2798,8 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
                 lora_state_dict = CogVideoXFunStaticToVideoPipeline.lora_state_dict(input_dir)
             elif pipeline_type == "cogvideox_fun_static_to_video_pose_cond_token":
                 lora_state_dict = CogVideoXFunStaticToVideoPoseTokenPipeline.lora_state_dict(input_dir)
+            elif pipeline_type == "cogvideox_fun_static_to_video_joint_generation":
+                lora_state_dict = CogVideoXFunStaticToVideoJointGenerationPipeline.lora_state_dict(input_dir)
             elif pipeline_type == "cogvideox_static_to_video_pose_concat":
                 lora_state_dict = CogVideoXStaticToVideoPoseConcatPipeline.lora_state_dict(input_dir)
             elif pipeline_type == "cogvideox_static_to_video_cross_pose_adapter":
@@ -2912,6 +2964,22 @@ def create_save_hooks(accelerator, transformer, config: Dict[str, Any]):
                 # For VideoX-Fun static-to-video, use VideoX-Fun transformer
                 from training.cogvideox_static_pose.cogvideox_fun_transformer_with_conditions import CogVideoXFunTransformer3DModel
                 load_model = CogVideoXFunTransformer3DModel.from_pretrained(os.path.join(input_dir, "transformer"))
+            elif pipeline_type == "cogvideox_fun_static_to_video_joint_generation":
+                from training.cogvideox_static_pose.cogvideox_fun_transformer_with_conditions import (
+                    CogVideoXFunTransformer3DModelWithJointGeneration,
+                )
+
+                condition_channels = config["pipeline"].get("condition_channels", 16)
+                num_output_videos = config["pipeline"].get("num_output_videos", 2)
+                expand_input_channels = config["pipeline"].get("expand_input_channels", False)
+                load_model = CogVideoXFunTransformer3DModelWithJointGeneration.from_pretrained(
+                    pretrained_model_name_or_path=input_dir,
+                    subfolder="transformer",
+                    base_model_name_or_path=config["model"]["base_model_name_or_path"],
+                    condition_channels=condition_channels,
+                    num_output_videos=num_output_videos,
+                    expand_input_channels=expand_input_channels,
+                )
             elif pipeline_type == "cogvideox_fun_static_to_video_pose_concat":
                 # For VideoX-Fun static-to-video pose concat, use concat transformer
                 from training.cogvideox_static_pose.cogvideox_fun_transformer_with_conditions import CogVideoXFunTransformer3DModelWithConcat
@@ -3082,8 +3150,8 @@ def _process_condition_video(condition_video, vae, vae_scaling_factor, device, w
         return condition_video.to(device=device, dtype=weight_dtype)
 
 
-def _process_condition_videos(hand_videos, static_videos, smpl_pos_map, vae, vae_scaling_factor, device, weight_dtype, load_tensors, split_hands=False):
-    """Process condition videos (hand, static, and smpl_pos_map) individually based on their type."""
+def _process_condition_videos(hand_videos, static_videos, smpl_pos_map, vae, vae_scaling_factor, device, weight_dtype, load_tensors, split_hands=False, object_videos=None):
+    """Process condition videos (hand, static, object, and smpl_pos_map) individually based on their type."""
     
     # Process hand videos
     if hand_videos is not None:
@@ -3162,6 +3230,28 @@ def _process_condition_videos(hand_videos, static_videos, smpl_pos_map, vae, vae
     else:
         static_videos_latents = None
     
+    # Process object videos (same logic as static videos)
+    if object_videos is not None:
+        object_videos = object_videos.to(device=device, dtype=vae.dtype)
+        # Determine if this is raw video or latents based on channel count
+        batch_size, channels, frames, height, width = object_videos.shape
+        
+        if channels <= 3:  # Raw video (3 for RGB)
+            # Raw video needs encoding
+            with torch.no_grad():
+                object_latent = vae.encode(object_videos)[0]
+            object_videos_latents = object_latent.sample() * vae_scaling_factor
+            object_videos_latents = object_videos_latents.permute(0, 2, 1, 3, 4)  # [B, F, C, H, W]
+        else:
+            # Already latents (high channel count), need to sample from distribution
+            object_videos = object_videos.to(device=device, dtype=weight_dtype)
+            object_latent_dist = DiagonalGaussianDistribution(object_videos)
+            object_videos_latents = object_latent_dist.sample() * vae_scaling_factor
+            object_videos_latents = object_videos_latents.permute(0, 2, 1, 3, 4)  # [B, F, C, H, W]
+            object_videos_latents = object_videos_latents.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
+    else:
+        object_videos_latents = None
+    
     # Process SMPL pos map
     if smpl_pos_map is not None:
         # SMPL pos map is already compressed: [B, T', C*4, H/8, W/8] if compress_smpl_pos_map_temporal=True
@@ -3177,7 +3267,7 @@ def _process_condition_videos(hand_videos, static_videos, smpl_pos_map, vae, vae
     else:
         smpl_pos_map_latents = None
     
-    return hand_videos_latents, static_videos_latents, smpl_pos_map_latents
+    return hand_videos_latents, static_videos_latents, smpl_pos_map_latents, object_videos_latents
 
 
 def _apply_condition_flags(hand_videos, static_videos, conditions_config):
@@ -3397,6 +3487,8 @@ def main():
                        help="Test dataloader only without training")
     parser.add_argument("--test_dataloader_samples", type=int, default=10000000,
                        help="Number of samples to test in dataloader test mode")
+    parser.add_argument("--save_initial_checkpoints", action="store_true",
+                       help="Save initial checkpoints")
     args = parser.parse_args()
     
     # Load configuration
@@ -3710,6 +3802,7 @@ def main():
             "images": stack_or_none("image"),
             "hand_videos": stack_or_none("hand_videos"),
             "static_videos": stack_or_none("static_videos"),
+            "object_videos": stack_or_none("object_videos"),
             "smpl_pos_map": stack_or_none("smpl_pos_map"),
             "raymaps": stack_or_none("raymap"),
             "image_goal": stack_or_none("image_goal"),
@@ -4024,6 +4117,22 @@ def main():
                     first_epoch = global_step // num_update_steps_per_epoch
     else:
         initial_global_step = 0
+
+    # save initial checkpoints
+    print(f"💾 Saving initial checkpoint: {args.save_initial_checkpoints}")
+    if args.save_initial_checkpoints:
+        if accelerator.is_main_process or accelerator.distributed_type == DistributedType.DEEPSPEED:
+            save_path = os.path.join(experiment_config["output_dir"], f"checkpoint-{initial_global_step}")
+            logger.info(f"💾 Saving initial checkpoint to {save_path}")
+
+            if os.path.exists(save_path):
+                shutil.rmtree(save_path)
+
+            # Use save_state for full checkpoint saving (save_model_hook handles LoRA vs full model logic)
+            accelerator.save_state(save_path)
+            logger.info(f"✅ Saved initial state to {save_path}")
+
+        accelerator.wait_for_everyone()
     
     # Initialize dataset's global_step for conditional i2v training
     if hasattr(train_dataset, 'set_global_step'):
@@ -4167,6 +4276,11 @@ def main():
 
     # Training loop - epoch based (like original CogVideoX)
     transformer.train()
+    
+    # Record training start time for time-based checkpoint saving
+    training_start_time = time.time()
+    time_based_checkpoint_saved = False  # Track if time-based checkpoint has been saved
+    TIME_LIMIT_SECONDS = 47 * 3600 + 45 * 60  # 47 hours 45 minutes
 
     for epoch in range(first_epoch, num_epochs):
         for step, batch in enumerate(train_dataloader):
@@ -4252,6 +4366,19 @@ def main():
                     else:
                         static_videos_latents = None
                     
+                    # Process object videos (already latents, same as static videos)
+                    object_videos = batch.get("object_videos")
+                    if object_videos is not None:
+                        object_videos = object_videos.to(device=accelerator.device, dtype=weight_dtype)
+                        # Already latents: [B, C, F, H, W] format (distribution parameters)
+                        # Sample from distribution (same as _process_condition_videos)
+                        object_latent_dist = DiagonalGaussianDistribution(object_videos)
+                        object_videos_latents = object_latent_dist.sample() * VAE_SCALING_FACTOR
+                        object_videos_latents = object_videos_latents.permute(0, 2, 1, 3, 4)  # [B, F, C, H, W]
+                        object_videos_latents = object_videos_latents.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
+                    else:
+                        object_videos_latents = None
+                    
                     # Process SMPL pos map (already processed)
                     if smpl_pos_map is not None:
                         smpl_pos_map_latents = smpl_pos_map.to(device=accelerator.device, dtype=weight_dtype)
@@ -4262,9 +4389,10 @@ def main():
                         smpl_pos_map_latents = None
                 else:
                     # When load_tensors=False, VAE is available for encoding
-                    hand_videos_latents, static_videos_latents, smpl_pos_map_latents = _process_condition_videos(
+                    object_videos = batch.get("object_videos")
+                    hand_videos_latents, static_videos_latents, smpl_pos_map_latents, object_videos_latents = _process_condition_videos(
                         hand_videos, static_videos, smpl_pos_map, vae, VAE_SCALING_FACTOR, 
-                        accelerator.device, weight_dtype, load_tensors, split_hands
+                        accelerator.device, weight_dtype, load_tensors, split_hands, object_videos
                     )
                 
                 # Apply hand dropout for classifier-free guidance training (helps prevent color drift)
@@ -4309,10 +4437,48 @@ def main():
                 videos = latent_dist.sample() * VAE_SCALING_FACTOR
                 videos = videos.permute(0, 2, 1, 3, 4)  # [B, F, C, H, W]
                 videos = videos.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
-                if pipeline_config["type"] == "cogvideox_fun_static_to_video_joint_generation":
-                    model_input = torch.cat([videos, static_videos_latents], dim=2)
+
+                # Select training target latents (default: interaction videos).
+                # For non-joint-generation pipelines, allow training the model to generate object videos instead,
+                # while keeping the same conditioning inputs.
+                output_type = pipeline_config.get("output_type", "interaction")
+                if pipeline_config["type"] != "cogvideox_fun_static_to_video_joint_generation":
+                    if output_type == "object":
+                        if object_videos_latents is None:
+                            raise ValueError(
+                                "pipeline.output_type='object' requires object_videos_latents, but it is None. "
+                                "Ensure the dataset provides object videos (batch key 'object_videos') and that they "
+                                "are loaded/encoded into `object_videos_latents`."
+                            )
+                        target_videos_latents = object_videos_latents
+                    else:
+                        # Default behavior: generate interaction videos
+                        target_videos_latents = videos
                 else:
-                    model_input = videos
+                    # Joint generation pipeline handles its own target logic; keep default.
+                    target_videos_latents = videos
+                
+                # For joint generation with expand_input_channels, determine which latents to concatenate
+                if pipeline_config["type"] == "cogvideox_fun_static_to_video_joint_generation" \
+                     and pipeline_config.get("expand_input_channels", False):
+                    # Get joint_target from config: "static", "object", or None
+                    joint_target = pipeline_config.get("joint_target", None)
+                    joint_target_latents = None
+                    if joint_target == "static":
+                        joint_target_latents = static_videos_latents
+                    elif joint_target == "object":
+                        joint_target_latents = object_videos_latents
+
+                    if joint_target_latents is None:
+                        joint_target_latents = torch.randn_like(videos)
+                    
+                    # Only concatenate if joint_target_latents is available
+                    if joint_target_latents is not None:
+                        model_input = torch.cat([videos, joint_target_latents], dim=2)
+                    else:
+                        model_input = target_videos_latents
+                else:
+                    model_input = target_videos_latents
 
                 # Use already processed condition videos from _process_condition_videos
                 # Note: hand_dropout is already applied to hand_videos_latents above
@@ -4366,7 +4532,20 @@ def main():
                             logs["prompt_dropout_count"] = num_dropped
 
                 # Sample noise that will be added to the latents
-                noise = torch.randn_like(model_input)
+                # For expand_input_channels=True with joint generation, need separate noise for videos and joint_target
+                if pipeline_config["type"] == "cogvideox_fun_static_to_video_joint_generation" \
+                     and pipeline_config.get("expand_input_channels", False) \
+                     and joint_target_latents is not None:
+                    # Generate noise for videos and joint_target separately
+                    if pipeline_config.get("use_same_noise", False):
+                        noise = torch.randn_like(videos)
+                        joint_noise = noise
+                    else:
+                        noise = torch.randn_like(videos)
+                        joint_noise = torch.randn_like(joint_target_latents)
+                else:
+                    noise = torch.randn_like(model_input)
+                
                 batch_size, num_frames, num_channels, height, width = model_input.shape
 
                 # Sample a random timestep for each image
@@ -4398,7 +4577,16 @@ def main():
 
                 # Add noise to the model input according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
-                noisy_model_input = scheduler.add_noise(model_input, noise, timesteps)
+                # For expand_input_channels=True with joint generation, add noise to each part separately
+                if pipeline_config["type"] == "cogvideox_fun_static_to_video_joint_generation" \
+                     and pipeline_config.get("expand_input_channels", False) \
+                     and joint_target_latents is not None:
+                    # Add noise to videos and joint_target_latents separately
+                    noisy_videos = scheduler.add_noise(videos, noise, timesteps)
+                    noisy_joint = scheduler.add_noise(joint_target_latents, joint_noise, timesteps)
+                    noisy_model_input = torch.cat([noisy_videos, noisy_joint], dim=2)
+                else:
+                    noisy_model_input = scheduler.add_noise(model_input, noise, timesteps)
 
                 # Prepare condition latents based on pipeline type
                 if pipeline_config["type"] == "cogvideox_i2v":
@@ -4887,13 +5075,54 @@ def main():
                         image_rotary_emb=image_rotary_emb,
                         return_dict=False,
                     )[0]
-                        
 
-                target = model_input
-                noisy_target = noisy_model_input
+                joint_target_latents = None        
+                if pipeline_config["type"] == "cogvideox_fun_static_to_video_joint_generation":
+                    # Get joint_target from config: "static", "object", or None
+                    joint_target = pipeline_config.get("joint_target", None)
+                    # Determine which latents to use for joint generation
+                    if joint_target == "static":
+                        joint_target_latents = static_videos_latents
+                    elif joint_target == "object":
+                        joint_target_latents = object_videos_latents
+                    else:
+                        joint_target_latents = None
+                    
+                    # If joint_target is specified and latents are available, use joint generation
+                    if joint_target_latents is not None:
+                        if pipeline_config.get("expand_input_channels", False):
+                            # expand_input_channels=True: target and noisy_target already set correctly above
+                            target = model_input
+                            noisy_target = noisy_model_input
+                        else:
+                            # expand_input_channels=False: concatenate joint_target_latents to model_input
+                            target = torch.cat([model_input, joint_target_latents], dim=2)
+                            # Joint target video noise can be shared with the main video noise
+                            if pipeline_config.get("use_same_noise", False):
+                                joint_noise = noise
+                            else:
+                                joint_noise = torch.randn_like(joint_target_latents)
+                            noise_both = torch.cat([noise, joint_noise], dim=2)
+                            noisy_target = scheduler.add_noise(target, noise_both, timesteps)
+                    else:
+                        # Joint target not specified or latents not available: use single video generation
+                        target_single = model_input[:, :, :num_channels, :, :]
+                        noisy_target_single = noisy_model_input[:, :, :num_channels, :, :]
+                        target = target_single
+                        noisy_target = noisy_target_single
+                else:
+                    # For non-joint generation, use model_input as target
+                    target = model_input
+                    noisy_target = noisy_model_input
                 
                 # Get velocity prediction
-                model_pred = scheduler.get_velocity(model_output, noisy_target, timesteps)
+                if pipeline_config["type"] == "cogvideox_fun_static_to_video_joint_generation" \
+                    and joint_target_latents is None:
+                    # Joint target not specified or latents not available: use single video generation
+                    model_output_single = model_output[:, :, :num_channels, :, :]
+                    model_pred = scheduler.get_velocity(model_output_single, noisy_target, timesteps)
+                else:
+                    model_pred = scheduler.get_velocity(model_output, noisy_target, timesteps)
                 
                 # Compute weights
                 weights = 1 / (1 - alphas_cumprod[timesteps])
@@ -5005,8 +5234,21 @@ def main():
                 validation_steps = data_config.get("validation_steps", 500)
                 init_validation_steps = data_config.get("init_validation_steps", 100)
                 max_validation_steps = data_config.get("max_validation_steps", validation_steps * 2)
-                if global_step % checkpointing_steps == 0:
+                
+                # Check time-based checkpoint saving (47 hours 45 minutes)
+                elapsed_time = time.time() - training_start_time
+                should_save_time_based_checkpoint = (
+                    not time_based_checkpoint_saved 
+                    and elapsed_time >= TIME_LIMIT_SECONDS
+                )
+                
+                if should_save_time_based_checkpoint or global_step % checkpointing_steps == 0:
                     if accelerator.is_main_process or accelerator.distributed_type == DistributedType.DEEPSPEED:
+                        
+                        # Log checkpoint reason
+                        if should_save_time_based_checkpoint:
+                            elapsed_hours = elapsed_time / 3600
+                            logger.info(f"⏰ Time-based checkpoint trigger: {elapsed_hours:.2f} hours elapsed (limit: 47.75 hours)")
                         
                         # Check if we need to remove old checkpoints
                         if training_config.get("custom_settings", {}).get("checkpoints_total_limit") is not None:
@@ -5031,10 +5273,17 @@ def main():
                         
                         # Save checkpoint with memory optimization
                         try:
+                            checkpoint_start_time = time.time()
                             logger.info(f"💾 Saving checkpoint to {save_path}")
                             # Use save_state for full checkpoint saving (save_model_hook handles LoRA vs full model logic)
                             accelerator.save_state(save_path)
-                            logger.info(f"✅ Saved state to {save_path}")
+                            checkpoint_elapsed = time.time() - checkpoint_start_time
+                            logger.info(f"✅ Saved state to {save_path} (took {checkpoint_elapsed:.2f} seconds)")
+                            
+                            # Mark time-based checkpoint as saved if this was a time-based save
+                            if should_save_time_based_checkpoint:
+                                time_based_checkpoint_saved = True
+                                logger.info(f"⏰ Time-based checkpoint saved at step {global_step} (elapsed: {elapsed_time/3600:.2f} hours)")
                         except RuntimeError as e:
                             if "out of memory" in str(e).lower():
                                 logger.warning(f"⚠️ OOM during checkpoint save, retrying with CPU offload...")
