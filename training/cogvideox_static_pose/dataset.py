@@ -404,7 +404,7 @@ class VideoDatasetWithConditions(VideoDataset):
     Extended VideoDataset that supports additional condition videos:
     - hand_videos: Egocentric hand mesh videos (automatically derived from main video paths)
     - static_videos: Static scene videos (automatically derived from main video paths)
-    - videos_object: Object videos (automatically derived from main video paths)
+    - videos_object: Object videos (loaded only when load_object_video=True)
     - raymaps: Camera ray maps for 3D scene understanding
     - image_goal_latents: Goal image latents for navigation tasks
     """
@@ -433,6 +433,7 @@ class VideoDatasetWithConditions(VideoDataset):
         load_raymaps: bool = False,
         load_image_goal: bool = False,
         load_hand_motions: bool = False,
+        load_object_video: bool = False,
         load_raw_videos_for_pixel_loss: bool = False,
         prompt_subdir: str = "prompts",
         prompt_embeds_subdir: str = "prompt_embeds",
@@ -440,10 +441,12 @@ class VideoDatasetWithConditions(VideoDataset):
         hand_video_latents_subdir: str = "hand_video_latents",
         start_i2v_training_iter: Optional[int] = None,
         warped_videos_prob: float = 0.0,
+        cond_mode: str = "s2v",
     ) -> None:
         # Store dataset_file_i2v and I2V parameters before calling parent
         self.dataset_file_i2v = dataset_file_i2v
         self.start_i2v_training_iter = start_i2v_training_iter
+        self.cond_mode = cond_mode
         self.warped_videos_prob = warped_videos_prob
         self._current_global_step = 0  # Will be updated by training script
         
@@ -481,6 +484,7 @@ class VideoDatasetWithConditions(VideoDataset):
         self.load_raymaps = load_raymaps
         self.load_image_goal = load_image_goal
         self.load_hand_motions = load_hand_motions
+        self.load_object_video = load_object_video
         self.load_raw_videos_for_pixel_loss = load_raw_videos_for_pixel_loss
         self.hand_video_subdir = hand_video_subdir
         self.hand_video_latents_subdir = hand_video_latents_subdir
@@ -505,8 +509,8 @@ class VideoDatasetWithConditions(VideoDataset):
         
         self.static_video_paths = self._derive_condition_video_paths("videos_static")
         
-        # Derive videos_object paths
-        self.videos_object_paths = self._derive_condition_video_paths("videos_object")
+        # Derive videos_object paths only when load_object_video is True
+        self.videos_object_paths = self._derive_condition_video_paths("videos_object") if load_object_video else None
         
         # Derive warped videos paths
         self.warped_video_paths = self._derive_condition_video_paths("warped_videos")
@@ -554,12 +558,13 @@ class VideoDatasetWithConditions(VideoDataset):
                     f"Some static video files are missing. First few missing files: {missing_static_videos[:5]}"
                 )
             
-            # Validate videos_object if they exist (optional, so just warn)
-            if any(not path.is_file() for path in self.videos_object_paths):
-                missing_videos_object = [path for path in self.videos_object_paths if not path.is_file()]
-                logger.warning(
-                    f"Some videos_object files are missing. First few missing files: {missing_videos_object[:5]}"
-                )
+            # Validate videos_object if load_object_video and paths exist (optional, so just warn)
+            if self.load_object_video and self.videos_object_paths is not None:
+                if any(not path.is_file() for path in self.videos_object_paths):
+                    missing_videos_object = [path for path in self.videos_object_paths if not path.is_file()]
+                    logger.warning(
+                        f"Some videos_object files are missing. First few missing files: {missing_videos_object[:5]}"
+                    )
             
             # Validate warped videos if they exist (optional, so just warn)
             if any(not path.is_file() for path in self.warped_video_paths):
@@ -724,20 +729,23 @@ class VideoDatasetWithConditions(VideoDataset):
                 main_data["hand_videos"] = None
             
             try:
-                static_video_latents = self._load_condition_video_latents_or_encode(self.static_video_paths[index], "static_video_latents")
+                static_latents_folder = "static_image_latents" if self.cond_mode == "i2v" else "static_video_latents"
+                static_video_latents = self._load_condition_video_latents_or_encode(self.static_video_paths[index], static_latents_folder)
                 main_data["static_videos"] = static_video_latents
             except Exception as e:
                 logger.warning(f"Failed to load static video latents for index {index}: {e}")
                 main_data["static_videos"] = None
             
-            try:
-                object_video_latents = self._load_condition_video_latents_or_encode(self.videos_object_paths[index], "object_video_latents")
-                main_data["object_videos"] = object_video_latents
-            except Exception as e:
-                # Only log warning for non-taste_rob datasets (taste_rob doesn't have videos_object)
-                current_dataset_type = self.dataset_type[index] if hasattr(self, 'dataset_type') and index < len(self.dataset_type) else "unknown"
-                if current_dataset_type != "taste_rob":
-                    logger.warning(f"Failed to load object video latents for index {index}: {e}")
+            if self.load_object_video and self.videos_object_paths is not None:
+                try:
+                    object_video_latents = self._load_condition_video_latents_or_encode(self.videos_object_paths[index], "object_video_latents")
+                    main_data["object_videos"] = object_video_latents
+                except Exception as e:
+                    current_dataset_type = self.dataset_type[index] if hasattr(self, 'dataset_type') and index < len(self.dataset_type) else "unknown"
+                    if current_dataset_type != "taste_rob":
+                        logger.warning(f"Failed to load object video latents for index {index}: {e}")
+                    main_data["object_videos"] = None
+            else:
                 main_data["object_videos"] = None
             
             # Handle warped_videos and masks if this sample is from i2v dataset
@@ -875,12 +883,23 @@ class VideoDatasetWithConditions(VideoDataset):
             # Load raymaps if enabled
             if self.load_raymaps:
                 try:
-                    name = self.video_paths[index].stem
-                    raymap = torch.load(
-                        self.video_paths[index].parent.parent / "raymaps" / f"{name}.pt",
-                        map_location="cpu",
-                        weights_only=True
-                    )
+                    current_dataset_type = self.dataset_type[index] if hasattr(self, 'dataset_type') and index < len(self.dataset_type) else "unknown"
+                    
+                    if current_dataset_type == "taste_rob":
+                        # Use fixed raymap for taste_rob (fixed camera)
+                        fixed_raymap_path = Path("data/taste_rob/double_resized/cam_params/fixed_raymap.npz")
+                        if not fixed_raymap_path.exists():
+                            # Try relative to data_root if data_root is taste_rob directory
+                            fixed_raymap_path = self.data_root / "cam_params" / "fixed_raymap.npz"
+                        raymap = np.load(fixed_raymap_path)['raymap']
+                    else:
+                        # Load per-video raymap for other datasets
+                        name = self.video_paths[index].stem
+                        raymap = np.load(
+                            self.data_root / "raymaps_new" / f"{name}.npz",
+                        )['raymap']
+                    
+                    raymap = torch.tensor(raymap, dtype=torch.float32)
                     main_data["raymap"] = raymap
                 except Exception as e:
                     logger.warning(f"Failed to load raymap for index {index}: {e}")
@@ -936,14 +955,16 @@ class VideoDatasetWithConditions(VideoDataset):
                 logger.warning(f"Failed to load static video for index {index}: {e}")
                 main_data["static_videos"] = None
             
-            try:
-                _, videos_object, _ = self._preprocess_video(self.videos_object_paths[index])
-                main_data["object_videos"] = videos_object
-            except Exception as e:
-                # Only log warning for non-taste_rob datasets (taste_rob doesn't have videos_object)
-                current_dataset_type = self.dataset_type[index] if hasattr(self, 'dataset_type') and index < len(self.dataset_type) else "unknown"
-                if current_dataset_type != "taste_rob":
-                    logger.warning(f"Failed to load videos_object for index {index}: {e}")
+            if self.load_object_video and self.videos_object_paths is not None:
+                try:
+                    _, videos_object, _ = self._preprocess_video(self.videos_object_paths[index])
+                    main_data["object_videos"] = videos_object
+                except Exception as e:
+                    current_dataset_type = self.dataset_type[index] if hasattr(self, 'dataset_type') and index < len(self.dataset_type) else "unknown"
+                    if current_dataset_type != "taste_rob":
+                        logger.warning(f"Failed to load videos_object for index {index}: {e}")
+                    main_data["object_videos"] = None
+            else:
                 main_data["object_videos"] = None
             
             # Handle warped_videos and masks if this sample is from i2v dataset (raw mode)
@@ -1014,7 +1035,7 @@ class VideoDatasetWithConditions(VideoDataset):
             if self.load_raymaps:
                 try:
                     name = self.video_paths[index].stem
-                    raymap = np.load(self.data_root / "raymaps" / f"{name}.npz")['raymap']
+                    raymap = np.load(self.data_root / "raymaps_new" / f"{name}.npz")['raymap']
                     main_data["raymap"] = torch.tensor(raymap, dtype=torch.float32)
                     
                     # Also load raymap_abs if available
@@ -1488,6 +1509,7 @@ class VideoDatasetWithHumanMotions(VideoDatasetWithConditions):
         vae_scale_factor_spatial: int = 8,
         load_raymaps: bool = False,
         load_image_goal: bool = False,
+        load_object_video: bool = False,
         load_raw_videos_for_pixel_loss: bool = False,
         prompt_subdir: str = "prompts",
         prompt_embeds_subdir: str = "prompt_embeds",
@@ -1495,6 +1517,7 @@ class VideoDatasetWithHumanMotions(VideoDatasetWithConditions):
         hand_video_latents_subdir: str = "hand_video_latents",
         start_i2v_training_iter: Optional[int] = None,
         warped_videos_prob: float = 0.0,
+        cond_mode: str = "s2v",
     ) -> None:
         super().__init__(
             data_root=data_root,
@@ -1519,6 +1542,7 @@ class VideoDatasetWithHumanMotions(VideoDatasetWithConditions):
             load_raymaps=load_raymaps,
             load_image_goal=load_image_goal,
             load_hand_motions=True,
+            load_object_video=load_object_video,
             load_raw_videos_for_pixel_loss=load_raw_videos_for_pixel_loss,
             prompt_subdir=prompt_subdir,
             prompt_embeds_subdir=prompt_embeds_subdir,
@@ -1526,6 +1550,7 @@ class VideoDatasetWithHumanMotions(VideoDatasetWithConditions):
             hand_video_latents_subdir=hand_video_latents_subdir,
             start_i2v_training_iter=start_i2v_training_iter,
             warped_videos_prob=warped_videos_prob,
+            cond_mode=cond_mode,
         )
 
 

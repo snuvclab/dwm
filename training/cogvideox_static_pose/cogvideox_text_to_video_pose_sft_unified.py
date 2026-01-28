@@ -145,6 +145,8 @@ def log_validation_with_dataset(
         f"Running validation with dataset... \n Generating video for: {validation_video_path}"
     )
 
+    cond_mode = config.get("training", {}).get("cond_mode", "s2v")
+
     pipe = pipe.to(accelerator.device)
 
     # run inference
@@ -311,11 +313,8 @@ def log_validation_with_dataset(
         
         # Load raymap if provided
         if validation_raymap_path and os.path.exists(validation_raymap_path):
-            raymap = torch.load(validation_raymap_path, map_location="cpu", weights_only=True)
-            # raymap is [F, C, H, W] - convert to [1, F, C, H, W]
-            if raymap.ndim == 4:
-                raymap = raymap.unsqueeze(0)  # Add batch dimension
-            raymap = raymap.numpy()
+            raymap_npz = np.load(validation_raymap_path)['raymap']
+            raymap = raymap_npz[None]  # Add batch dimension
         else:
             raymap = None
 
@@ -486,6 +485,10 @@ def log_validation_with_dataset(
         # Concat/Adapter pipelines use video latents
         pipeline_args["hand_videos"] = hand_video
         pipeline_args["static_videos"] = static_video
+
+    if cond_mode == "i2v":
+        pipeline_args["mask_video"] = np.zeros_like(static_video[:, :1])
+        pipeline_args["mask_video"][:, :, 1:, :, :] = 255
 
     output = pipe(**pipeline_args, generator=generator)
     
@@ -1145,7 +1148,7 @@ def run_validation(
             
             # Add raymap path if needed
             if use_raymap:
-                raymap_path = video_path_obj.parent.parent / "raymaps" / f"{video_path_obj.stem}.pt"
+                raymap_path = video_path_obj.parent.parent / "raymaps_new" / f"{video_path_obj.stem}.npz"
                 validation_raymaps.append(Path(data_config["data_root"]) / raymap_path)
             else:
                 validation_raymaps.append(None)
@@ -1572,25 +1575,25 @@ def run_validation(
                         blur_strength=condition_blur_strength,
                     )
                 
-                # Mode 3: Image-to-Video (prediction mode - use first frame only)
-                print("   Mode 3: Image-to-Video / Prediction (first frame only)")
-                log_validation_with_dataset(
-                    pipe=pipe,
-                    config=config,
-                    accelerator=accelerator,
-                    validation_video_path=validation_video,
-                    validation_prompt=prompt_text,
-                    validation_hand_video_path=validation_hand_video,
-                    validation_static_video_path=None,  # Don't use static in prediction mode
-                    validation_human_motions_path=None,
-                    validation_hand_video_left_path=validation_hand_video_left,
-                    validation_hand_video_right_path=validation_hand_video_right,
-                    validation_raymap_path=validation_raymap,
-                    step=step,
-                    pipeline_type=config["pipeline"]["type"],
-                    validation_mode="image_to_video",
-                    apply_blur_to_static=False,
-                )
+                # # Mode 3: Image-to-Video (prediction mode - use first frame only)
+                # print("   Mode 3: Image-to-Video / Prediction (first frame only)")
+                # log_validation_with_dataset(
+                #     pipe=pipe,
+                #     config=config,
+                #     accelerator=accelerator,
+                #     validation_video_path=validation_video,
+                #     validation_prompt=prompt_text,
+                #     validation_hand_video_path=validation_hand_video,
+                #     validation_static_video_path=None,  # Don't use static in prediction mode
+                #     validation_human_motions_path=None,
+                #     validation_hand_video_left_path=validation_hand_video_left,
+                #     validation_hand_video_right_path=validation_hand_video_right,
+                #     validation_raymap_path=validation_raymap,
+                #     step=step,
+                #     pipeline_type=config["pipeline"]["type"],
+                #     validation_mode="image_to_video",
+                #     apply_blur_to_static=False,
+                # )
             else:
                 # For other pipelines (concat/adapter/cross), test static-to-video mode
                 print(f"🎬 Testing {config['pipeline']['type']} pipeline for {validation_video.name}")
@@ -1911,6 +1914,21 @@ def setup_pipeline_from_config(config: Dict[str, Any]):
             condition_channels=condition_channels,
             use_adapter=False,
             split_hands=split_hands,
+        )
+
+    elif pipeline_type == "cogvideox_fun_static_to_video_camera_hand_concat":
+        # raymap(24) + hand(16) = 40
+        # static handled by base model, smpl_pos_map not used
+        print("🔧 Setting up CogVideoX Fun Static-to-Video Camera + Hand Concat pipeline")
+        condition_channels = 24 + 16  # raymap + hand
+        print(f"   condition_channels: {condition_channels} (raymap:24 + hand:16)")
+        pipeline = CogVideoXFunStaticToVideoCameraHandConcatPipeline.from_pretrained(
+            pretrained_model_name_or_path=None,
+            base_model_name_or_path=model_path,
+            torch_dtype=load_dtype,
+            revision=model_config.get("revision"),
+            variant=model_config.get("variant"),
+            condition_channels=condition_channels,
         )
     
     elif pipeline_type == "cogvideox_fun_static_to_video_posmap_adapter":
@@ -3481,8 +3499,8 @@ def main():
                        help="Path to experiment YAML config file")
     parser.add_argument("--override", type=str, nargs="*",
                        help="Override config values (key=value format)")
-    parser.add_argument("--mode", type=str, choices=["debug", "slurm_test", "slurm"], default="slurm",
-                       help="Training mode: debug, slurm_test, or slurm")
+    parser.add_argument("--mode", type=str, choices=["debug", "slurm_test", "slurm", "batch"], default="slurm",
+                       help="Training mode: debug, slurm_test, slurm, or batch")
     parser.add_argument("--test_dataloader", action="store_true",
                        help="Test dataloader only without training")
     parser.add_argument("--test_dataloader_samples", type=int, default=10000000,
@@ -3556,6 +3574,12 @@ def main():
         
         experiment_config["output_dir"] = f"{base_output_dir}_slurm_{slurm_job_id}"
         print(f"📁 SLURM mode: Output directory set to {experiment_config['output_dir']}")
+    elif args.mode == "batch":
+        # Batch mode: add timestamp to output directory
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        experiment_config["output_dir"] = f"{base_output_dir}_batch_{timestamp}"
+        print(f"🚀 Batch mode: Output directory set to {experiment_config['output_dir']}")
     
     print(f"📁 Final output directory: {experiment_config['output_dir']}")
     print(f"   - Base: {base_output_dir}")
@@ -3730,6 +3754,7 @@ def main():
         "prompt_embeds_subdir": data_config.get("prompt_embeds_subdir", "prompt_embeds"),
         "hand_video_subdir": data_config.get("hand_video_subdir", "videos_hands"),
         "hand_video_latents_subdir": data_config.get("hand_video_latents_subdir", "hand_video_latents"),
+        "cond_mode": training_config.get("cond_mode", "s2v"),
     }
 
     if data_config.get("load_hand_motions", False):
@@ -3996,6 +4021,7 @@ def main():
         
         # Initialize accelerator trackers with custom config and wandb settings
         # Set wandb to offline mode for debug and slurm_test modes
+        # Disable wandb for batch mode
         wandb_init_kwargs = {
             "name": run_name,
             "entity": entity_name,
@@ -4004,6 +4030,9 @@ def main():
         if args.mode in ["debug", "slurm_test"]:
             wandb_init_kwargs["mode"] = "offline"
             print(f"🔧 WandB set to offline mode for {args.mode}")
+        elif args.mode == "batch":
+            wandb_init_kwargs["mode"] = "disabled"
+            print(f"🔧 Batch mode: WandB disabled")
         
         accelerator.init_trackers(
             project_name=project_name,
@@ -4281,6 +4310,8 @@ def main():
     training_start_time = time.time()
     time_based_checkpoint_saved = False  # Track if time-based checkpoint has been saved
     TIME_LIMIT_SECONDS = 47 * 3600 + 45 * 60  # 47 hours 45 minutes
+
+    cond_mode = training_config.get("cond_mode", "i2v")
 
     for epoch in range(first_epoch, num_epochs):
         for step, batch in enumerate(train_dataloader):
@@ -4777,30 +4808,35 @@ def main():
                     # Two modes: prediction (image + zero padding) or static-to-video (full static)
                     p_prediction = training_config.get("p_prediction", 0.5)
                     
-                    # Process images to latents if in prediction mode
-                    if images is not None and random.random() < p_prediction:
-                        # Prediction mode: image + zero padding
-                        if not load_tensors:
-                            # Encode image to latents
-                            images = images.to(accelerator.device, dtype=weight_dtype)
-                            images = images.permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
-                            with torch.no_grad():
-                                image_latent_dist = vae.encode(images).latent_dist
-                            image_latents = image_latent_dist.sample() * VAE_SCALING_FACTOR
-                            image_latents = image_latents.permute(0, 2, 1, 3, 4)  # [B, F, C, H, W]
-                            image_latents = image_latents.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
-                        else:
-                            image_latent_dist = DiagonalGaussianDistribution(images)
-                            image_latents = image_latent_dist.sample() * VAE_SCALING_FACTOR
-                            image_latents = image_latents.permute(0, 2, 1, 3, 4)  # [B, F, C, H, W]
-                            image_latents = image_latents.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
+                    # # Process images to latents if in prediction mode
+                    # if images is not None and random.random() < p_prediction:
+                    #     # Prediction mode: image + zero padding
+                    #     if not load_tensors:
+                    #         # Encode image to latents
+                    #         images = images.to(accelerator.device, dtype=weight_dtype)
+                    #         images = images.permute(0, 2, 1, 3, 4)  # [B, C, F, H, W]
+                    #         with torch.no_grad():
+                    #             image_latent_dist = vae.encode(images).latent_dist
+                    #         image_latents = image_latent_dist.sample() * VAE_SCALING_FACTOR
+                    #         image_latents = image_latents.permute(0, 2, 1, 3, 4)  # [B, F, C, H, W]
+                    #         image_latents = image_latents.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
+                    #     else:
+                    #         image_latent_dist = DiagonalGaussianDistribution(images)
+                    #         image_latents = image_latent_dist.sample() * VAE_SCALING_FACTOR
+                    #         image_latents = image_latents.permute(0, 2, 1, 3, 4)  # [B, F, C, H, W]
+                    #         image_latents = image_latents.to(memory_format=torch.contiguous_format, dtype=weight_dtype)
                         
-                        # Create visual condition: image + zero padding
-                        padding_shape = (batch_size, num_frames - 1, *image_latents.shape[2:])
-                        latent_padding = image_latents.new_zeros(padding_shape)
-                        visual_condition = torch.cat([image_latents, latent_padding], dim=1)
+                    #     # Create visual condition: image + zero padding
+                    #     padding_shape = (batch_size, num_frames - 1, *image_latents.shape[2:])
+                    #     latent_padding = image_latents.new_zeros(padding_shape)
+                    #     visual_condition = torch.cat([image_latents, latent_padding], dim=1)
                         
-                        # Mask: first frame only
+                    #     # Mask: first frame only
+                    #     mask_input = torch.zeros_like(noisy_model_input[:, :, :1])
+                    #     mask_input[:, 0:1, :] = VAE_SCALING_FACTOR
+                    if cond_mode == "i2v":
+                        static_image_latents = static_videos_latents  # if cond_mode is i2v, dataset loads static_image_latents instead of static_videos_latents
+                        visual_condition = static_image_latents
                         mask_input = torch.zeros_like(noisy_model_input[:, :, :1])
                         mask_input[:, 0:1, :] = VAE_SCALING_FACTOR
                     else:

@@ -1583,6 +1583,25 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
         
         return camera_conditions
 
+    def _build_control_latents_list(
+        self,
+        static_videos_latents,
+        hand_videos_latents,
+        smpl_pos_map_latents,
+        processed_raymap,
+        device,
+        dtype,
+    ):
+        """Build list of condition latents for concat. Override in subclasses (e.g. camera-hand) to change order."""
+        control_latents_list = []
+        if hand_videos_latents is not None:
+            control_latents_list.append(hand_videos_latents)
+        if smpl_pos_map_latents is not None:
+            control_latents_list.append(smpl_pos_map_latents)
+        if processed_raymap is not None:
+            control_latents_list.append(processed_raymap.to(device=device, dtype=dtype))
+        return control_latents_list
+
     def check_inputs(
         self,
         prompt,
@@ -1982,22 +2001,16 @@ class CogVideoXFunStaticToVideoPipeline(CogVideoXFunInpaintPipeline):
         if comfyui_progressbar and pbar is not None:
             pbar.update(1)
         
-        # Concatenate condition latents (hand_videos + smpl_pos_map + raymap)
+        # Concatenate condition latents (order via _build_control_latents_list; default: hand + smpl + raymap)
         control_latents = None
-        control_latents_list = []
-        
-        if hand_videos_latents is not None:
-            control_latents_list.append(hand_videos_latents)
-        
-        if smpl_pos_map_latents is not None:
-            control_latents_list.append(smpl_pos_map_latents)
-        
-        # Add raymap if provided (already in compressed format [B, T', 24, H/8, W/8])
-        if processed_raymap is not None:
-            # Raymap is already compressed and at correct resolution
-            # Just ensure it's on the correct device and dtype
-            raymap_for_concat = processed_raymap.to(device=device, dtype=latents.dtype)
-            control_latents_list.append(raymap_for_concat)
+        control_latents_list = self._build_control_latents_list(
+            static_videos_latents,
+            hand_videos_latents,
+            smpl_pos_map_latents,
+            processed_raymap,
+            device,
+            latents.dtype,
+        )
         
         if control_latents_list:
             # Concatenate along channel dimension: [B, F, C1, H, W] + [B, F, C2, H, W] -> [B, F, C1+C2, H, W]

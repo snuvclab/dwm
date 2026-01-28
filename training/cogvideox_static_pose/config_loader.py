@@ -99,6 +99,7 @@ class ExperimentConfigLoader:
             "cogvideox_fun_static_to_video_pose_concat",
             "cogvideox_fun_static_to_video_posmap_concat",
             "cogvideox_fun_static_to_video_raymap_pose_concat",
+            "cogvideox_fun_static_to_video_camera_hand_concat",
             "cogvideox_fun_static_to_video_posmap_adapter",
             "cogvideox_fun_static_to_video_pose_adapter",
             "cogvideox_fun_static_to_video_pose_cond_token",
