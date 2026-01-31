@@ -205,7 +205,9 @@ except Exception as e:
         print(f"Exception getting animation names for {os.path.basename(blend_file)}: {e}")
         return []
 
-def check_already_rendered(blend_file, save_path, status_report=None, script_path=None, grayscale=False, separate=False):
+def check_already_rendered(blend_file, save_path, status_report=None, script_path=None, grayscale=False, separate=False, 
+                          only_object=False, auto_split_clips=False, no_depth=False, video_output=False, 
+                          clip_length=49, clip_stride=25, frame_skip=3, static=False):
     """Check if a scene has already been rendered using status report if available.
     Returns: (is_complete, rendered_animations, missing_animations, all_animations)"""
     directory_name = os.path.basename(os.path.dirname(blend_file))
@@ -225,6 +227,9 @@ def check_already_rendered(blend_file, save_path, status_report=None, script_pat
         elif script_name in ['blender_ego_hand.py']:
             is_video_output = True
             video_type = "hands"
+        elif script_name in ['blender_ego_rgb_depth_optimized.py']:
+            # For blender_ego_rgb_depth_optimized.py, check video_output flag
+            is_video_output = video_output
     
     # Use status report if available (preferred method - no Blender overhead)
     if status_report and "rendered_scenes_details" in status_report:
@@ -377,19 +382,84 @@ def check_already_rendered(blend_file, save_path, status_report=None, script_pat
                             rendered_animations.append(item)
                 else:
                     # For frame-based output (blender_ego_rgb_depth_optimized.py)
-                    # Check if this animation folder has complete output
+                    # Handle different output modes: only-object, auto-split-clips, static, etc.
+                    if script_path and 'blender_ego_rgb_depth_optimized.py' in script_path:
+                        # Check for auto-split-clips mode (video-output + auto-split-clips)
+                        if video_output and auto_split_clips:
+                            # Determine path based on mode
+                            if static:
+                                clips_path = os.path.join(item_path, "processed2", "videos_static")
+                            elif only_object:
+                                clips_path = os.path.join(item_path, "processed2", "videos_object")
+                            else:
+                                clips_path = os.path.join(item_path, "processed2", "videos")
+                            
+                            if os.path.exists(clips_path):
+                                video_files = len([f for f in os.listdir(clips_path) if f.endswith('.mp4')])
+                                expected_videos = get_expected_video_count(blend_file, item, frame_skip=frame_skip, stride=clip_stride, clip_length=clip_length)
+                                if expected_videos is None:
+                                    expected_videos = 0
+                                if video_files >= expected_videos:
+                                    rendered_animations.append(item)
+                            continue
+                        # Check for video-output + only-object mode (single video file)
+                        elif video_output and only_object:
+                            # Check for {animation_name}_object.mp4 in output_base
+                            video_file = os.path.join(output_base, f"{item}_object.mp4")
+                            if os.path.exists(video_file) and os.path.getsize(video_file) > 10240:  # At least 10KB
+                                rendered_animations.append(item)
+                            continue
+                        # Check for only-object frame-based mode
+                        elif only_object:
+                            # Check for images_object and depth_object directories
+                            rgb_path = os.path.join(item_path, "images_object")
+                            depth_path = os.path.join(item_path, "depth_object")
+                            
+                            if not os.path.exists(rgb_path):
+                                continue
+                            
+                            rgb_files = len([f for f in os.listdir(rgb_path) if f.endswith('.png')])
+                            
+                            # Check depth only if not no_depth
+                            if no_depth:
+                                # RGB only mode
+                                expected_frames = get_animation_frame_count(blend_file, item)
+                                if expected_frames is None:
+                                    expected_frames = 0
+                                if rgb_files == expected_frames:
+                                    rendered_animations.append(item)
+                            else:
+                                # RGB + depth mode
+                                if not os.path.exists(depth_path):
+                                    continue
+                                depth_files = len([f for f in os.listdir(depth_path) if f.endswith('.exr')])
+                                expected_frames = get_animation_frame_count(blend_file, item)
+                                if expected_frames is None:
+                                    expected_frames = 0
+                                if rgb_files == expected_frames and depth_files == expected_frames:
+                                    rendered_animations.append(item)
+                            continue
+                    
+                    # Default frame-based output (blender_ego_rgb_depth_optimized.py normal mode)
                     rgb_path = os.path.join(item_path, "images")  # Updated to match Blender script
                     depth_path = os.path.join(item_path, "depth")
                     cam_params_path = os.path.join(item_path, "cam_params")
                     
                     # Check if all required folders exist
-                    if not all(os.path.exists(p) for p in [rgb_path, depth_path, cam_params_path]):
+                    required_paths = [rgb_path]
+                    if not no_depth:
+                        required_paths.append(depth_path)
+                    # cam_params is only saved when not only-object
+                    if not only_object:
+                        required_paths.append(cam_params_path)
+                    
+                    if not all(os.path.exists(p) for p in required_paths):
                         continue
                     
                     # Count files in each folder
                     rgb_files = len([f for f in os.listdir(rgb_path) if f.endswith('.png')])
-                    depth_files = len([f for f in os.listdir(depth_path) if f.endswith('.exr')])
-                    cam_files = len([f for f in os.listdir(cam_params_path) if f.startswith('cam')])
+                    depth_files = len([f for f in os.listdir(depth_path) if f.endswith('.exr')]) if not no_depth else 0
+                    cam_files = len([f for f in os.listdir(cam_params_path) if f.startswith('cam')]) if not only_object else 0
                     
                     # Get expected frame count for this animation
                     expected_frames = get_animation_frame_count(blend_file, item)
@@ -397,9 +467,11 @@ def check_already_rendered(blend_file, save_path, status_report=None, script_pat
                         expected_frames = 0
                     
                     # Consider complete only if all file counts match expected frames
-                    if (rgb_files == expected_frames and 
-                        depth_files == expected_frames and 
-                        cam_files == expected_frames):
+                    rgb_ok = rgb_files == expected_frames
+                    depth_ok = (no_depth or depth_files == expected_frames)
+                    cam_ok = (only_object or cam_files == expected_frames)
+                    
+                    if rgb_ok and depth_ok and cam_ok:
                         rendered_animations.append(item)
         
         # Calculate missing animations
@@ -448,8 +520,16 @@ def main():
     parser.add_argument("--fov", type=float, default=90.0, help="Camera field of view in degrees (default: 90)")
     parser.add_argument("--width", type=int, default=720, help="Render width in pixels (default: 720)")
     parser.add_argument("--height", type=int, default=480, help="Render height in pixels (default: 480)")
-    parser.add_argument("--samples", type=int, default=32, help="Cycles samples for rendering (default: 16) - only applies to blender_ego_rgb_depth_optimized.py")
+    parser.add_argument("--samples", type=int, default=64, help="Cycles samples for rendering (default: 16) - only applies to blender_ego_rgb_depth_optimized.py")
     parser.add_argument("--no-depth", action="store_true", help="Skip depth rendering (RGB only) - only applies to blender_ego_rgb_depth_optimized.py")
+    parser.add_argument("--only-object", action="store_true", help="Hide actor/agent and render only objects - only applies to blender_ego_rgb_depth_optimized.py")
+    parser.add_argument("--static", action="store_true", help="Freeze all object animations except camera (static scene mode) - only applies to blender_ego_rgb_depth_optimized.py")
+    parser.add_argument("--video-output", action="store_true", help="Output video directly instead of individual frames - only applies to blender_ego_rgb_depth_optimized.py")
+    parser.add_argument("--auto-split-clips", action="store_true", help="Automatically split video into clips when using --video-output - only applies to blender_ego_rgb_depth_optimized.py")
+    parser.add_argument("--direct-clips", action="store_true", help="Create clips on-the-fly as frames are rendered (faster feedback for debugging) - only applies to blender_ego_rgb_depth_optimized.py")
+    parser.add_argument("--clip-length", type=int, default=49, help="Number of frames per clip (default: 49) - only applies to blender_ego_rgb_depth_optimized.py with --auto-split-clips or --direct-clips")
+    parser.add_argument("--clip-stride", type=int, default=25, help="Frame stride between clips (default: 25) - only applies to blender_ego_rgb_depth_optimized.py with --auto-split-clips")
+    parser.add_argument("--fps", type=float, default=8.0, help="FPS for video output (default: 8.0) - only applies to blender_ego_rgb_depth_optimized.py")
     parser.add_argument("--grayscale", action="store_true", help="Render hands in grayscale (black & white) - only applies to blender_ego_hand.py")
     parser.add_argument("--save-images", action="store_true", help="Save individual images instead of creating videos - only applies to blender_ego_hand.py")
     parser.add_argument("--separate", action="store_true", help="Create separate videos for left and right hands (only works with --grayscale) - only applies to blender_ego_hand.py")
@@ -559,6 +639,18 @@ def main():
         print(f"Hand rendering resolution: {args.width}x{args.height} pixels")
     if args.no_depth and ('blender_ego_rgb_depth_optimized.py' in args.script_path or 'blender_ego_static.py' in args.script_path):
         print(f"No-depth mode: Enabled (RGB only, no depth rendering)")
+    if args.only_object and 'blender_ego_rgb_depth_optimized.py' in args.script_path:
+        print(f"Only-object mode: Enabled (hide actor, render objects only)")
+    if args.static and 'blender_ego_rgb_depth_optimized.py' in args.script_path:
+        print(f"Static mode: Enabled (freeze all animations except camera)")
+    if args.video_output and 'blender_ego_rgb_depth_optimized.py' in args.script_path:
+        print(f"Video-output mode: Enabled (output video directly instead of frames)")
+    if args.auto_split_clips and 'blender_ego_rgb_depth_optimized.py' in args.script_path:
+        print(f"Auto-split-clips mode: Enabled (clip length: {args.clip_length}, stride: {args.clip_stride})")
+    if args.direct_clips and 'blender_ego_rgb_depth_optimized.py' in args.script_path:
+        print(f"Direct-clips mode: Enabled (clip length: {args.clip_length}, stride: {args.clip_stride}) - faster feedback for debugging")
+    if 'blender_ego_rgb_depth_optimized.py' in args.script_path:
+        print(f"Video FPS: {args.fps}")
     print(f"Found {len(blend_jobs)} .blend files.")
     
     # Apply scene filtering if specified
@@ -676,7 +768,14 @@ def main():
         # Use directory_name as scene key for consistency with status report and actual output folders
         scene_name = directory_name
         display_name = directory_name  # For user-friendly display (same as scene_name in this case)
-        is_rendered, rendered_anims, missing_anims, all_anims = check_already_rendered(blend_file, args.save_path, status_report, args.script_path, args.grayscale, args.separate)
+        is_rendered, rendered_anims, missing_anims, all_anims = check_already_rendered(
+            blend_file, args.save_path, status_report, args.script_path, 
+            grayscale=args.grayscale, separate=args.separate,
+            only_object=args.only_object, auto_split_clips=args.auto_split_clips,
+            no_depth=args.no_depth, video_output=args.video_output,
+            clip_length=args.clip_length, clip_stride=args.clip_stride, frame_skip=args.frame_skip,
+            static=args.static
+        )
         
         if is_rendered:
             rendered_scenes[scene_name] = rendered_anims
@@ -803,7 +902,14 @@ def main():
                     processed_scenes.add(directory_name)
                     
                     # Check if this scene has animations
-                    _, _, _, all_anims = check_already_rendered(blend_file, args.save_path, status_report, args.script_path, args.grayscale, args.separate)
+                    _, _, _, all_anims = check_already_rendered(
+                        blend_file, args.save_path, status_report, args.script_path,
+                        grayscale=args.grayscale, separate=args.separate,
+                        only_object=args.only_object, auto_split_clips=args.auto_split_clips,
+                        no_depth=args.no_depth, video_output=args.video_output,
+                        clip_length=args.clip_length, clip_stride=args.clip_stride, frame_skip=args.frame_skip,
+                        static=args.static
+                    )
                     if not all_anims:
                         no_animations += 1
                     else:
@@ -906,7 +1012,14 @@ def main():
                 directory_name = os.path.basename(os.path.dirname(blend_file))
                 if directory_name not in rendered_scenes:
                     # Force real-time Blender query instead of using status report for accuracy
-                    _, _, missing_anims, all_anims = check_already_rendered(blend_file, args.save_path, None, args.script_path, args.grayscale, args.separate)  # Pass None to force Blender query
+                    _, _, missing_anims, all_anims = check_already_rendered(
+                        blend_file, args.save_path, None, args.script_path,
+                        grayscale=args.grayscale, separate=args.separate,
+                        only_object=args.only_object, auto_split_clips=args.auto_split_clips,
+                        no_depth=args.no_depth, video_output=args.video_output,
+                        clip_length=args.clip_length, clip_stride=args.clip_stride, frame_skip=args.frame_skip,
+                        static=args.static
+                    )  # Pass None to force Blender query
                     if all_anims:  # Scene has animations
                         actual_missing_total += len(missing_anims)
                         total_expected += len(all_anims)  # Add all animations (rendered + missing)
@@ -946,7 +1059,14 @@ def main():
                 directory_name = os.path.basename(os.path.dirname(blend_file))
                 if directory_name not in rendered_scenes:
                     # Force real-time Blender query for accuracy
-                    _, _, _, all_anims = check_already_rendered(blend_file, args.save_path, None, args.script_path, args.grayscale, args.separate)  # Pass None to force Blender query
+                    _, _, _, all_anims = check_already_rendered(
+                        blend_file, args.save_path, None, args.script_path,
+                        grayscale=args.grayscale, separate=args.separate,
+                        only_object=args.only_object, auto_split_clips=args.auto_split_clips,
+                        no_depth=args.no_depth, video_output=args.video_output,
+                        clip_length=args.clip_length, clip_stride=args.clip_stride, frame_skip=args.frame_skip,
+                        static=args.static
+                    )  # Pass None to force Blender query
                     if not all_anims:
                         scenes_with_no_anims.append(directory_name)
             
@@ -1006,7 +1126,14 @@ def main():
                 directory_name = os.path.basename(os.path.dirname(blend_file))
                 if directory_name not in rendered_scenes:
                     # Force real-time Blender query for accuracy
-                    _, _, missing_anims, all_anims = check_already_rendered(blend_file, args.save_path, None, args.script_path, args.grayscale, args.separate)  # Pass None to force Blender query
+                    _, _, missing_anims, all_anims = check_already_rendered(
+                        blend_file, args.save_path, None, args.script_path,
+                        grayscale=args.grayscale, separate=args.separate,
+                        only_object=args.only_object, auto_split_clips=args.auto_split_clips,
+                        no_depth=args.no_depth, video_output=args.video_output,
+                        clip_length=args.clip_length, clip_stride=args.clip_stride, frame_skip=args.frame_skip,
+                        static=args.static
+                    )  # Pass None to force Blender query
                     if all_anims and missing_anims:  # Scene has animations but some are missing
                         scenes_with_missing_anims += 1
                         missing_animations_total += len(missing_anims)
@@ -1169,6 +1296,34 @@ def main():
         # Add no-depth option if specified and using blender_ego_rgb_depth_optimized.py
         if args.no_depth and 'blender_ego_rgb_depth_optimized.py' in args.script_path:
             cmd.append("--no-depth")
+        
+        # Add only-object option if specified and using blender_ego_rgb_depth_optimized.py
+        if args.only_object and 'blender_ego_rgb_depth_optimized.py' in args.script_path:
+            cmd.append("--only-object")
+        
+        # Add static option if specified and using blender_ego_rgb_depth_optimized.py
+        if args.static and 'blender_ego_rgb_depth_optimized.py' in args.script_path:
+            cmd.append("--static")
+        
+        # Add video-output option if specified and using blender_ego_rgb_depth_optimized.py
+        if args.video_output and 'blender_ego_rgb_depth_optimized.py' in args.script_path:
+            cmd.append("--video-output")
+        
+        # Add auto-split-clips option if specified and using blender_ego_rgb_depth_optimized.py
+        if args.auto_split_clips and 'blender_ego_rgb_depth_optimized.py' in args.script_path:
+            cmd.append("--auto-split-clips")
+            cmd.extend(["--clip-length", str(args.clip_length)])
+            cmd.extend(["--clip-stride", str(args.clip_stride)])
+        
+        # Add direct-clips option if specified and using blender_ego_rgb_depth_optimized.py
+        if args.direct_clips and 'blender_ego_rgb_depth_optimized.py' in args.script_path:
+            cmd.append("--direct-clips")
+            cmd.extend(["--clip-length", str(args.clip_length)])
+            cmd.extend(["--clip-stride", str(args.clip_stride)])
+        
+        # Add fps option if using blender_ego_rgb_depth_optimized.py
+        if 'blender_ego_rgb_depth_optimized.py' in args.script_path:
+            cmd.extend(["--fps", str(args.fps)])
         
         # Add animation index or name for animation-based jobs
         if job.get('job_type') == 'animation':
