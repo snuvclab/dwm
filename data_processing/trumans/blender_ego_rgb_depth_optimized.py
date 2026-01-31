@@ -43,6 +43,17 @@ args = parser.parse_args(argv)
 if args.no_skip_existing:
     args.skip_existing = False
 
+# Validate static mode constraints
+if args.static:
+    if args.auto_split_clips:
+        print("ERROR: --static mode cannot be used with --auto-split-clips")
+        print("  Reason: Static mode requires each clip to freeze objects at the clip's first frame state.")
+        print("  Use --direct-clips instead for static mode.")
+        sys.exit(1)
+    if not args.video_output:
+        print("WARNING: --static mode requires --video-output. Enabling video output mode.")
+        args.video_output = True
+
 # ---------------------------
 # Paths / logging
 # ---------------------------
@@ -679,107 +690,176 @@ def render_animation_sequence(animation_index, animation_name):
             print(f"  Clips output: {clips_output_path}")
             print(f"  Frames: {render_start_frame}..{render_end_frame} (step {args.frame_skip}) -> {total_frames} frames")
             
+            # Calculate clip start frames
+            effective_stride = args.clip_stride * args.frame_skip
+            clip_start_frames = []
+            current_frame_idx = 0
+            while current_frame_idx + args.clip_length <= total_frames:
+                clip_start_frames.append(current_frame_idx)
+                current_frame_idx += args.clip_stride
+            
+            print(f"  Creating {len(clip_start_frames)} clips (effective stride: {effective_stride} frames)")
+            
             # Temporary directory for rendered frames
             import tempfile
             import shutil
             temp_frames_dir = tempfile.mkdtemp(prefix="blender_frames_")
             
             try:
-                # Static mode: setup freeze/bake before rendering
-                if args.static:
-                    # Apply animation for sampling camera poses
-                    if not apply_animation_set(animation_index):
-                        print(f"Failed to apply animation set")
-                        return
-                    # Sample all camera poses first (before freezing)
-                    all_cam_locs, all_cam_rots = sample_camera_world_transforms(camera_obj, frames_to_render)
-                    # Freeze animations and hide actor
-                    disable_animations_except_camera(camera_obj)
-                    hide_actor_from_rendering()
-                    # Bake camera keys for all frames
-                    bake_camera_keys(camera_obj, frames_to_render, all_cam_locs, all_cam_rots)
-                
-                # Render frames and create clips on-the-fly
                 render.image_settings.file_format = 'PNG'
                 render.image_settings.color_mode = 'RGBA'
                 original_filepath = render.filepath
                 
                 start_time = time.time()
-                
-                # Frame buffer: store frame paths with their indices
-                frame_buffer = []  # List of (frame_idx, frame_path)
                 clips_created = 0
-                clip_idx = 0
-                next_clip_start = 0  # Next clip should start at this frame index
                 
-                for frame_idx, frame_num in enumerate(frames_to_render):
-                    scene.frame_set(frame_num)
-                    
-                    # Render frame to temp directory
-                    frame_filepath = os.path.join(temp_frames_dir, f"frame_{frame_idx:04d}.png")
-                    render.filepath = frame_filepath
-                    bpy.ops.render.render(write_still=True)
-                    
-                    if os.path.exists(frame_filepath):
-                        frame_buffer.append((frame_idx, frame_filepath))
+                if args.static:
+                    # Static mode: process each clip individually with freeze at first frame
+                    for clip_idx, clip_start_idx in enumerate(clip_start_frames):
+                        clip_end_idx = clip_start_idx + args.clip_length - 1
+                        clip_frame_indices = list(range(clip_start_idx, clip_end_idx + 1))
+                        clip_frame_numbers = [frames_to_render[i] for i in clip_frame_indices]
                         
-                        # Check if we can create a clip starting at next_clip_start
-                        # We need clip_length frames starting from next_clip_start
-                        if frame_idx >= next_clip_start + args.clip_length - 1:
-                            # Check if we have all required frames in buffer
-                            required_frames = [(idx, path) for idx, path in frame_buffer 
-                                             if next_clip_start <= idx < next_clip_start + args.clip_length]
+                        clip_output_path = os.path.join(clips_output_path, f"{clip_idx:05d}.mp4")
+                        
+                        # Check if clip already exists
+                        if args.skip_existing and os.path.exists(clip_output_path):
+                            clip_size = os.path.getsize(clip_output_path)
+                            if clip_size > 10240:  # At least 10KB
+                                print(f"  Clip {clip_idx:05d}.mp4 already exists, skipping")
+                                clips_created += 1
+                                continue
+                        
+                        print(f"\n========== CLIP {clip_idx + 1}/{len(clip_start_frames)} ==========")
+                        print(f"  Frame indices: {clip_start_idx}-{clip_end_idx} (frames {clip_frame_numbers[0]}-{clip_frame_numbers[-1]})")
+                        
+                        # === (A) Loop start: restore clean state ===
+                        restore_animations(camera_obj)
+                        show_actor_in_rendering()
+                        
+                        # Apply animation for current clip (in dynamic state)
+                        if not apply_animation_set(animation_index):
+                            print(f"Failed to apply animation set for clip {clip_idx}")
+                            continue
+                        
+                        # === (B) Sample camera poses for this clip ===
+                        cam_locs, cam_rots = sample_camera_world_transforms(camera_obj, clip_frame_numbers)
+                        
+                        # === (C) Set scene to start frame of clip and freeze ===
+                        scene.frame_set(clip_frame_numbers[0])  # Set to first frame of clip
+                        disable_animations_except_camera(camera_obj)  # Freeze at first frame state
+                        hide_actor_from_rendering()
+                        
+                        # === (D) Bake camera keys for this clip ===
+                        bake_camera_keys(camera_obj, clip_frame_numbers, cam_locs, cam_rots)
+                        
+                        # === (E) Render frames for this clip ===
+                        clip_frames = []
+                        for frame_idx, frame_num in zip(clip_frame_indices, clip_frame_numbers):
+                            scene.frame_set(frame_num)
+                            frame_filepath = os.path.join(temp_frames_dir, f"clip_{clip_idx}_frame_{frame_idx:04d}.png")
+                            render.filepath = frame_filepath
+                            bpy.ops.render.render(write_still=True)
                             
-                            if len(required_frames) == args.clip_length:
-                                # We have all frames needed for this clip
-                                clip_output_path = os.path.join(clips_output_path, f"{clip_idx:05d}.mp4")
-                                
-                                # Check if clip already exists
-                                should_create = True
-                                if args.skip_existing and os.path.exists(clip_output_path):
-                                    clip_size = os.path.getsize(clip_output_path)
-                                    if clip_size > 10240:  # At least 10KB
-                                        print(f"  Clip {clip_idx:05d}.mp4 already exists, skipping")
-                                        should_create = False
-                                
-                                if should_create:
-                                    # Sort by frame index and get paths
-                                    required_frames.sort(key=lambda x: x[0])
-                                    clip_frames = [path for _, path in required_frames]
-                                    
-                                    # Create clip
-                                    fps = args.fps
-                                    if create_video_clip_from_frames(clip_frames, clip_output_path, fps):
-                                        clips_created += 1
-                                        print(f"  ✓ Created clip {clip_idx:05d}.mp4 (frames {next_clip_start}-{next_clip_start+args.clip_length-1})")
-                                    else:
-                                        print(f"  ✗ Failed to create clip {clip_idx:05d}.mp4")
-                                
-                                # Move to next clip
-                                clip_idx += 1
-                                next_clip_start += args.clip_stride
-                                
-                                # Clean up frames that are no longer needed (keep some buffer for overlapping clips)
-                                # Keep frames from (next_clip_start - clip_stride) to current frame_idx
-                                min_keep_idx = max(0, next_clip_start - args.clip_stride)
-                                frame_buffer = [(idx, path) for idx, path in frame_buffer if idx >= min_keep_idx]
-                    
-                    # Progress update
-                    if (frame_idx + 1) % 10 == 0 or frame_idx == len(frames_to_render) - 1:
-                        progress = (frame_idx + 1) / total_frames * 100.0
+                            if os.path.exists(frame_filepath):
+                                clip_frames.append(frame_filepath)
+                        
+                        # === (F) Create video clip ===
+                        if len(clip_frames) == args.clip_length:
+                            fps = args.fps
+                            if create_video_clip_from_frames(clip_frames, clip_output_path, fps):
+                                clips_created += 1
+                                print(f"  ✓ Created clip {clip_idx:05d}.mp4")
+                            else:
+                                print(f"  ✗ Failed to create clip {clip_idx:05d}.mp4")
+                        else:
+                            print(f"  ✗ Only {len(clip_frames)}/{args.clip_length} frames rendered")
+                        
+                        # === (G) Cleanup for next clip ===
+                        clear_camera_keys(camera_obj)
+                        restore_animations(camera_obj)
+                        show_actor_in_rendering()
+                        
+                        # Clean up temporary frames for this clip
+                        for frame_path in clip_frames:
+                            try:
+                                os.remove(frame_path)
+                            except:
+                                pass
+                        
+                        # Progress update
                         elapsed = time.time() - start_time
                         if clips_created > 0:
                             avg_time_per_clip = elapsed / clips_created
-                            print(f"  Rendered {frame_idx + 1}/{total_frames} frames ({progress:.1f}%), Created {clips_created} clips (avg {avg_time_per_clip:.1f}s/clip)")
-                        else:
-                            print(f"  Rendered {frame_idx + 1}/{total_frames} frames ({progress:.1f}%)")
+                            remaining = len(clip_start_frames) - clips_created
+                            eta = remaining * avg_time_per_clip
+                            print(f"  📊 Progress: {clips_created}/{len(clip_start_frames)} clips")
+                            print(f"  ⏱️  Avg: {avg_time_per_clip:.1f}s/clip | ETA: {eta/60:.1f} min")
+                else:
+                    # Non-static mode: render all frames first, then create clips on-the-fly
+                    frame_buffer = []  # List of (frame_idx, frame_path)
+                    next_clip_start = 0
+                    
+                    for frame_idx, frame_num in enumerate(frames_to_render):
+                        scene.frame_set(frame_num)
+                        
+                        # Render frame to temp directory
+                        frame_filepath = os.path.join(temp_frames_dir, f"frame_{frame_idx:04d}.png")
+                        render.filepath = frame_filepath
+                        bpy.ops.render.render(write_still=True)
+                        
+                        if os.path.exists(frame_filepath):
+                            frame_buffer.append((frame_idx, frame_filepath))
+                            
+                            # Check if we can create a clip starting at next_clip_start
+                            if frame_idx >= next_clip_start + args.clip_length - 1:
+                                # Check if we have all required frames in buffer
+                                required_frames = [(idx, path) for idx, path in frame_buffer 
+                                                 if next_clip_start <= idx < next_clip_start + args.clip_length]
+                                
+                                if len(required_frames) == args.clip_length:
+                                    # We have all frames needed for this clip
+                                    clip_output_path = os.path.join(clips_output_path, f"{clips_created:05d}.mp4")
+                                    
+                                    # Check if clip already exists
+                                    should_create = True
+                                    if args.skip_existing and os.path.exists(clip_output_path):
+                                        clip_size = os.path.getsize(clip_output_path)
+                                        if clip_size > 10240:  # At least 10KB
+                                            print(f"  Clip {clips_created:05d}.mp4 already exists, skipping")
+                                            should_create = False
+                                    
+                                    if should_create:
+                                        # Sort by frame index and get paths
+                                        required_frames.sort(key=lambda x: x[0])
+                                        clip_frames = [path for _, path in required_frames]
+                                        
+                                        # Create clip
+                                        fps = args.fps
+                                        if create_video_clip_from_frames(clip_frames, clip_output_path, fps):
+                                            clips_created += 1
+                                            print(f"  ✓ Created clip {clips_created-1:05d}.mp4 (frames {next_clip_start}-{next_clip_start+args.clip_length-1})")
+                                        else:
+                                            print(f"  ✗ Failed to create clip {clips_created:05d}.mp4")
+                                    
+                                    # Move to next clip
+                                    next_clip_start += args.clip_stride
+                                    
+                                    # Clean up frames that are no longer needed
+                                    min_keep_idx = max(0, next_clip_start - args.clip_stride)
+                                    frame_buffer = [(idx, path) for idx, path in frame_buffer if idx >= min_keep_idx]
+                        
+                        # Progress update
+                        if (frame_idx + 1) % 10 == 0 or frame_idx == len(frames_to_render) - 1:
+                            progress = (frame_idx + 1) / total_frames * 100.0
+                            elapsed = time.time() - start_time
+                            if clips_created > 0:
+                                avg_time_per_clip = elapsed / clips_created
+                                print(f"  Rendered {frame_idx + 1}/{total_frames} frames ({progress:.1f}%), Created {clips_created} clips (avg {avg_time_per_clip:.1f}s/clip)")
+                            else:
+                                print(f"  Rendered {frame_idx + 1}/{total_frames} frames ({progress:.1f}%)")
                 
                 render.filepath = original_filepath
-                
-                # Static mode: cleanup after rendering
-                if args.static:
-                    clear_camera_keys(camera_obj)
-                    restore_animations(camera_obj)
                 
                 total_time = time.time() - start_time
                 print(f"\n✅ Created {clips_created} clips in {total_time/60:.1f} minutes")
