@@ -11,8 +11,9 @@ from typing import Any, Dict, Optional, Union
 
 import numpy as np
 import torch
-import torch.cuda.amp as amp
+import torch.amp as amp
 import torch.nn as nn
+import torch.nn.functional as F
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.loaders.single_file_model import FromOriginalModelMixin
 from diffusers.models.modeling_utils import ModelMixin
@@ -249,18 +250,28 @@ def sinusoidal_embedding_1d(dim, position):
     return x
 
 
-@amp.autocast(enabled=False)
-def rope_params(max_seq_len, dim, theta=10000):
+# @amp.autocast('cuda', enabled=False)
+# def rope_params(max_seq_len, dim, theta=10000):
+#     assert dim % 2 == 0
+#     freqs = torch.outer(
+#         torch.arange(max_seq_len),
+#         1.0 / torch.pow(theta,
+#                         torch.arange(0, dim, 2).to(torch.float64).div(dim)))
+#     freqs = torch.polar(torch.ones_like(freqs), freqs)
+#     return freqs
+@amp.autocast('cuda', enabled=False)
+def rope_params(max_seq_len, dim, theta=10000, pos_scale: float = 1.0):
     assert dim % 2 == 0
+    pos = torch.arange(max_seq_len, dtype=torch.float64) * float(pos_scale)
     freqs = torch.outer(
-        torch.arange(max_seq_len),
-        1.0 / torch.pow(theta,
-                        torch.arange(0, dim, 2).to(torch.float64).div(dim)))
+        pos,
+        1.0 / torch.pow(theta, torch.arange(0, dim, 2).to(torch.float64).div(dim)),
+    )
     freqs = torch.polar(torch.ones_like(freqs), freqs)
     return freqs
 
 # modified from https://github.com/thu-ml/RIFLEx/blob/main/riflex_utils.py
-@amp.autocast(enabled=False)
+@amp.autocast('cuda', enabled=False)
 def get_1d_rotary_pos_embed_riflex(
     pos: Union[np.ndarray, int],
     dim: int,
@@ -269,6 +280,7 @@ def get_1d_rotary_pos_embed_riflex(
     k: Optional[int] = None,
     L_test: Optional[int] = None,
     L_test_scale: Optional[int] = None,
+    pos_scale: float = 1.0,
 ):
     """
     RIFLEx: Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
@@ -295,6 +307,7 @@ def get_1d_rotary_pos_embed_riflex(
         pos = torch.arange(pos)
     if isinstance(pos, np.ndarray):
         pos = torch.from_numpy(pos)  # type: ignore  # [S]
+    pos = pos.to(torch.float64) * float(pos_scale)
 
     freqs = 1.0 / torch.pow(theta,
         torch.arange(0, dim, 2).to(torch.float64).div(dim))
@@ -337,7 +350,7 @@ def get_resize_crop_region_for_grid(src, tgt_width, tgt_height):
 
     return (crop_top, crop_left), (crop_top + resize_height, crop_left + resize_width)
 
-@amp.autocast(enabled=False)
+@amp.autocast('cuda', enabled=False)
 @torch.compiler.disable()
 def rope_apply(x, grid_sizes, freqs):
     n, c = x.size(2), x.size(3) // 2
@@ -757,6 +770,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         add_ref_conv=False,
         in_dim_ref_conv=16,
         cross_attn_type=None,
+        fps: int = 16,
     ):
         r"""
         Initialize the diffusion model backbone.
@@ -798,6 +812,11 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
 
         assert model_type in ['t2v', 'i2v', 'ti2v']
         self.model_type = model_type
+        self.base_fps = 16
+        self.fps = int(fps)
+        if self.fps <= 0:
+            raise ValueError(f"fps must be positive, got {self.fps}")
+        temporal_pos_scale = float(self.base_fps) / float(self.fps)
 
         self.patch_size = patch_size
         self.text_len = text_len
@@ -847,7 +866,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         self.dim = dim
         self.freqs = torch.cat(
             [
-                rope_params(1024, d - 4 * (d // 6)),
+                rope_params(1024, d - 4 * (d // 6), pos_scale=temporal_pos_scale),
                 rope_params(1024, 2 * (d // 6)),
                 rope_params(1024, 2 * (d // 6))
             ],
@@ -935,9 +954,18 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         L_test_scale = 4.886,
     ):
         device = self.freqs.device
+        temporal_pos_scale = float(self.base_fps) / float(self.fps)
         self.freqs = torch.cat(
             [
-                get_1d_rotary_pos_embed_riflex(1024, self.d - 4 * (self.d // 6), use_real=False, k=k, L_test=L_test, L_test_scale=L_test_scale),
+                get_1d_rotary_pos_embed_riflex(
+                    1024,
+                    self.d - 4 * (self.d // 6),
+                    use_real=False,
+                    k=k,
+                    L_test=L_test,
+                    L_test_scale=L_test_scale,
+                    pos_scale=temporal_pos_scale,
+                ),
                 rope_params(1024, 2 * (self.d // 6)),
                 rope_params(1024, 2 * (self.d // 6))
             ],
@@ -946,9 +974,10 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
 
     def disable_riflex(self):
         device = self.freqs.device
+        temporal_pos_scale = float(self.base_fps) / float(self.fps)
         self.freqs = torch.cat(
             [
-                rope_params(1024, self.d - 4 * (self.d // 6)),
+                rope_params(1024, self.d - 4 * (self.d // 6), pos_scale=temporal_pos_scale),
                 rope_params(1024, 2 * (self.d // 6)),
                 rope_params(1024, 2 * (self.d // 6))
             ],
@@ -1005,10 +1034,13 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         #     assert clip_fea is not None and y is not None
         # params
         device = self.patch_embedding.weight.device
-        dtype = x.dtype
+        if isinstance(x, list):
+            dtype = x[0].dtype
+        else:
+            dtype = x.dtype
         if self.freqs.device != device and torch.device(type="meta") != device:
             self.freqs = self.freqs.to(device)
-
+        
         if y is not None:
             x = [torch.cat([u, v], dim=0) for u, v in zip(x, y)]
 
@@ -1046,7 +1078,7 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         ])
 
         # time embeddings
-        with amp.autocast(dtype=torch.float32):
+        with amp.autocast(device_type='cuda', dtype=torch.float32):
             if t.dim() != 1:
                 bt = t.size(0)
                 ft = t.flatten()
@@ -1060,8 +1092,8 @@ class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
                 e0 = self.time_projection(e).unflatten(1, (6, self.dim))
 
             # assert e.dtype == torch.float32 and e0.dtype == torch.float32
-            # e0 = e0.to(dtype)
-            # e = e.to(dtype)
+            e0 = e0.to(dtype)
+            e = e.to(dtype)
 
         # context
         context_lens = None
@@ -1449,6 +1481,7 @@ class Wan2_2Transformer3DModel(WanTransformer3DModel):
         in_dim_control_adapter=24,
         add_ref_conv=False,
         in_dim_ref_conv=16,
+        fps: int = 16,
     ):
         r"""
         Initialize the diffusion model backbone.
@@ -1506,7 +1539,8 @@ class Wan2_2Transformer3DModel(WanTransformer3DModel):
             in_dim_control_adapter=in_dim_control_adapter,
             add_ref_conv=add_ref_conv,
             in_dim_ref_conv=in_dim_ref_conv,
-            cross_attn_type="cross_attn"
+            cross_attn_type="cross_attn",
+            fps=fps,
         )
         
         if hasattr(self, "img_emb"):

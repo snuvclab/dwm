@@ -76,6 +76,7 @@ class WanTransformer3DModelWithConcat(WanTransformer3DModel):
         add_ref_conv=False,
         in_dim_ref_conv=16,
         cross_attn_type=None,
+        fps: int = 16,
         # WanTransformer3DModelWithConcat specific parameter
         condition_channels: int = 0,
     ):
@@ -110,6 +111,7 @@ class WanTransformer3DModelWithConcat(WanTransformer3DModel):
             add_ref_conv=add_ref_conv,
             in_dim_ref_conv=in_dim_ref_conv,
             cross_attn_type=cross_attn_type,
+            fps=fps,
         )
         
         self.condition_channels = condition_channels

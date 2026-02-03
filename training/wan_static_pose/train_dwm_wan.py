@@ -64,6 +64,7 @@ import imageio.v3 as iio
 # WAN models and utilities from training.wan_static_pose
 from training.wan_static_pose.models import (
     AutoencoderKLWan,
+    AutoencoderKLWan3_8,
     CLIPModel,
     WanT5EncoderModel,
     WanTransformer3DModel,
@@ -71,9 +72,14 @@ from training.wan_static_pose.models import (
 from training.wan_static_pose.models.wan_transformer3d_with_conditions import (
     WanTransformer3DModelWithConcat,
 )
-from training.wan_static_pose.pipeline import WanFunInpaintPipeline
+from training.wan_static_pose.pipeline.pipeline_wan_fun_inpaint import (
+    WanFunInpaintPipeline,
+)
 from training.wan_static_pose.pipeline.pipeline_wan_fun_inpaint_hand_concat import (
     WanFunInpaintHandConcatPipeline,
+)
+from training.wan_static_pose.pipeline.pipeline_wan2_2_fun_inpaint_hand_concat import (
+    Wan2_2FunInpaintHandConcatPipeline,
 )
 from training.wan_static_pose.utils.lora_utils import (
     create_network,
@@ -188,10 +194,15 @@ def log_validation(
         
         # Extract config values
         pipeline_config = config.get('pipeline', {})
+        training_config = config.get('training', {})
         transformer_config = config.get('transformer', {})
         data_config = config.get('data', {})
         scheduler_kwargs = config.get('scheduler_kwargs', {})
         transformer_additional_kwargs = config.get('transformer_additional_kwargs', {})
+
+        # Propagate fixed FPS (used for RoPE scaling) into transformer loading kwargs
+        if pipeline_config.get("fps") is not None:
+            transformer_additional_kwargs["fps"] = int(pipeline_config["fps"])
         
         # Get base model path (same as in main training)
         base_model_path = pipeline_config.get('base_model_name_or_path', args.pretrained_model_name_or_path)
@@ -223,25 +234,63 @@ def log_validation(
         
         # Limit validation samples
         max_validation_videos = data_config.get("max_validation_videos", 2)
-        validation_set = validation_set[:max_validation_videos]
+        
+        # For multi-GPU training, multiply by number of GPUs to ensure each GPU gets different videos
+        total_validation_videos = max_validation_videos * accelerator.num_processes
+        
+        # Select validation videos (sequential selection)
+        if len(validation_set) > total_validation_videos:
+            validation_set = validation_set[:total_validation_videos]
+        else:
+            validation_set = validation_set[:total_validation_videos]
+        
+        # Distribute videos across GPUs - each GPU gets different videos
+        videos_per_gpu = len(validation_set) // accelerator.num_processes
+        start_idx = accelerator.process_index * videos_per_gpu
+        end_idx = start_idx + videos_per_gpu if accelerator.process_index < accelerator.num_processes - 1 else len(validation_set)
+        
+        # Each GPU gets its own subset of videos
+        validation_set = validation_set[start_idx:end_idx]
         
         if not validation_set:
             logger.warning("No validation videos found. Skipping validation.")
             return
         
-        logger.info(f"Running validation on {len(validation_set)} samples...")
+        logger.info(f"🎯 Multi-GPU Validation Strategy:")
+        logger.info(f"   - Total GPUs: {accelerator.num_processes}")
+        logger.info(f"   - Videos per GPU: {videos_per_gpu}")
+        logger.info(f"   - GPU {accelerator.process_index}: Processing {len(validation_set)} validation videos (indices {start_idx}-{end_idx-1})")
 
+        # Determine pretrain mode
+        pretrain_mode = training_config.get("pretrain_mode", "t2v")
+
+        # Determine transformer type for validation
+        transformer_type = transformer_config.get("class", "WanTransformer3DModelWithConcat")
+        
         # Create a new transformer for validation
         if args.train_mode == "lora":
-            transformer3d_val = WanTransformer3DModelWithConcat.from_pretrained(
-                os.path.join(base_model_path, transformer_additional_kwargs.get('transformer_subpath', 'transformer')),
-                transformer_additional_kwargs={
-                    "condition_channels": transformer_config.get('condition_channels', args.condition_channels),
-                    **transformer_additional_kwargs,
-                },
-                torch_dtype=weight_dtype,
-            )
-            transformer3d_val.load_state_dict(accelerator.unwrap_model(transformer3d).state_dict())
+            if transformer_type == "WanTransformer3DModel":
+                transformer3d_val = WanTransformer3DModel.from_pretrained(
+                    os.path.join(base_model_path, transformer_additional_kwargs.get('transformer_subpath', 'transformer')),
+                    transformer_additional_kwargs=transformer_additional_kwargs,
+                    torch_dtype=weight_dtype,
+                )
+            elif transformer_type == "WanTransformer3DModelWithConcat":
+                transformer3d_val = WanTransformer3DModelWithConcat.from_pretrained(
+                    os.path.join(base_model_path, transformer_additional_kwargs.get('transformer_subpath', 'transformer')),
+                    transformer_additional_kwargs={
+                        "condition_channels": transformer_config.get('condition_channels', args.condition_channels),
+                        **transformer_additional_kwargs,
+                    },
+                    torch_dtype=weight_dtype,
+                )
+            else:
+                raise ValueError(f"Unsupported transformer type: {transformer_type}")
+            src_sd = accelerator.unwrap_model(transformer3d).state_dict()
+            # Remove LoRA network keys from DeepSpeed/FSDP path that attached to transformer3d
+            src_sd = {k: v for k, v in src_sd.items() if not k.startswith("network.")}
+            missing, unexpected = transformer3d_val.load_state_dict(src_sd, strict=False)
+            logger.info(f"[val] load transformer3d_val: missing={len(missing)}, unexpected={len(unexpected)}")
         else:
             transformer3d_val = accelerator.unwrap_model(transformer3d)
 
@@ -249,15 +298,53 @@ def log_validation(
             **filter_kwargs(FlowMatchEulerDiscreteScheduler, scheduler_kwargs)
         )
 
-        # Create pipeline for validation
-        pipeline = WanFunInpaintHandConcatPipeline(
-            vae=accelerator.unwrap_model(vae),
-            text_encoder=accelerator.unwrap_model(text_encoder),
-            tokenizer=tokenizer,
-            transformer=transformer3d_val,
-            scheduler=scheduler,
-            clip_image_encoder=clip_image_encoder,
-        )
+        # Check pipeline type to select appropriate pipeline
+        pipeline_type = pipeline_config.get("type", "")
+        is_wan2_2 = "2.2" in pipeline_type
+        
+        if is_wan2_2:
+            # WAN 2.2: No CLIP encoder needed
+            logger.info("🔧 Using WAN 2.2 pipeline for validation")
+            pipeline = Wan2_2FunInpaintHandConcatPipeline(
+                vae=accelerator.unwrap_model(vae),
+                text_encoder=accelerator.unwrap_model(text_encoder),
+                tokenizer=tokenizer,
+                transformer=transformer3d_val,
+                transformer_2=None,  # Can be loaded from config if needed
+                scheduler=scheduler,
+            )
+        else:
+            # WAN 2.1: CLIP encoder required
+            clip_image_encoder_for_pipeline = clip_image_encoder
+            if clip_image_encoder_for_pipeline is None:
+                logger.warning("⚠️  Creating dummy CLIP encoder for pipeline compatibility")
+                # Create a minimal dummy CLIP encoder
+                clip_image_encoder_for_pipeline = CLIPModel()
+                clip_image_encoder_for_pipeline.eval()
+                clip_image_encoder_for_pipeline.requires_grad_(False)
+            
+            if pipeline_type == "wan2.1_fun_inp":
+                logger.info("🔧 Using WAN 2.1 base pipeline for validation")
+                pipeline = WanFunInpaintPipeline(
+                    vae=accelerator.unwrap_model(vae),
+                    text_encoder=accelerator.unwrap_model(text_encoder),
+                    tokenizer=tokenizer,
+                    transformer=transformer3d_val,
+                    scheduler=scheduler,
+                    clip_image_encoder=clip_image_encoder_for_pipeline,
+                )
+            elif pipeline_type == "wan2.1_fun_inp_hand_concat":
+                logger.info("🔧 Using WAN 2.1 hand concat pipeline for validation")
+                pipeline = WanFunInpaintHandConcatPipeline(
+                    vae=accelerator.unwrap_model(vae),
+                    text_encoder=accelerator.unwrap_model(text_encoder),
+                    tokenizer=tokenizer,
+                    transformer=transformer3d_val,
+                    scheduler=scheduler,
+                    clip_image_encoder=clip_image_encoder_for_pipeline,
+                )
+            else:
+                raise ValueError(f"Unsupported WAN 2.1 pipeline type: {pipeline_type}")
         pipeline = pipeline.to(accelerator.device, dtype=weight_dtype)
 
         # Merge LoRA weights for validation if using LoRA training
@@ -319,18 +406,61 @@ def log_validation(
                     
                     mask_video = torch.zeros(1, 1, num_frames, height, width)
                     
-                    sample = pipeline(
-                        prompt_text,
-                        num_frames=num_frames,
-                        negative_prompt="bad detailed",
-                        height=height,
-                        width=width,
-                        guidance_scale=6.0,
-                        generator=generator,
-                        static_video=static_video.to(accelerator.device, dtype=weight_dtype),
-                        mask_video=mask_video.to(accelerator.device, dtype=weight_dtype),
-                        hand_video=hand_video.to(accelerator.device, dtype=weight_dtype) if hand_video is not None else None,
-                    ).videos
+                    if transformer_type == "WanTransformer3DModel":
+                        # Base pipeline uses 'video' parameter instead of 'static_video'
+                        if pretrain_mode == "t2v":
+                            sample = pipeline(
+                                prompt_text,
+                                num_frames=num_frames,
+                                negative_prompt="bad detailed",
+                                height=height,
+                                width=width,
+                                guidance_scale=6.0,
+                                generator=generator,
+                                video=torch.zeros_like(static_video),
+                                mask_video=torch.ones_like(mask_video) * 255, 
+                            ).videos
+                        elif pretrain_mode == "v2v":
+                            sample = pipeline(
+                                prompt_text,
+                                num_frames=num_frames,
+                                negative_prompt="bad detailed",
+                                height=height,
+                                width=width,
+                                guidance_scale=6.0,
+                                generator=generator,
+                                video=static_video.to(accelerator.device, dtype=weight_dtype),
+                                mask_video=mask_video.to(accelerator.device, dtype=weight_dtype),
+                            ).videos
+                        elif pretrain_mode == "i2v":
+                            mask_video[:, :, 1:, :, :] = 255
+                            sample = pipeline(
+                                prompt_text,
+                                num_frames=num_frames,
+                                negative_prompt="bad detailed",
+                                height=height,
+                                width=width,
+                                guidance_scale=6.0,
+                                generator=generator,
+                                video=static_video.to(accelerator.device, dtype=weight_dtype),
+                                mask_video=mask_video.to(accelerator.device, dtype=weight_dtype),
+                            ).videos
+                    elif transformer_type == "WanTransformer3DModelWithConcat":
+                        # Concat pipeline uses 'static_video' and 'hand_video'
+                        sample = pipeline(
+                            prompt_text,
+                            num_frames=num_frames,
+                            negative_prompt="bad detailed",
+                            height=height,
+                            width=width,
+                            guidance_scale=6.0,
+                            generator=generator,
+                            static_video=static_video.to(accelerator.device, dtype=weight_dtype),
+                            mask_video=mask_video.to(accelerator.device, dtype=weight_dtype),
+                            hand_video=hand_video.to(accelerator.device, dtype=weight_dtype) if hand_video is not None else None,
+                        ).videos
+                    else:
+                        raise ValueError(f"Unsupported transformer type: {transformer_type}")
                     
                     # Prepare videos for comparison: static | hand | generated | gt
                     # All videos should be [1, c, f, h, w] format
@@ -380,15 +510,16 @@ def log_validation(
                     logger.info(f"   Generated: {generated_filename}")
                     logger.info(f"   Comparison (static|hand|generated|gt): {comparison_filename}")
                     
-                    # Log to wandb if available
-                    for tracker in accelerator.trackers:
-                        if tracker.name == "wandb" and HAS_WANDB:
-                            caption = f"step_{global_step}_{phase_name}_{video_name}_comparison (static|hand|generated|gt)"
-                            tracker.log({
-                                phase_name: [
-                                    wandb.Video(comparison_filename, caption=caption, fps=8)
-                                ]
-                            }, step=global_step)
+                    # Log to wandb if available (only on main process)
+                    if accelerator.is_main_process:
+                        for tracker in accelerator.trackers:
+                            if tracker.name == "wandb" and HAS_WANDB:
+                                caption = f"step_{global_step}_{phase_name}_{video_name}_comparison (static|hand|generated|gt)"
+                                tracker.log({
+                                    phase_name: [
+                                        wandb.Video(comparison_filename, caption=caption, fps=8)
+                                    ]
+                                }, step=global_step)
                     
                     logger.info(f"Validation {i+1}/{len(validation_set)}: {video_name} saved")
 
@@ -452,7 +583,7 @@ def main():
                         help="Override config values (key=value format)")
     parser.add_argument("--mode", type=str, choices=["debug", "slurm_test", "slurm"], default="slurm",
                         help="Training mode: debug, slurm_test, or slurm")
-    # Add all other arguments from args.py
+    # # Add all other arguments from args.py
     add_all_args(parser)
     args = parser.parse_args()
     
@@ -466,6 +597,12 @@ def main():
     pipeline_config = config.get("pipeline", {})
     transformer_config = config.get("transformer", {})
     data_config = config.get("data", {})
+
+    # Print training FPS (used for RoPE scaling in WanTransformer3DModel)
+    if pipeline_config.get("fps") is not None:
+        print(f"🎞️ Training FPS: {int(pipeline_config['fps'])} (from pipeline_config)")
+    else:
+        print("🎞️ Training FPS: 16 (default)")
     
     # Model-related configs from pipeline config (merged from configs/pipelines/*.yaml)
     text_encoder_kwargs = config.get("text_encoder_kwargs", {})
@@ -473,32 +610,39 @@ def main():
     scheduler_kwargs = config.get("scheduler_kwargs", {})
     transformer_additional_kwargs = config.get("transformer_additional_kwargs", {})
     image_encoder_kwargs = config.get("image_encoder_kwargs", {})
+
+    # Propagate fixed FPS (used for RoPE scaling) into transformer loading kwargs
+    if pipeline_config.get("fps") is not None:
+        transformer_additional_kwargs["fps"] = int(pipeline_config["fps"])
     
-    # Override args with config values (handle string->float conversion for YAML quirks like "1e-4")
-    if training_config.get("learning_rate"):
+    # Override args with config values (config values take priority over command line args)
+    # Use "is not None" check to ensure config values (including 0, False, empty string) override args
+    if training_config.get("learning_rate") is not None:
         args.learning_rate = float(training_config["learning_rate"])
-    if training_config.get("batch_size"):
+    if training_config.get("batch_size") is not None:
         args.train_batch_size = int(training_config["batch_size"])
-    if training_config.get("max_train_steps"):
+    if training_config.get("max_train_steps") is not None:
         args.max_train_steps = int(training_config["max_train_steps"])
-    if training_config.get("gradient_accumulation_steps"):
+    if training_config.get("gradient_accumulation_steps") is not None:
         args.gradient_accumulation_steps = int(training_config["gradient_accumulation_steps"])
     # Note: args.pretrained_model_name_or_path is NOT overridden by pipeline_config
     # to allow specifying SFT checkpoint path via CLI (--pretrained_model_name_or_path)
     # pipeline_config["base_model_name_or_path"] is used for model structure definition
-    if args.pretrained_model_name_or_path is None and pipeline_config.get("base_model_name_or_path"):
+    if args.pretrained_model_name_or_path is None and pipeline_config.get("base_model_name_or_path") is not None:
         args.pretrained_model_name_or_path = pipeline_config["base_model_name_or_path"]
-    if data_config.get("data_root"):
+    if data_config.get("data_root") is not None:
         args.train_data_dir = data_config["data_root"]
-    if data_config.get("dataset_file"):
+    if data_config.get("dataset_file") is not None:
         args.train_data_meta = data_config["dataset_file"]
-    if transformer_config.get("condition_channels"):
+    # Determine transformer type
+    transformer_type = transformer_config.get("class", "WanTransformer3DModelWithConcat")
+    if transformer_config.get("condition_channels") is not None:
         args.condition_channels = int(transformer_config["condition_channels"])
-    if training_config.get("mode"):
+    if training_config.get("mode") is not None:
         args.train_mode = training_config["mode"]
-    if training_config.get("lora_rank"):
+    if training_config.get("lora_rank") is not None:
         args.rank = int(training_config["lora_rank"])
-    if training_config.get("lora_alpha"):
+    if training_config.get("lora_alpha") is not None:
         args.network_alpha = int(training_config["lora_alpha"])
     
     # ========== Setup Output Directory with SLURM Support ==========
@@ -661,31 +805,48 @@ def main():
     text_encoder = WanT5EncoderModel.from_pretrained(
         os.path.join(args.pretrained_model_name_or_path, text_encoder_kwargs.get('text_encoder_subpath', 'text_encoder')),
         additional_kwargs=text_encoder_kwargs,
-        low_cpu_mem_usage=True,
         torch_dtype=weight_dtype,
     ).eval()
 
     # Load VAE
-    vae = AutoencoderKLWan.from_pretrained(
+    Choosen_AutoencoderKL = {
+        "AutoencoderKLWan": AutoencoderKLWan,
+        "AutoencoderKLWan3_8": AutoencoderKLWan3_8
+    }[vae_kwargs.get('vae_type', 'AutoencoderKLWan')]
+    vae = Choosen_AutoencoderKL.from_pretrained(
         os.path.join(args.pretrained_model_name_or_path, vae_kwargs.get('vae_subpath', 'vae')),
         additional_kwargs=vae_kwargs,
     ).eval()
 
-    # Load CLIP image encoder
-    clip_image_encoder = CLIPModel.from_pretrained(
-        os.path.join(args.pretrained_model_name_or_path, image_encoder_kwargs.get('image_encoder_subpath', 'image_encoder')),
-    ).eval()
+    # Load CLIP image encoder (skip for WAN 2.2)
+    if "2.2" in pipeline_config.get("type", ""):
+        logger.info("⚠️  WAN 2.2 detected: Skipping CLIP image encoder loading")
+        clip_image_encoder = None
+    else:
+        clip_image_encoder = CLIPModel.from_pretrained(
+            os.path.join(args.pretrained_model_name_or_path, image_encoder_kwargs.get('image_encoder_subpath', 'image_encoder')),
+        ).eval()
 
-    # Load transformer (WanTransformer3DModelWithConcat for conditional training)
-    print(f"🔧 Loading WanTransformer3DModelWithConcat with {args.condition_channels} condition channels...")
-    transformer3d = WanTransformer3DModelWithConcat.from_pretrained(
-        os.path.join(args.pretrained_model_name_or_path, transformer_additional_kwargs.get('transformer_subpath', 'transformer')),
-        transformer_additional_kwargs={
-            "condition_channels": args.condition_channels,
-            **transformer_additional_kwargs,
-        },
-        torch_dtype=weight_dtype,
-    )
+    # Load transformer
+    if transformer_type == "WanTransformer3DModel":
+        print(f"🔧 Loading WanTransformer3DModel (base model)...")
+        transformer3d = WanTransformer3DModel.from_pretrained(
+            os.path.join(args.pretrained_model_name_or_path, transformer_additional_kwargs.get('transformer_subpath', 'transformer')),
+            transformer_additional_kwargs=transformer_additional_kwargs,
+            torch_dtype=weight_dtype,
+        )
+    elif transformer_type == "WanTransformer3DModelWithConcat":
+        print(f"🔧 Loading WanTransformer3DModelWithConcat with {args.condition_channels} condition channels...")
+        transformer3d = WanTransformer3DModelWithConcat.from_pretrained(
+            os.path.join(args.pretrained_model_name_or_path, transformer_additional_kwargs.get('transformer_subpath', 'transformer')),
+            transformer_additional_kwargs={
+                "condition_channels": args.condition_channels,
+                **transformer_additional_kwargs,
+            },
+            torch_dtype=weight_dtype,
+        )
+    else:
+        raise ValueError(f"Unsupported transformer type: {transformer_type}")
 
     # Load custom weights if provided
     if args.transformer_path is not None:
@@ -711,7 +872,8 @@ def main():
     # ========== Setup Training Mode ==========
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
-    clip_image_encoder.requires_grad_(False)
+    if clip_image_encoder is not None:
+        clip_image_encoder.requires_grad_(False)
     transformer3d.requires_grad_(False)
 
     network = None
@@ -866,6 +1028,12 @@ def main():
     # ========== Setup Dataset ==========
     print("🔧 Setting up dataset...")
     
+    # Check if WAN 2.2 (requires width alignment to 32)
+    is_wan2_2 = "2.2" in pipeline_config.get("type", "")
+    align_width_to_32 = is_wan2_2
+    if align_width_to_32:
+        print("📐 WAN 2.2 detected: Aligning width to multiples of 32 for compatibility")
+    
     # Setup dataset and dataloader
     dataset_init_kwargs = {
         "data_root": data_config["data_root"],
@@ -880,6 +1048,7 @@ def main():
         "prompt_embeds_subdir": data_config.get("prompt_embeds_subdir", "prompt_embeds"),
         "hand_video_subdir": data_config.get("hand_video_subdir", "videos_hands"),
         "hand_video_latents_subdir": data_config.get("hand_video_latents_subdir", "hand_video_latents"),
+        "align_width_to_32": align_width_to_32,
     }
     
     train_dataset = VideoDatasetWithConditionsAndResizing(**dataset_init_kwargs)
@@ -949,7 +1118,8 @@ def main():
     if not (args.train_mode == "lora" and use_deepspeed_or_fsdp):
         transformer3d.to(accelerator.device, dtype=weight_dtype)
     text_encoder.to(accelerator.device)
-    clip_image_encoder.to(accelerator.device, dtype=weight_dtype)
+    if clip_image_encoder is not None:
+        clip_image_encoder.to(accelerator.device, dtype=weight_dtype)
 
     # Recalculate training steps
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -1026,10 +1196,7 @@ def main():
     if checkpoint_to_resume:
         if checkpoint_to_resume != "latest":
             # Use the provided checkpoint path directly
-            if os.path.isabs(checkpoint_to_resume):
-                checkpoint_path = checkpoint_to_resume
-            else:
-                checkpoint_path = os.path.join(args.output_dir, checkpoint_to_resume)
+            checkpoint_path = checkpoint_to_resume
             
             if not os.path.exists(checkpoint_path):
                 accelerator.print(f"Checkpoint '{checkpoint_path}' does not exist. Starting a new training run.")
@@ -1112,6 +1279,13 @@ def main():
                     initial_global_step = global_step
                     first_epoch = global_step // num_update_steps_per_epoch
 
+    # Get step intervals from config (with args as fallback)
+    checkpointing_steps = training_config.get("custom_settings", {}).get("checkpointing_steps", args.checkpointing_steps)
+    validation_steps = data_config.get("validation_steps", args.validation_steps)
+    init_validation_steps = data_config.get("init_validation_steps", 100)
+    
+    logger.info(f"📊 Step intervals: checkpointing={checkpointing_steps}, validation={validation_steps}, init_validation={init_validation_steps}")
+
     progress_bar = tqdm(
         range(0, args.max_train_steps),
         initial=global_step,
@@ -1139,13 +1313,18 @@ def main():
         return torch.cat(new_latents, dim=0)
 
     # Run initial validation at step 0 (before training starts)
-    if accelerator.is_main_process and data_config.get("validation_set") is not None:
-        logger.info("🎬 Running initial validation at step 0 (before training starts)")
+    # Run on all GPUs to distribute validation videos (not just main process)
+    if data_config.get("validation_set") is not None:
+        if accelerator.is_main_process:
+            logger.info("🎬 Running initial validation at step 0 (before training starts)")
         log_validation(
             vae, text_encoder, tokenizer, clip_image_encoder,
             transformer3d, network, config, args, accelerator,
-            weight_dtype, global_step=0
+            weight_dtype, global_step=global_step
         )
+
+    requires_hand_videos = transformer_type == "WanTransformer3DModelWithConcat"
+    pretrain_mode = training_config.get("pretrain_mode", "t2v")
 
     for epoch in range(first_epoch, args.num_train_epochs):
         train_loss = 0.0
@@ -1166,25 +1345,58 @@ def main():
                     latents = _batch_encode_vae(videos)
 
                 # Encode condition videos
-                if hand_videos is not None:
+                if requires_hand_videos and hand_videos is not None:
                     hand_videos = hand_videos.to(accelerator.device, dtype=weight_dtype)
                     hand_videos = rearrange(hand_videos, "b f c h w -> b c f h w")
                     with torch.no_grad():
                         hand_latents = _batch_encode_vae(hand_videos)
                 else:
-                    hand_latents = torch.zeros_like(latents)
+                    hand_latents = None
 
                 if static_videos is not None:
+                    bs, _, num_frames, height, width = static_videos.size()
+                    # Create mask (all ones for now - full generation)
+                    if pretrain_mode == "v2v":
+                        mask = torch.ones(videos.shape[0], 1, videos.shape[2], videos.shape[3], videos.shape[4],
+                                        device=accelerator.device, dtype=weight_dtype)
+                    elif pretrain_mode == "i2v":
+                        mask = torch.zeros(videos.shape[0], 1, videos.shape[2], videos.shape[3], videos.shape[4],
+                                        device=accelerator.device, dtype=weight_dtype)
+                        mask[:, :, 0:1, :, :] = 1.0
+                    elif pretrain_mode == "t2v":
+                        mask = torch.zeros(videos.shape[0], 1, videos.shape[2], videos.shape[3], videos.shape[4],
+                                        device=accelerator.device, dtype=weight_dtype)
+
                     static_videos = static_videos.to(accelerator.device, dtype=weight_dtype)
                     static_videos = rearrange(static_videos, "b f c h w -> b c f h w")
+                    static_videos = static_videos * mask
                     with torch.no_grad():
                         static_latents = _batch_encode_vae(static_videos)
-                else:
-                    static_latents = torch.zeros_like(latents)
 
-                # Create mask (all ones for now - full generation)
-                mask = torch.ones(latents.shape[0], 4, latents.shape[2], latents.shape[3], latents.shape[4],
-                                  device=accelerator.device, dtype=weight_dtype)
+                    # Channel layout for WanTransformer3DModelWithConcat:
+                    # x: noisy_latents [b, 16, f, h, w]
+                    # y: inpaint_latents = mask + static_latents [b, 4+16=20, f, h, w] (WAN Fun format)
+                    #    - mask: 4ch (4x temporal compression stacks along channel dim)
+                    #    - static_latents: 16ch (VAE latent)
+                    # condition_latents: hand_latents [b, 16, f, h, w] (extra condition channels)
+                    # 
+                    # Total: 16 + 20 + 16 = 52 channels (condition_channels=16 for hand)
+                    
+                    # Resize mask to match latent dimensions
+                    mask = torch.concat(
+                        [
+                            torch.repeat_interleave(mask[:, :, 0:1], repeats=4, dim=2), 
+                            mask[:, :, 1:]
+                        ], dim=2
+                    )
+                    mask = mask.view(bs, mask.shape[2] // 4, 4, height, width)
+                    mask = mask.transpose(1, 2)
+                    mask_latents = resize_mask(mask, latents, process_first_frame_only=True)
+                
+                    # Create inpaint-style input for WAN Fun (y argument)
+                    inpaint_latents = torch.cat([mask_latents, static_latents], dim=1)  # [b, 4+16=20, f, h, w]
+                else:
+                    inpaint_latents = None
 
                 # Encode prompts
                 with torch.no_grad():
@@ -1234,21 +1446,6 @@ def main():
                 # Flow Matching target
                 target = noise - latents
 
-                # Channel layout for WanTransformer3DModelWithConcat:
-                # x: noisy_latents [b, 16, f, h, w]
-                # y: inpaint_latents = mask + static_latents [b, 4+16=20, f, h, w] (WAN Fun format)
-                #    - mask: 4ch (4x temporal compression stacks along channel dim)
-                #    - static_latents: 16ch (VAE latent)
-                # condition_latents: hand_latents [b, 16, f, h, w] (extra condition channels)
-                # 
-                # Total: 16 + 20 + 16 = 52 channels (condition_channels=16 for hand)
-                
-                # Resize mask to match latent dimensions
-                mask = resize_mask(mask, latents, process_first_frame_only=True)
-                
-                # Create inpaint-style input for WAN Fun (y argument)
-                inpaint_latents = torch.cat([mask, static_latents], dim=1)  # [b, 4+16=20, f, h, w]
-
                 # Calculate seq_len for transformer (based on patched dimensions)
                 seq_len = math.ceil(
                     (height / patch_size[1]) * (width / patch_size[2]) * (num_frames / patch_size[0])
@@ -1257,20 +1454,34 @@ def main():
                 # Forward pass
                 # x: noisy_latents [B, 16, F, H, W]
                 # y: inpaint_latents [B, 17, F, H, W] (mask + static)
-                # condition_latents: hand_latents [B, 16, F, H, W] (extra conditions)
+                # condition_latents: hand_latents [B, 16, F, H, W] (extra conditions, only for WithConcat)
                 #
                 # WanTransformer3DModelWithConcat.forward handles conversion to list format
                 # and concatenation of condition_latents
                 with torch.amp.autocast(device_type='cuda', dtype=weight_dtype):
-                    noise_pred = transformer3d(
-                        x=noisy_latents,
-                        t=timesteps,
-                        context=prompt_embeds,
-                        seq_len=seq_len,
-                        y=inpaint_latents,
-                        clip_fea=None,  # Can add CLIP features later
-                        condition_latents=hand_latents,  # Extra condition channels
-                    )
+                    if transformer_type == "WanTransformer3DModel":
+                        # Base model: no condition_latents
+                        noise_pred = transformer3d(
+                            x=noisy_latents,
+                            t=timesteps,
+                            context=prompt_embeds,
+                            seq_len=seq_len,
+                            y=torch.zeros_like(inpaint_latents) if pretrain_mode == "t2v" else inpaint_latents,
+                            clip_fea=None,  # Can add CLIP features later
+                        )
+                    elif transformer_type == "WanTransformer3DModelWithConcat": 
+                        # Concat model: with condition_latents
+                        noise_pred = transformer3d(
+                            x=noisy_latents,
+                            t=timesteps,
+                            context=prompt_embeds,
+                            seq_len=seq_len,
+                            y=inpaint_latents,
+                            clip_fea=None,  # Can add CLIP features later
+                            condition_latents=hand_latents,  # Extra condition channels
+                        )
+                    else:
+                        raise ValueError(f"Unsupported transformer type: {transformer_type}")
 
                 # Compute loss with weighting
                 weighting = compute_loss_weighting_for_sd3(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
@@ -1302,7 +1513,7 @@ def main():
                 train_loss = 0.0
 
                 # Save checkpoint
-                if global_step % args.checkpointing_steps == 0:
+                if global_step % checkpointing_steps == 0:
                     # Remove old checkpoints if limit is set (all processes wait)
                     if args.checkpoints_total_limit is not None:
                         checkpoints = os.listdir(args.output_dir) if os.path.exists(args.output_dir) else []
@@ -1336,8 +1547,11 @@ def main():
                         logger.info(f"Saved checkpoint to {save_path}")
 
                 # Validation (runs if validation_set is defined in config)
-                if accelerator.is_main_process and global_step % args.validation_steps == 0:
+                # Run on all GPUs to distribute validation videos (not just main process)
+                if global_step % validation_steps == 0:
                     if data_config.get("validation_set"):
+                        if accelerator.is_main_process:
+                            logger.info(f"🎬 Running validation at step {global_step}")
                         log_validation(
                             vae, text_encoder, tokenizer, clip_image_encoder,
                             transformer3d, network, config, args, accelerator,

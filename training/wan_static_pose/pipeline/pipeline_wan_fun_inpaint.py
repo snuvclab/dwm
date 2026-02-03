@@ -673,6 +673,8 @@ class WanFunInpaintPipeline(DiffusionPipeline):
                         torch.cat([masked_video_latents] * 2) if do_classifier_free_guidance else masked_video_latents
                     )
                     y = torch.cat([mask_input, masked_video_latents_input], dim=1).to(device, weight_dtype) 
+                else:
+                    y = None 
 
                 clip_context_input = (
                     torch.cat([clip_context] * 2) if do_classifier_free_guidance else clip_context

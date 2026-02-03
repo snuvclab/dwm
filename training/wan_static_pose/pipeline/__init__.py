@@ -1,5 +1,6 @@
 
 from .pipeline_wan2_2_fun_inpaint import Wan2_2FunInpaintPipeline
+from .pipeline_wan2_2_fun_inpaint_hand_concat import Wan2_2FunInpaintHandConcatPipeline
 from .pipeline_wan_fun_inpaint import WanFunInpaintPipeline
 from .pipeline_wan_fun_inpaint_hand_concat import WanFunInpaintHandConcatPipeline
 

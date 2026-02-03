@@ -53,8 +53,10 @@ class VideoDataset(Dataset):
         prompt_embeds_subdir: str = "prompt_embeds",
         hand_video_subdir: str = "videos_hands",
         hand_video_latents_subdir: str = "hand_video_latents",
+        align_width_to_32: bool = False,
     ) -> None:
         super().__init__()
+        self.align_width_to_32 = align_width_to_32
 
         self.data_root = Path(data_root)
         # Handle dataset_file as list or single path
@@ -270,7 +272,7 @@ class VideoDataset(Dataset):
                 for path in file_video_paths
             ]
             file_prompts = [path.read_text() for path in prompt_paths]
-            
+
             all_video_paths.extend(file_video_paths)
             all_prompts.extend(file_prompts)
         
@@ -395,6 +397,7 @@ class VideoDatasetWithConditions(VideoDataset):
         prompt_embeds_subdir: str = "prompt_embeds",
         hand_video_subdir: str = "videos_hands",
         hand_video_latents_subdir: str = "hand_video_latents",
+        align_width_to_32: bool = False,
     ) -> None:
         # Initialize parent class with main video column
         super().__init__(
@@ -414,10 +417,13 @@ class VideoDatasetWithConditions(VideoDataset):
             prompt_embeds_subdir=prompt_embeds_subdir,
             hand_video_subdir=hand_video_subdir,
             hand_video_latents_subdir=hand_video_latents_subdir,
+            align_width_to_32=align_width_to_32,
         )
         
         # Store the use_gray_hand_videos flag
         self.use_gray_hand_videos = use_gray_hand_videos
+        # Store the align_width_to_32 flag (for WAN 2.2 compatibility)
+        self.align_width_to_32 = align_width_to_32
         
         # Automatically derive hand video and static video paths from main video paths
         if self.use_gray_hand_videos:
@@ -515,8 +521,12 @@ class VideoDatasetWithConditions(VideoDataset):
 
         return main_data
 
-    def _load_condition_video_latents(self, path: Path, latent_folder: str) -> torch.Tensor:
-        """Load preprocessed latents for condition videos."""
+    def _load_condition_video_latents(self, path: Path, latent_folder: str) -> Optional[torch.Tensor]:
+        """Load preprocessed latents for condition videos.
+        
+        Returns:
+            torch.Tensor if latents are successfully loaded, None if folder or file doesn't exist.
+        """
         try:
             filename_without_ext = path.name.split(".")[0]
             pt_filename = f"{filename_without_ext}.pt"
@@ -533,14 +543,14 @@ class VideoDatasetWithConditions(VideoDataset):
             latents_path = action_dir / "processed2" / latent_folder
             
             if not latents_path.exists():
-                logger.warning(f"Latents folder not found: {latents_path}")
-                raise FileNotFoundError(f"Latents folder not found: {latents_path}")
+                logger.warning(f"Latents folder not found: {latents_path}. Returning None.")
+                return None
             
             latent_filepath = latents_path.joinpath(pt_filename)
             
             if not latent_filepath.is_file():
-                logger.warning(f"Latent file not found: {latent_filepath}")
-                raise FileNotFoundError(f"Latent file not found: {latent_filepath}")
+                logger.warning(f"Latent file not found: {latent_filepath}. Returning None.")
+                return None
             
             try:
                 latents = torch.load(latent_filepath, map_location="cpu", weights_only=True)
@@ -550,8 +560,13 @@ class VideoDatasetWithConditions(VideoDataset):
                 raise e
                 
         except Exception as e:
-            logger.error(f"Error in _load_condition_video_latents for {path} in {latent_folder}: {e}")
-            raise e
+            # Only log and re-raise if it's not a FileNotFoundError (which we already handled above)
+            if not isinstance(e, FileNotFoundError):
+                logger.error(f"Error in _load_condition_video_latents for {path} in {latent_folder}: {e}")
+                raise e
+            # If it's a FileNotFoundError that we didn't catch above, return None
+            logger.warning(f"Latents not found for {path} in {latent_folder}. Returning None.")
+            return None
 
 
 class VideoDatasetWithConditionsAndResizing(VideoDatasetWithConditions):
@@ -585,7 +600,18 @@ class VideoDatasetWithConditionsAndResizing(VideoDatasetWithConditions):
 
     def _find_nearest_resolution(self, height, width):
         nearest_res = min(self.resolutions, key=lambda x: abs(x[1] - height) + abs(x[2] - width))
-        return nearest_res[1], nearest_res[2]
+        nearest_h, nearest_w = nearest_res[1], nearest_res[2]
+        
+        # For WAN 2.2: align width to 32 for compatibility
+        # 32 = 8 (VAE spatial_compression) * 4, ensures clean division through the pipeline
+        if self.align_width_to_32:
+            # Round to nearest multiple of 32
+            nearest_w = round(nearest_w / 32) * 32
+            # Ensure it's still in valid buckets (clamp to nearest valid width)
+            if nearest_w not in self.width_buckets:
+                nearest_w = min(self.width_buckets, key=lambda x: abs(x - nearest_w))
+        
+        return nearest_h, nearest_w
 
 
 class VideoDatasetWithConditionsAndResizeAndRectangleCrop(VideoDatasetWithConditions):
