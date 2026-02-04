@@ -204,6 +204,9 @@ def log_validation(
         if pipeline_config.get("fps") is not None:
             transformer_additional_kwargs["fps"] = int(pipeline_config["fps"])
         
+        # Check if WAN 2.2 (needed for transformer loading and CLIP encoder)
+        is_wan2_2 = "2.2" in pipeline_config.get("type", "")
+        
         # Get base model path (same as in main training)
         base_model_path = pipeline_config.get('base_model_name_or_path', args.pretrained_model_name_or_path)
 
@@ -280,6 +283,7 @@ def log_validation(
                     os.path.join(base_model_path, transformer_additional_kwargs.get('transformer_subpath', 'transformer')),
                     transformer_additional_kwargs={
                         "condition_channels": transformer_config.get('condition_channels', args.condition_channels),
+                        "is_wan2_2": is_wan2_2,
                         **transformer_additional_kwargs,
                     },
                     torch_dtype=weight_dtype,
@@ -399,10 +403,52 @@ def log_validation(
             else:
                 hand_video = None
             
+            # Align width to 32 for WAN 2.2 compatibility
+            if is_wan2_2:
+                # Get original dimensions
+                num_frames = gt_video.shape[0]
+                orig_height, orig_width = gt_video.shape[1], gt_video.shape[2]
+                
+                # Calculate aligned width (round to nearest multiple of 32)
+                aligned_width = round(orig_width / 32) * 32
+                
+                if aligned_width != orig_width:
+                    # Resize GT video: [f, h, w, c] -> resize -> [f, h, w, c]
+                    gt_video_tensor = torch.from_numpy(gt_video).permute(0, 3, 1, 2)  # [f, c, h, w]
+                    gt_video_tensor = F.interpolate(
+                        gt_video_tensor, 
+                        size=(orig_height, aligned_width), 
+                        mode='bilinear', 
+                        align_corners=False
+                    )
+                    gt_video = gt_video_tensor.permute(0, 2, 3, 1).numpy()  # [f, h, w, c]
+                    
+                    # Resize static video: [1, c, f, h, w] -> [1, c, f, h, w]
+                    static_video = F.interpolate(
+                        static_video.squeeze(0),  # [c, f, h, w]
+                        size=(orig_height, aligned_width),
+                        mode='bilinear',
+                        align_corners=False
+                    ).unsqueeze(0)  # [1, c, f, h, w]
+                    
+                    # Resize hand video if exists: [1, c, f, h, w] -> [1, c, f, h, w]
+                    if hand_video is not None:
+                        hand_video = F.interpolate(
+                            hand_video.squeeze(0),  # [c, f, h, w]
+                            size=(orig_height, aligned_width),
+                            mode='bilinear',
+                            align_corners=False
+                        ).unsqueeze(0)  # [1, c, f, h, w]
+                    
+                    height, width = orig_height, aligned_width
+                else:
+                    height, width = orig_height, orig_width
+            else:
+                num_frames = gt_video.shape[0]
+                height, width = gt_video.shape[1], gt_video.shape[2]
+            
             with torch.no_grad():
                 with torch.autocast("cuda", dtype=weight_dtype):
-                    num_frames = gt_video.shape[0]
-                    height, width = gt_video.shape[1], gt_video.shape[2]
                     
                     mask_video = torch.zeros(1, 1, num_frames, height, width)
                     
@@ -818,8 +864,11 @@ def main():
         additional_kwargs=vae_kwargs,
     ).eval()
 
+    # Check if WAN 2.2 (needed for transformer loading and CLIP encoder)
+    is_wan2_2 = "2.2" in pipeline_config.get("type", "")
+    
     # Load CLIP image encoder (skip for WAN 2.2)
-    if "2.2" in pipeline_config.get("type", ""):
+    if is_wan2_2:
         logger.info("⚠️  WAN 2.2 detected: Skipping CLIP image encoder loading")
         clip_image_encoder = None
     else:
@@ -841,6 +890,7 @@ def main():
             os.path.join(args.pretrained_model_name_or_path, transformer_additional_kwargs.get('transformer_subpath', 'transformer')),
             transformer_additional_kwargs={
                 "condition_channels": args.condition_channels,
+                "is_wan2_2": is_wan2_2,
                 **transformer_additional_kwargs,
             },
             torch_dtype=weight_dtype,
@@ -1028,8 +1078,7 @@ def main():
     # ========== Setup Dataset ==========
     print("🔧 Setting up dataset...")
     
-    # Check if WAN 2.2 (requires width alignment to 32)
-    is_wan2_2 = "2.2" in pipeline_config.get("type", "")
+    # Use is_wan2_2 already defined above (for width alignment to 32)
     align_width_to_32 = is_wan2_2
     if align_width_to_32:
         print("📐 WAN 2.2 detected: Aligning width to multiples of 32 for compatibility")
@@ -1345,11 +1394,31 @@ def main():
                     latents = _batch_encode_vae(videos)
 
                 # Encode condition videos
+                dropout_mask = None  # Initialize dropout_mask
                 if requires_hand_videos and hand_videos is not None:
                     hand_videos = hand_videos.to(accelerator.device, dtype=weight_dtype)
                     hand_videos = rearrange(hand_videos, "b f c h w -> b c f h w")
                     with torch.no_grad():
                         hand_latents = _batch_encode_vae(hand_videos)
+                    
+                    # Apply hand dropout for classifier-free guidance training
+                    # This helps the model learn to generate without hand information
+                    hand_dropout_prob = training_config.get("hand_dropout_prob", 0.0)
+                    if hand_dropout_prob > 0:
+                        # Get batch size from hand_latents shape
+                        hand_batch_size = hand_latents.shape[0]
+                        # Sample dropout mask: each sample in batch has independent dropout probability
+                        dropout_mask = torch.rand(hand_batch_size, device=accelerator.device) < hand_dropout_prob
+                        
+                        if dropout_mask.any():
+                            # Zero out hand latents for dropped samples
+                            # hand_latents shape: [B, 16, F, H, W]
+                            hand_latents[dropout_mask] = torch.zeros_like(hand_latents[dropout_mask])
+                            
+                            # Log dropout statistics (only occasionally to avoid spam)
+                            if global_step % 100 == 0:
+                                num_dropped = dropout_mask.sum().item()
+                                accelerator.log({"hand_dropout_count": num_dropped}, step=global_step)
                 else:
                     hand_latents = None
 
@@ -1444,7 +1513,16 @@ def main():
                 noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
 
                 # Flow Matching target
-                target = noise - latents
+                # If hand_latents were dropped out, use static_latents as target instead of full latents
+                # This teaches the model to generate static-only content when hand info is missing
+                if dropout_mask is not None and dropout_mask.any() and static_latents is not None:
+                    # For dropped samples, use static_latents as target
+                    # target shape: [B, 16, F, H, W]
+                    target = noise - latents.clone()
+                    # Replace target for dropped samples with static-based target
+                    target[dropout_mask] = noise[dropout_mask] - static_latents[dropout_mask]
+                else:
+                    target = noise - latents
 
                 # Calculate seq_len for transformer (based on patched dimensions)
                 seq_len = math.ceil(

@@ -1,12 +1,17 @@
 """
-WanFunInpaintHandConcatPipeline: WAN Fun Inpaint pipeline with hand video condition.
+Wan2_2FunInpaintHandConcatPipeline: WAN 2.2 Fun Inpaint pipeline with hand video condition.
 
-This pipeline extends WanFunInpaintPipeline to support:
+This pipeline extends Wan2_2FunInpaintPipeline to support:
 - static_video: Used as the init video for inpainting (replaces 'video' arg)
 - hand_video: Additional condition input concatenated to the transformer
 
-Uses WanTransformer3DModelWithConcat which extends patch_embedding to handle
-additional condition channels.
+Uses WanTransformer3DModelWithConcat (or future Wan2_2Transformer3DModelWithConcat)
+which extends patch_embedding to handle additional condition channels.
+
+Key differences from WanFunInpaintHandConcatPipeline:
+- No CLIP image encoder (WAN 2.2 doesn't use it)
+- No clip_fea in transformer forward
+- Supports boundary-based transformer_2 switching
 """
 
 import inspect
@@ -31,14 +36,14 @@ from PIL import Image
 from ..models import (
     AutoencoderKLWan,
     AutoTokenizer,
-    CLIPModel,
     WanT5EncoderModel,
+    Wan2_2Transformer3DModel,
 )
 from ..models.wan_transformer3d_with_conditions import WanTransformer3DModelWithConcat
 from ..utils.fm_solvers import FlowDPMSolverMultistepScheduler, get_sampling_sigmas
 from ..utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
-from .pipeline_wan_fun_inpaint import (
-    WanFunInpaintPipeline,
+from .pipeline_wan2_2_fun_inpaint import (
+    Wan2_2FunInpaintPipeline,
     WanPipelineOutput,
     resize_mask,
     retrieve_timesteps,
@@ -47,19 +52,19 @@ from .pipeline_wan_fun_inpaint import (
 logger = logging.get_logger(__name__)
 
 
-class WanFunInpaintHandConcatPipeline(WanFunInpaintPipeline):
+class Wan2_2FunInpaintHandConcatPipeline(Wan2_2FunInpaintPipeline):
     """
-    WAN Fun Inpaint Pipeline with Hand Video Concatenation.
+    WAN 2.2 Fun Inpaint Pipeline with Hand Video Concatenation.
     
-    This pipeline extends WanFunInpaintPipeline to support an additional
+    This pipeline extends Wan2_2FunInpaintPipeline to support an additional
     hand video condition that is concatenated to the transformer input.
     
     Args:
         tokenizer: T5 tokenizer
         text_encoder: WAN T5 text encoder
         vae: WAN VAE
-        transformer: WanTransformer3DModelWithConcat (extended for condition channels)
-        clip_image_encoder: CLIP image encoder
+        transformer: Wan2_2Transformer3DModel or WanTransformer3DModelWithConcat
+        transformer_2: Optional second transformer for boundary-based sampling
         scheduler: Flow matching scheduler
     
     Input mapping:
@@ -79,17 +84,17 @@ class WanFunInpaintHandConcatPipeline(WanFunInpaintPipeline):
         tokenizer: AutoTokenizer,
         text_encoder: WanT5EncoderModel,
         vae: AutoencoderKLWan,
-        transformer: WanTransformer3DModelWithConcat,
-        clip_image_encoder: CLIPModel,
-        scheduler: FlowMatchEulerDiscreteScheduler,
+        transformer: Union[Wan2_2Transformer3DModel, WanTransformer3DModelWithConcat],
+        transformer_2: Optional[Union[Wan2_2Transformer3DModel, WanTransformer3DModelWithConcat]] = None,
+        scheduler: FlowMatchEulerDiscreteScheduler = None,
     ):
-        # Call parent's __init__ which registers modules
+        # Call parent's __init__ which registers modules (no clip_image_encoder!)
         super().__init__(
             tokenizer=tokenizer,
             text_encoder=text_encoder,
             vae=vae,
             transformer=transformer,
-            clip_image_encoder=clip_image_encoder,
+            transformer_2=transformer_2,
             scheduler=scheduler,
         )
     
@@ -160,12 +165,10 @@ class WanFunInpaintHandConcatPipeline(WanFunInpaintPipeline):
         ] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
-        clip_image: Image.Image = None,
         max_sequence_length: int = 512,
+        boundary: float = 0.875,
         comfyui_progressbar: bool = False,
-        # If you want to generate a 480p video, it is recommended to set the shift value to 3.0.
-        # If you want to generate a 720p video, it is recommended to set the shift value to 5.0.
-        shift: float = 3.0,
+        shift: int = 5,
     ) -> Union[WanPipelineOutput, Tuple]:
         """
         Generate video with hand-conditioned inpainting.
@@ -193,8 +196,8 @@ class WanFunInpaintHandConcatPipeline(WanFunInpaintPipeline):
             callback_on_step_end: Callback function
             attention_kwargs: Additional attention kwargs
             callback_on_step_end_tensor_inputs: Tensor inputs for callback
-            clip_image: CLIP image for conditioning
             max_sequence_length: Max text sequence length
+            boundary: Boundary for transformer_2 switching (WAN 2.2 specific)
             comfyui_progressbar: Use ComfyUI progress bar
             shift: Scheduler shift parameter
         
@@ -204,6 +207,8 @@ class WanFunInpaintHandConcatPipeline(WanFunInpaintPipeline):
         # 0. Default values
         if isinstance(callback_on_step_end, (PipelineCallback, MultiPipelineCallbacks)):
             callback_on_step_end_tensor_inputs = callback_on_step_end.tensor_inputs
+        
+        num_videos_per_prompt = 1
         
         # 1. Check inputs
         self.check_inputs(
@@ -301,7 +306,7 @@ class WanFunInpaintHandConcatPipeline(WanFunInpaintPipeline):
         if comfyui_progressbar:
             pbar.update(1)
         
-        # Prepare mask latent variables (same as original)
+        # Prepare mask latent variables (same as Wan2_2FunInpaintPipeline)
         if init_video is not None:
             if mask_video is not None and (mask_video == 255).all():
                 mask_latents = torch.tile(
@@ -317,7 +322,7 @@ class WanFunInpaintHandConcatPipeline(WanFunInpaintPipeline):
                 )
                 mask_condition = mask_condition.to(dtype=torch.float32)
                 mask_condition = rearrange(mask_condition, "(b f) c h w -> b c f h w", f=video_length_mask)
-
+                
                 masked_video = init_video * (torch.tile(mask_condition, [1, 3, 1, 1, 1]) < 0.5)
                 _, masked_video_latents = self.prepare_mask_latents(
                     None,
@@ -367,16 +372,6 @@ class WanFunInpaintHandConcatPipeline(WanFunInpaintPipeline):
             # No hand video
             hand_latents = torch.zeros_like(latents).to(device, weight_dtype)
         
-        # Prepare CLIP context
-        if clip_image is not None:
-            clip_image_tensor = TF.to_tensor(clip_image).sub_(0.5).div_(0.5).to(device, weight_dtype)
-            clip_context = self.clip_image_encoder([clip_image_tensor[:, None, :, :]])
-        else:
-            clip_image_placeholder = Image.new("RGB", (512, 512), color=(0, 0, 0))
-            clip_image_tensor = TF.to_tensor(clip_image_placeholder).sub_(0.5).div_(0.5).to(device, weight_dtype)
-            clip_context = self.clip_image_encoder([clip_image_tensor[:, None, :, :]])
-            clip_context = torch.zeros_like(clip_context)
-        
         if comfyui_progressbar:
             pbar.update(1)
         
@@ -398,9 +393,14 @@ class WanFunInpaintHandConcatPipeline(WanFunInpaintPipeline):
         # 8. Denoising loop
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
         self.transformer.num_inference_steps = num_inference_steps
+        if self.transformer_2 is not None:
+            self.transformer_2.num_inference_steps = num_inference_steps
+        
         with self.progress_bar(total=num_inference_steps) as progress_bar:
             for i, t in enumerate(timesteps):
                 self.transformer.current_steps = i
+                if self.transformer_2 is not None:
+                    self.transformer_2.current_steps = i
                 
                 if self.interrupt:
                     continue
@@ -411,41 +411,62 @@ class WanFunInpaintHandConcatPipeline(WanFunInpaintPipeline):
                     latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
                 
                 # Prepare y (mask + static latents)
-                mask_input = torch.cat([mask_latents] * 2) if do_classifier_free_guidance else mask_latents
-                masked_video_latents_input = (
-                    torch.cat([masked_video_latents] * 2) if do_classifier_free_guidance else masked_video_latents
-                )
-                y = torch.cat([mask_input, masked_video_latents_input], dim=1).to(device, weight_dtype)
+                if init_video is not None:
+                    mask_input = torch.cat([mask_latents] * 2) if do_classifier_free_guidance else mask_latents
+                    masked_video_latents_input = (
+                        torch.cat([masked_video_latents] * 2) if do_classifier_free_guidance else masked_video_latents
+                    )
+                    y = torch.cat([mask_input, masked_video_latents_input], dim=1).to(device, weight_dtype)
+                else:
+                    y = None
                 
                 # Prepare hand latents for classifier-free guidance
                 hand_latents_input = (
                     torch.cat([hand_latents] * 2) if do_classifier_free_guidance else hand_latents
                 )
                 
-                # Prepare CLIP context
-                clip_context_input = (
-                    torch.cat([clip_context] * 2) if do_classifier_free_guidance else clip_context
-                )
-                
                 # Broadcast timestep
                 timestep = t.expand(latent_model_input.shape[0])
                 
-                # Predict noise with hand condition
+                # Select transformer based on boundary (WAN 2.2 specific)
+                if self.transformer_2 is not None:
+                    if t >= boundary * self.scheduler.config.num_train_timesteps:
+                        local_transformer = self.transformer_2
+                    else:
+                        local_transformer = self.transformer
+                else:
+                    local_transformer = self.transformer
+                
+                # Predict noise with hand condition (no clip_fea for WAN 2.2)
                 with torch.cuda.amp.autocast(dtype=weight_dtype), torch.cuda.device(device=device):
-                    noise_pred = self.transformer(
-                        x=latent_model_input,
-                        context=in_prompt_embeds,
-                        t=timestep,
-                        seq_len=seq_len,
-                        y=y,
-                        clip_fea=clip_context_input,
-                        condition_latents=hand_latents_input,  # Hand condition
-                    )
+                    # Check if transformer supports condition_latents (WanTransformer3DModelWithConcat)
+                    if hasattr(local_transformer, 'condition_channels') and local_transformer.condition_channels > 0:
+                        noise_pred = local_transformer(
+                            x=latent_model_input,
+                            context=in_prompt_embeds,
+                            t=timestep,
+                            seq_len=seq_len,
+                            y=y,
+                            condition_latents=hand_latents_input,  # Hand condition
+                        )
+                    else:
+                        # Fallback for transformers without condition support
+                        noise_pred = local_transformer(
+                            x=latent_model_input,
+                            context=in_prompt_embeds,
+                            t=timestep,
+                            seq_len=seq_len,
+                            y=y,
+                        )
                 
                 # Perform guidance
                 if do_classifier_free_guidance:
+                    if self.transformer_2 is not None and (isinstance(self.guidance_scale, (list, tuple))):
+                        sample_guide_scale = self.guidance_scale[1] if t >= self.transformer_2.config.boundary * self.scheduler.config.num_train_timesteps else self.guidance_scale[0]
+                    else:
+                        sample_guide_scale = self.guidance_scale
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-                    noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
+                    noise_pred = noise_pred_uncond + sample_guide_scale * (noise_pred_text - noise_pred_uncond)
                 
                 # Compute previous noisy sample
                 latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
@@ -482,3 +503,4 @@ class WanFunInpaintHandConcatPipeline(WanFunInpaintPipeline):
             video = torch.from_numpy(video) if isinstance(video, np.ndarray) else video
         
         return WanPipelineOutput(videos=video)
+
