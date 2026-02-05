@@ -17,6 +17,7 @@ import gc
 import logging
 import math
 import os
+import time
 import pickle
 import random
 import re
@@ -72,6 +73,9 @@ from training.wan_static_pose.models import (
 from training.wan_static_pose.models.wan_transformer3d_with_conditions import (
     WanTransformer3DModelWithConcat,
 )
+from training.wan_static_pose.models.wan_transformer3d_vace import (
+    WanTransformer3DVace,
+)
 from training.wan_static_pose.pipeline.pipeline_wan_fun_inpaint import (
     WanFunInpaintPipeline,
 )
@@ -80,6 +84,9 @@ from training.wan_static_pose.pipeline.pipeline_wan_fun_inpaint_hand_concat impo
 )
 from training.wan_static_pose.pipeline.pipeline_wan2_2_fun_inpaint_hand_concat import (
     Wan2_2FunInpaintHandConcatPipeline,
+)
+from training.wan_static_pose.pipeline.pipeline_wan_fun_inpaint_hand_vace import (
+    WanFunInpaintHandVacePipeline,
 )
 from training.wan_static_pose.utils.lora_utils import (
     create_network,
@@ -288,6 +295,19 @@ def log_validation(
                     },
                     torch_dtype=weight_dtype,
                 )
+            elif transformer_type == "WanTransformer3DVace":
+                vace_layers = transformer_config.get('vace_layers', None)
+                vace_in_dim = transformer_config.get('vace_in_dim', 16)
+                transformer3d_val = WanTransformer3DVace.from_pretrained(
+                    os.path.join(base_model_path, transformer_additional_kwargs.get('transformer_subpath', 'transformer')),
+                    transformer_additional_kwargs={
+                        "vace_layers": vace_layers,
+                        "vace_in_dim": vace_in_dim,
+                        "is_wan2_2": is_wan2_2,
+                        **transformer_additional_kwargs,
+                    },
+                    torch_dtype=weight_dtype,
+                )
             else:
                 raise ValueError(f"Unsupported transformer type: {transformer_type}")
             src_sd = accelerator.unwrap_model(transformer3d).state_dict()
@@ -340,6 +360,16 @@ def log_validation(
             elif pipeline_type == "wan2.1_fun_inp_hand_concat":
                 logger.info("🔧 Using WAN 2.1 hand concat pipeline for validation")
                 pipeline = WanFunInpaintHandConcatPipeline(
+                    vae=accelerator.unwrap_model(vae),
+                    text_encoder=accelerator.unwrap_model(text_encoder),
+                    tokenizer=tokenizer,
+                    transformer=transformer3d_val,
+                    scheduler=scheduler,
+                    clip_image_encoder=clip_image_encoder_for_pipeline,
+                )
+            elif pipeline_type == "wan2.1_fun_inp_hand_vace":
+                logger.info("🔧 Using WAN 2.1 VACE pipeline for validation")
+                pipeline = WanFunInpaintHandVacePipeline(
                     vae=accelerator.unwrap_model(vae),
                     text_encoder=accelerator.unwrap_model(text_encoder),
                     tokenizer=tokenizer,
@@ -505,6 +535,22 @@ def log_validation(
                             mask_video=mask_video.to(accelerator.device, dtype=weight_dtype),
                             hand_video=hand_video.to(accelerator.device, dtype=weight_dtype) if hand_video is not None else None,
                         ).videos
+                    elif transformer_type == "WanTransformer3DVace":
+                        # VACE pipeline uses 'static_video', 'hand_video', and 'vace_context_scale'
+                        vace_context_scale = training_config.get("vace_context_scale", 1.0)
+                        sample = pipeline(
+                            prompt_text,
+                            num_frames=num_frames,
+                            negative_prompt="bad detailed",
+                            height=height,
+                            width=width,
+                            guidance_scale=6.0,
+                            generator=generator,
+                            static_video=static_video.to(accelerator.device, dtype=weight_dtype),
+                            mask_video=mask_video.to(accelerator.device, dtype=weight_dtype),
+                            hand_video=hand_video.to(accelerator.device, dtype=weight_dtype) if hand_video is not None else None,
+                            vace_context_scale=vace_context_scale,
+                        ).videos
                     else:
                         raise ValueError(f"Unsupported transformer type: {transformer_type}")
                     
@@ -627,8 +673,8 @@ def main():
                         help="Path to experiment YAML config file")
     parser.add_argument("--override", type=str, nargs="*",
                         help="Override config values (key=value format)")
-    parser.add_argument("--mode", type=str, choices=["debug", "slurm_test", "slurm"], default="slurm",
-                        help="Training mode: debug, slurm_test, or slurm")
+    parser.add_argument("--mode", type=str, choices=["debug", "slurm_test", "slurm", "batch"], default="slurm",
+                        help="Training mode: debug, slurm_test, slurm, or batch")
     # # Add all other arguments from args.py
     add_all_args(parser)
     args = parser.parse_args()
@@ -737,6 +783,13 @@ def main():
             print(f"🚀 New training: Using current SLURM Job ID: {slurm_job_id}")
         args.output_dir = f"{base_output_dir}_slurm_{slurm_job_id}"
         print(f"📁 SLURM mode: Output directory set to {args.output_dir}")
+    elif args.mode == "batch":
+        # Batch mode: add timestamp to output directory (use env var so all processes get same dir)
+        timestamp = os.environ.get("BATCH_TIMESTAMP")
+        if not timestamp:
+            timestamp = dt.now().strftime("%Y%m%d_%H%M%S")
+        args.output_dir = f"{base_output_dir}_batch_{timestamp}"
+        print(f"🚀 Batch mode: Output directory set to {args.output_dir}")
     
     print(f"📁 Final output directory: {args.output_dir}")
     print(f"   - Base: {base_output_dir}")
@@ -780,9 +833,6 @@ def main():
             fsdp_stage = 0
         print(f"🚀 Using FSDP stage: {fsdp_stage}")
         args.use_fsdp = True
-        if fsdp_stage == 3:
-            print(f"   Auto set save_state to True because fsdp_stage == 3")
-            args.save_state = True
     else:
         zero_stage = 0
         fsdp_stage = 0
@@ -890,6 +940,25 @@ def main():
             os.path.join(args.pretrained_model_name_or_path, transformer_additional_kwargs.get('transformer_subpath', 'transformer')),
             transformer_additional_kwargs={
                 "condition_channels": args.condition_channels,
+                "is_wan2_2": is_wan2_2,
+                **transformer_additional_kwargs,
+            },
+            torch_dtype=weight_dtype,
+        )
+    elif transformer_type == "WanTransformer3DVace":
+        # Get VACE-specific configuration
+        vace_layers = transformer_config.get('vace_layers', None)  # e.g., [0, 2, 4, 6, ...] or None for default
+        vace_in_dim = transformer_config.get('vace_in_dim', 16)  # Hand latent channels
+
+        print(f"🔧 Loading WanTransformer3DVace with VACE conditioning...")
+        print(f"   vace_layers: {vace_layers if vace_layers else 'default (every 2nd layer)'}")
+        print(f"   vace_in_dim: {vace_in_dim}")
+
+        transformer3d = WanTransformer3DVace.from_pretrained(
+            os.path.join(args.pretrained_model_name_or_path, transformer_additional_kwargs.get('transformer_subpath', 'transformer')),
+            transformer_additional_kwargs={
+                "vace_layers": vace_layers,
+                "vace_in_dim": vace_in_dim,
                 "is_wan2_2": is_wan2_2,
                 **transformer_additional_kwargs,
             },
@@ -1211,10 +1280,13 @@ def main():
         if args.tracker_entity_name:
             wandb_init_kwargs["entity"] = args.tracker_entity_name
         
-        # Set wandb to offline mode for debug and slurm_test modes
+        # Set wandb to offline mode for debug and slurm_test modes; disabled for batch
         if args.mode in ["debug", "slurm_test"]:
             wandb_init_kwargs["mode"] = "offline"
             print(f"🔧 WandB set to offline mode for {args.mode}")
+        elif args.mode == "batch":
+            wandb_init_kwargs["mode"] = "disabled"
+            print(f"🔧 Batch mode: WandB disabled")
         
         accelerator.init_trackers(
             project_name=args.tracker_project_name,
@@ -1254,30 +1326,35 @@ def main():
             else:
                 accelerator.print(f"Resuming from checkpoint {checkpoint_path}")
                 
-                # Load full accelerator state if save_state was used
-                if args.save_state and os.path.exists(os.path.join(checkpoint_path, "optimizer.bin")):
+                # Try to load full accelerator state first, fallback to weight-only loading if it fails
+                try:
                     accelerator.load_state(checkpoint_path)
-                elif args.train_mode == "lora":
-                    # Load LoRA weights
-                    lora_path = os.path.join(checkpoint_path, "lora_diffusion_pytorch_model.safetensors")
-                    if os.path.exists(lora_path):
-                        state_dict = load_file(lora_path, device=str(accelerator.device))
-                        m, u = accelerator.unwrap_model(network).load_state_dict(state_dict, strict=False)
-                        print(f"Loaded LoRA: missing {len(m)}, unexpected {len(u)}")
+                    accelerator.print(f"Successfully loaded full accelerator state from {checkpoint_path}")
+                except Exception as e:
+                    accelerator.print(f"Failed to load full accelerator state: {e}")
+                    accelerator.print(f"Falling back to weight-only loading...")
                     
-                    # Load non-LoRA trainable weights (e.g., patch_embedding)
-                    non_lora_path = os.path.join(checkpoint_path, "non_lora_weights.safetensors")
-                    if os.path.exists(non_lora_path):
-                        non_lora_state_dict = load_file(non_lora_path, device=str(accelerator.device))
-                        m, u = accelerator.unwrap_model(transformer3d).load_state_dict(non_lora_state_dict, strict=False)
-                        print(f"Loaded non-LoRA weights: missing {len(m)}, unexpected {len(u)}")
-                else:
-                    # Load transformer weights for SFT
-                    transformer_path = os.path.join(checkpoint_path, "transformer")
-                    if os.path.exists(transformer_path):
-                        state_dict = WanTransformer3DModelWithConcat.from_pretrained(transformer_path).state_dict()
-                        m, u = accelerator.unwrap_model(transformer3d).load_state_dict(state_dict, strict=False)
-                        print(f"Loaded transformer: missing {len(m)}, unexpected {len(u)}")
+                    if args.train_mode == "lora":
+                        # Load LoRA weights
+                        lora_path = os.path.join(checkpoint_path, "lora_diffusion_pytorch_model.safetensors")
+                        if os.path.exists(lora_path):
+                            state_dict = load_file(lora_path, device=str(accelerator.device))
+                            m, u = accelerator.unwrap_model(network).load_state_dict(state_dict, strict=False)
+                            print(f"Loaded LoRA: missing {len(m)}, unexpected {len(u)}")
+                        
+                        # Load non-LoRA trainable weights (e.g., patch_embedding)
+                        non_lora_path = os.path.join(checkpoint_path, "non_lora_weights.safetensors")
+                        if os.path.exists(non_lora_path):
+                            non_lora_state_dict = load_file(non_lora_path, device=str(accelerator.device))
+                            m, u = accelerator.unwrap_model(transformer3d).load_state_dict(non_lora_state_dict, strict=False)
+                            print(f"Loaded non-LoRA weights: missing {len(m)}, unexpected {len(u)}")
+                    else:
+                        # Load transformer weights for SFT
+                        transformer_path = os.path.join(checkpoint_path, "transformer")
+                        if os.path.exists(transformer_path):
+                            state_dict = WanTransformer3DModelWithConcat.from_pretrained(transformer_path).state_dict()
+                            m, u = accelerator.unwrap_model(transformer3d).load_state_dict(state_dict, strict=False)
+                            print(f"Loaded transformer: missing {len(m)}, unexpected {len(u)}")
                 
                 # Extract global step from checkpoint name
                 checkpoint_name = os.path.basename(checkpoint_path.rstrip('/'))
@@ -1307,22 +1384,34 @@ def main():
                     checkpoint_path = os.path.join(args.output_dir, latest_checkpoint)
                     accelerator.print(f"Resuming from latest checkpoint {checkpoint_path}")
                     
-                    # Load full accelerator state if save_state was used
-                    if args.save_state and os.path.exists(os.path.join(checkpoint_path, "optimizer.bin")):
+                    # Try to load full accelerator state first, fallback to weight-only loading if it fails
+                    try:
                         accelerator.load_state(checkpoint_path)
-                    elif args.train_mode == "lora":
-                        lora_path = os.path.join(checkpoint_path, "lora_diffusion_pytorch_model.safetensors")
-                        if os.path.exists(lora_path):
-                            state_dict = load_file(lora_path, device=str(accelerator.device))
-                            m, u = accelerator.unwrap_model(network).load_state_dict(state_dict, strict=False)
-                            print(f"Loaded LoRA: missing {len(m)}, unexpected {len(u)}")
+                        accelerator.print(f"Successfully loaded full accelerator state from {checkpoint_path}")
+                    except Exception as e:
+                        accelerator.print(f"Failed to load full accelerator state: {e}")
+                        accelerator.print(f"Falling back to weight-only loading...")
                         
-                        # Load non-LoRA trainable weights (e.g., patch_embedding)
-                        non_lora_path = os.path.join(checkpoint_path, "non_lora_weights.safetensors")
-                        if os.path.exists(non_lora_path):
-                            non_lora_state_dict = load_file(non_lora_path, device=str(accelerator.device))
-                            m, u = accelerator.unwrap_model(transformer3d).load_state_dict(non_lora_state_dict, strict=False)
-                            print(f"Loaded non-LoRA weights: missing {len(m)}, unexpected {len(u)}")
+                        if args.train_mode == "lora":
+                            lora_path = os.path.join(checkpoint_path, "lora_diffusion_pytorch_model.safetensors")
+                            if os.path.exists(lora_path):
+                                state_dict = load_file(lora_path, device=str(accelerator.device))
+                                m, u = accelerator.unwrap_model(network).load_state_dict(state_dict, strict=False)
+                                print(f"Loaded LoRA: missing {len(m)}, unexpected {len(u)}")
+                            
+                            # Load non-LoRA trainable weights (e.g., patch_embedding)
+                            non_lora_path = os.path.join(checkpoint_path, "non_lora_weights.safetensors")
+                            if os.path.exists(non_lora_path):
+                                non_lora_state_dict = load_file(non_lora_path, device=str(accelerator.device))
+                                m, u = accelerator.unwrap_model(transformer3d).load_state_dict(non_lora_state_dict, strict=False)
+                                print(f"Loaded non-LoRA weights: missing {len(m)}, unexpected {len(u)}")
+                        else:
+                            # Load transformer weights for SFT
+                            transformer_path = os.path.join(checkpoint_path, "transformer")
+                            if os.path.exists(transformer_path):
+                                state_dict = WanTransformer3DModelWithConcat.from_pretrained(transformer_path).state_dict()
+                                m, u = accelerator.unwrap_model(transformer3d).load_state_dict(state_dict, strict=False)
+                                print(f"Loaded transformer weights: missing {len(m)}, unexpected {len(u)}")
                     
                     global_step = int(latest_checkpoint.split("-")[1])
                     initial_global_step = global_step
@@ -1372,8 +1461,17 @@ def main():
             weight_dtype, global_step=global_step
         )
 
-    requires_hand_videos = transformer_type == "WanTransformer3DModelWithConcat"
+    requires_hand_videos = transformer_type in ["WanTransformer3DModelWithConcat", "WanTransformer3DVace"]
     pretrain_mode = training_config.get("pretrain_mode", "t2v")
+
+    # Time-based checkpoint saving (47h45m); only when slurm and partition is not h100
+    training_start_time = time.time()
+    time_based_checkpoint_saved = False
+    TIME_LIMIT_SECONDS = 47 * 3600 + 45 * 60  # 47 hours 45 minutes
+    enable_time_limit_checkpoint = (
+        args.mode == "slurm"
+        and os.environ.get("SLURM_JOB_PARTITION", "") != "h100"
+    )
 
     for epoch in range(first_epoch, args.num_train_epochs):
         train_loss = 0.0
@@ -1547,7 +1645,7 @@ def main():
                             y=torch.zeros_like(inpaint_latents) if pretrain_mode == "t2v" else inpaint_latents,
                             clip_fea=None,  # Can add CLIP features later
                         )
-                    elif transformer_type == "WanTransformer3DModelWithConcat": 
+                    elif transformer_type == "WanTransformer3DModelWithConcat":
                         # Concat model: with condition_latents
                         noise_pred = transformer3d(
                             x=noisy_latents,
@@ -1557,6 +1655,27 @@ def main():
                             y=inpaint_latents,
                             clip_fea=None,  # Can add CLIP features later
                             condition_latents=hand_latents,  # Extra condition channels
+                        )
+                    elif transformer_type == "WanTransformer3DVace":
+                        # VACE model: hand condition via vace_context (list format)
+                        # Convert hand_latents to list format for VACE
+                        if hand_latents is not None:
+                            vace_context = [hand_latents[i] for i in range(hand_latents.shape[0])]
+                        else:
+                            vace_context = None
+
+                        # Get vace_context_scale from config (default 1.0)
+                        vace_context_scale = training_config.get("vace_context_scale", 1.0)
+
+                        noise_pred = transformer3d(
+                            x=noisy_latents,
+                            t=timesteps,
+                            context=prompt_embeds,
+                            seq_len=seq_len,
+                            y=inpaint_latents,
+                            clip_fea=None,  # Can add CLIP features later
+                            vace_context=vace_context,
+                            vace_context_scale=vace_context_scale,
                         )
                     else:
                         raise ValueError(f"Unsupported transformer type: {transformer_type}")
@@ -1590,31 +1709,36 @@ def main():
                 accelerator.log({"train_loss": train_loss}, step=global_step)
                 train_loss = 0.0
 
-                # Save checkpoint
-                if global_step % checkpointing_steps == 0:
-                    # Remove old checkpoints if limit is set (all processes wait)
-                    if args.checkpoints_total_limit is not None:
-                        checkpoints = os.listdir(args.output_dir) if os.path.exists(args.output_dir) else []
-                        checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
-                        checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
+                # Save checkpoint (step interval or time limit; time limit only when slurm and partition != h100)
+                elapsed_time = time.time() - training_start_time
+                should_save_time_based_checkpoint = (
+                    enable_time_limit_checkpoint
+                    and not time_based_checkpoint_saved
+                    and elapsed_time >= TIME_LIMIT_SECONDS
+                )
+                if should_save_time_based_checkpoint or global_step % checkpointing_steps == 0:
+                    if accelerator.is_main_process or accelerator.distributed_type == DistributedType.DEEPSPEED:
+                        if should_save_time_based_checkpoint:
+                            time_based_checkpoint_saved = True
+                            elapsed_hours = elapsed_time / 3600
+                            logger.info(f"⏰ Time-based checkpoint trigger: {elapsed_hours:.2f} hours elapsed (limit: 47.75 hours)")
+                        # Remove old checkpoints if limit is set (all processes wait)
+                        if args.checkpoints_total_limit is not None:
+                            checkpoints = os.listdir(args.output_dir) if os.path.exists(args.output_dir) else []
+                            checkpoints = [d for d in checkpoints if d.startswith("checkpoint")]
+                            checkpoints = sorted(checkpoints, key=lambda x: int(x.split("-")[1]))
 
-                        if len(checkpoints) >= args.checkpoints_total_limit:
-                            num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
-                            if accelerator.is_main_process:
-                                for removing_checkpoint in checkpoints[:num_to_remove]:
-                                    removing_path = os.path.join(args.output_dir, removing_checkpoint)
-                                    logger.info(f"Removing old checkpoint: {removing_path}")
-                                    shutil.rmtree(removing_path)
+                            if len(checkpoints) >= args.checkpoints_total_limit:
+                                num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
+                                if accelerator.is_main_process:
+                                    for removing_checkpoint in checkpoints[:num_to_remove]:
+                                        removing_path = os.path.join(args.output_dir, removing_checkpoint)
+                                        logger.info(f"Removing old checkpoint: {removing_path}")
+                                        shutil.rmtree(removing_path)
 
-                    save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                    
-                    # Save full accelerator state if requested (includes optimizer, scheduler, etc.)
-                    if args.save_state:
-                        accelerator.save_state(save_path)
-                        logger.info(f"Saved accelerator state to {save_path}")
-                    
-                    # Save model weights
-                    if accelerator.is_main_process:
+                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                        
+                        # Save model weights
                         os.makedirs(save_path, exist_ok=True)
                         
                         if args.train_mode == "lora":
@@ -1623,6 +1747,10 @@ def main():
                             save_model_sft(save_path, transformer3d, accelerator)
 
                         logger.info(f"Saved checkpoint to {save_path}")
+
+                        # Save full accelerator state
+                        accelerator.save_state(save_path)
+                        logger.info(f"Saved accelerator state to {save_path}")
 
                 # Validation (runs if validation_set is defined in config)
                 # Run on all GPUs to distribute validation videos (not just main process)
