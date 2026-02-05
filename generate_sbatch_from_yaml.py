@@ -16,7 +16,7 @@ import os
 from pathlib import Path
 from datetime import datetime
 
-def generate_sbatch_script(yaml_file, output_script=None, aicomputing=False):
+def generate_sbatch_script(yaml_file, output_script=None, aicomputing=False, h100=False):
     """Generate SLURM batch script from YAML configuration."""
     
     # Load YAML configuration
@@ -112,6 +112,12 @@ def generate_sbatch_script(yaml_file, output_script=None, aicomputing=False):
         if 'error' in slurm:
             slurm['error'] = slurm['error'].replace(path_prefix_old, path_prefix_new)
     
+    # Override SLURM for h100 when not aicomputing (--h100 flag)
+    if not aicomputing and h100:
+        print("🔧 H100 mode: Setting partition=h100, nodelist=worker-node1001")
+        slurm['partition'] = 'h100'
+        slurm['nodelist'] = 'worker-node1001'
+    
     # Auto-update paths with extracted date and experiment name
     if date_match != "unknown":
         # Get experiment name and date from YAML
@@ -203,6 +209,8 @@ conda activate world_model
 #SBATCH --partition={slurm.get('partition', 'batch')}
 #SBATCH --output={slurm.get('output', 'out/%j_default.out')}
 #SBATCH --error={slurm.get('error', 'out/%j_default.err')}"""
+        if slurm.get('nodelist'):
+            slurm_directives += f"\n#SBATCH --nodelist={slurm.get('nodelist')}"
         if slurm.get('exclude'):
             slurm_directives += f"\n#SBATCH --exclude={slurm.get('exclude')}"
         script_content = f"""{slurm_directives}
@@ -811,19 +819,23 @@ echo "   - SLURM error: {slurm.get('error', 'out/%j_default.err')}"
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python generate_sbatch_from_yaml.py <yaml_config_file> [output_script_name] [--aicomputing]")
+        print("Usage: python generate_sbatch_from_yaml.py <yaml_config_file> [output_script_name] [--aicomputing] [--h100]")
         print("Example: python generate_sbatch_from_yaml.py trumans_concat_static_hand.yaml")
         print("Example: python generate_sbatch_from_yaml.py trumans_concat_static_hand.yaml my_script.sh --aicomputing")
+        print("Example: python generate_sbatch_from_yaml.py trumans_concat_static_hand.yaml my_script.sh --h100")
         sys.exit(1)
     
     yaml_file = sys.argv[1]
     output_script = None
     aicomputing = False
+    h100 = False
     
     # Parse arguments
     for i, arg in enumerate(sys.argv[2:], 2):
         if arg == "--aicomputing":
             aicomputing = True
+        elif arg == "--h100":
+            h100 = True
         elif not arg.startswith("--"):
             # This is the output script name
             output_script = arg
@@ -832,7 +844,7 @@ def main():
         print(f"Error: YAML file not found: {yaml_file}")
         sys.exit(1)
     
-    success = generate_sbatch_script(yaml_file, output_script, aicomputing)
+    success = generate_sbatch_script(yaml_file, output_script, aicomputing, h100)
     sys.exit(0 if success else 1)
 
 if __name__ == "__main__":
