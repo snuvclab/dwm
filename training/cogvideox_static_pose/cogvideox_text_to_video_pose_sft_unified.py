@@ -3575,9 +3575,11 @@ def main():
         experiment_config["output_dir"] = f"{base_output_dir}_slurm_{slurm_job_id}"
         print(f"📁 SLURM mode: Output directory set to {experiment_config['output_dir']}")
     elif args.mode == "batch":
-        # Batch mode: add timestamp to output directory
+        # Batch mode: add timestamp to output directory (use env var so all processes get same dir)
         from datetime import datetime
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        timestamp = os.environ.get("BATCH_TIMESTAMP")
+        if not timestamp:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         experiment_config["output_dir"] = f"{base_output_dir}_batch_{timestamp}"
         print(f"🚀 Batch mode: Output directory set to {experiment_config['output_dir']}")
     
