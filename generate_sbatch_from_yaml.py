@@ -141,28 +141,9 @@ def generate_sbatch_script(yaml_file, output_script=None, aicomputing=False):
     output_script = yaml_dir / output_script
     
     # Generate flexible script content
-    # Build SLURM directives based on aicomputing mode
+    # When aicomputing: no SLURM directives (run directly with --mode batch). Otherwise: SLURM header.
     if aicomputing:
-        slurm_directives = f"""#!/bin/bash
-#SBATCH --job-name={slurm.get('job_name', 'default_job')}
-#SBATCH --nodes={slurm.get('nodes', 1)}
-#SBATCH --gpus-per-node={slurm.get('gpus_per_node', slurm.get('gpus', 4))}
-#SBATCH --cpus-per-task={slurm.get('cpus_per_task', 48)}
-#SBATCH --mem={slurm.get('mem', '400G')}
-#SBATCH --partition={slurm.get('partition', 'jhb_vclab')}
-#SBATCH --nodelist={slurm.get('nodelist', 'compute-st-kait-gpu-2')}
-#SBATCH --output={slurm.get('output', 'out/%j_default.out')}
-#SBATCH --error={slurm.get('error', 'out/%j_default.err')}"""
-    else:
-        slurm_directives = f"""#!/bin/bash
-#SBATCH --job-name={slurm.get('job_name', 'default_job')}
-#SBATCH --nodes={slurm.get('nodes', 1)}
-#SBATCH --gpus={slurm.get('gpus', 2)}
-#SBATCH --partition={slurm.get('partition', 'batch')}
-#SBATCH --output={slurm.get('output', 'out/%j_default.out')}
-#SBATCH --error={slurm.get('error', 'out/%j_default.err')}"""
-    
-    script_content = f"""{slurm_directives}
+        script_start = f"""#!/bin/bash
 
 # Generated from: {yaml_file}
 # Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
@@ -211,9 +192,62 @@ source $(conda info --base)/etc/profile.d/conda.sh
 conda activate world_model
 
 # Set PYTHONPATH to include the current directory for module imports"""
+    else:
+        # SLURM mode: include SLURM directives
+        slurm_directives = f"""#!/bin/bash
+#SBATCH --job-name={slurm.get('job_name', 'default_job')}
+#SBATCH --nodes={slurm.get('nodes', 1)}
+#SBATCH --gpus={slurm.get('gpus', 2)}
+#SBATCH --partition={slurm.get('partition', 'batch')}
+#SBATCH --output={slurm.get('output', 'out/%j_default.out')}
+#SBATCH --error={slurm.get('error', 'out/%j_default.err')}"""
+        if slurm.get('exclude'):
+            slurm_directives += f"\n#SBATCH --exclude={slurm.get('exclude')}"
+        script_content = f"""{slurm_directives}
+
+# Generated from: {yaml_file}
+# Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+# Experiment: {experiment.get('name', 'unknown')}
+# Description: {experiment.get('description', 'No description')}
+
+# Signal handler for clean shutdown
+cleanup() {{
+    echo ""
+    echo "🛑 Received interrupt signal. Cleaning up..."
+    
+    # Kill background processes
+    if [ ! -z "$ACCELERATE_PID" ]; then
+        echo "   Killing accelerate process (PID: $ACCELERATE_PID)..."
+        kill -TERM $ACCELERATE_PID 2>/dev/null
+        sleep 2
+        kill -KILL $ACCELERATE_PID 2>/dev/null
+    fi
+    
+    # Kill any remaining Python processes (ULTRA SAFE: only kill direct children)
+    echo "   Cleaning up child processes..."
+    if [ ! -z "$$" ]; then
+        echo "   Killing child processes of this script (PID: $$)..."
+        pkill -P $$ 2>/dev/null
+    fi
+    if [ ! -z "$ACCELERATE_PID" ]; then
+        echo "   Killing child processes of accelerate (PID: $ACCELERATE_PID)..."
+        pkill -P $ACCELERATE_PID 2>/dev/null
+    fi
+    echo "✅ Cleanup completed"
+    exit 1
+}}
+trap cleanup SIGINT SIGTERM
+
+# Conda environment setup
+source ~/.bashrc
+source $(conda info --base)/etc/profile.d/conda.sh
+conda activate world_model
+
+# Set PYTHONPATH to include the current directory for module imports"""
     
     # Add PYTHONPATH based on aicomputing mode
     if aicomputing:
+        script_content = script_start
         script_content += """
 export PYTHONPATH="${PYTHONPATH}:/fsx/byungjun_vclab/world_model"
 """
@@ -255,7 +289,223 @@ MAX_TRAIN_STEPS={training.get('max_train_steps', training.get('num_epochs', 'unk
 DATA_ROOT="{data.get('data_root', 'unknown')}"
 DATASET_FILE="{dataset_file_env}"
 BASE_OUTPUT_DIR="{model.get('output_dir', 'unknown')}"
-SLURM_JOB_NAME="{slurm.get('job_name', 'unknown')}"
+SLURM_JOB_NAME="{slurm.get('job_name', 'unknown')}"""
+
+    # AICOMPUTING tail: --debug only, batch mode with GPU auto-detect, no SLURM
+    script_tail_aicomputing = f"""
+
+# Parse command line arguments
+DEBUG_MODE=false
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --debug)
+            DEBUG_MODE=true
+            shift
+            ;;
+        --help)
+            echo "Usage: $0 [OPTIONS]"
+            echo "Options:"
+            echo "  --debug        Run in debug mode with ipdb (single GPU, batch_size=1)"
+            echo "  --help         Show this help message"
+            echo ""
+            echo "Modes:"
+            echo "  1. ./$0 --debug           : Debug mode with ipdb (single GPU, batch_size=1)"
+            echo "  2. ./$0                  : Batch mode (auto-detect GPUs)"
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Use --help for usage information"
+            exit 1
+            ;;
+    esac
+done
+
+# GPU configuration based on mode
+if [ "$DEBUG_MODE" = true ]; then
+    # Debug mode - always use single GPU
+    NUM_GPUS=1
+    GPU_IDS="0"
+    ACCELERATE_CONFIG_FILE="accelerate_configs/deepspeed_1.yaml"
+    echo "🔧 Debug mode: Using single GPU with ipdb"
+else
+    # Batch mode - auto-detect available GPUs
+    if [ -n "${{CUDA_VISIBLE_DEVICES:-}}" ]; then
+        NUM_GPUS=$(echo ${{CUDA_VISIBLE_DEVICES}} | tr ',' '\\n' | wc -l)
+        GPU_IDS="${{CUDA_VISIBLE_DEVICES}}"
+        echo "🔧 Using CUDA_VISIBLE_DEVICES: ${{CUDA_VISIBLE_DEVICES}} ($NUM_GPUS GPUs)"
+    elif command -v nvidia-smi &> /dev/null; then
+        NUM_GPUS=$(nvidia-smi --list-gpus | wc -l)
+        echo "🔧 Auto-detected $NUM_GPUS GPUs from nvidia-smi"
+        GPU_IDS=""
+        for i in $(seq 0 $((NUM_GPUS-1))); do
+            if [ $i -eq 0 ]; then
+                GPU_IDS="$i"
+            else
+                GPU_IDS="$GPU_IDS,$i"
+            fi
+        done
+    else
+        NUM_GPUS=4
+        echo "🔧 Using default: 4 GPUs (nvidia-smi not available)"
+        GPU_IDS=""
+        for i in $(seq 0 $((NUM_GPUS-1))); do
+            if [ $i -eq 0 ]; then
+                GPU_IDS="$i"
+            else
+                GPU_IDS="$GPU_IDS,$i"
+            fi
+        done
+    fi
+    if [ $NUM_GPUS -eq 1 ]; then
+        ACCELERATE_CONFIG_FILE="accelerate_configs/deepspeed_1.yaml"
+    elif [ $NUM_GPUS -eq 2 ]; then
+        ACCELERATE_CONFIG_FILE="accelerate_configs/deepspeed_2.yaml"
+    elif [ $NUM_GPUS -eq 4 ]; then
+        ACCELERATE_CONFIG_FILE="accelerate_configs/deepspeed_4.yaml"
+    elif [ $NUM_GPUS -eq 8 ]; then
+        ACCELERATE_CONFIG_FILE="accelerate_configs/deepspeed_8.yaml"
+    else
+        echo "Warning: Unsupported GPU count: $NUM_GPUS, using default config"
+        ACCELERATE_CONFIG_FILE="accelerate_configs/deepspeed_4.yaml"
+    fi
+    echo "🚀 Batch mode: Using $NUM_GPUS GPUs"
+    echo "🚀 GPU IDs: $GPU_IDS"
+fi
+
+echo "===== CogVideoX Pose Unified Training ====="
+echo "Experiment: $EXPERIMENT_NAME"
+echo "Training Mode: $TRAINING_MODE"
+echo "Learning Rate: $LEARNING_RATE"
+echo "Batch Size: $BATCH_SIZE per GPU (effective: $((BATCH_SIZE * NUM_GPUS)))"
+echo "Max Train Steps: $MAX_TRAIN_STEPS"
+echo "Data Root: $DATA_ROOT"
+echo "Dataset File(s): $DATASET_FILE"
+echo "Base Output Directory: $BASE_OUTPUT_DIR"
+echo "Number of GPUs: $NUM_GPUS"
+echo "GPU IDs: $GPU_IDS"
+echo "Accelerate Config: $ACCELERATE_CONFIG_FILE"
+echo ""
+
+# Check if data directory exists
+if [ ! -d "$DATA_ROOT" ]; then
+    echo "Error: Data root directory does not exist: $DATA_ROOT"
+    exit 1
+fi
+
+# Check if dataset files exist
+if [ -n "$DATASET_FILE" ]; then
+    IFS=':' read -ra DATASET_FILE_ARRAY <<< "$DATASET_FILE"
+    for dataset_file in "${{DATASET_FILE_ARRAY[@]}}"; do
+        if [ -z "$dataset_file" ]; then
+            continue
+        fi
+        if [ ! -f "$DATA_ROOT/$dataset_file" ]; then
+            echo "Error: Dataset file not found: $DATA_ROOT/$dataset_file"
+            exit 1
+        fi
+    done
+else
+    echo "Warning: No dataset files specified."
+fi
+
+# Check if config file exists
+if [ ! -f "$EXPERIMENT_CONFIG" ]; then
+    echo "Error: Experiment config file not found: $EXPERIMENT_CONFIG"
+    exit 1
+fi
+
+# Create output directory (will be created by the training script based on mode)
+echo "📁 Output directory will be created by training script based on mode"
+
+# Choose training script based on experiment config file name (cogvideox vs wan)
+if echo "$EXPERIMENT_CONFIG" | grep -qi "cogvideox"; then
+    SCRIPT_NAME="training/cogvideox_static_pose/cogvideox_text_to_video_pose_sft_unified.py"
+    echo "📜 Using CogVideoX training script (config name contains 'cogvideox')"
+elif echo "$EXPERIMENT_CONFIG" | grep -qi "wan"; then
+    SCRIPT_NAME="training/wan_static_pose/train_dwm_wan.py"
+    echo "📜 Using WAN training script (config name contains 'wan')"
+else
+    SCRIPT_NAME="training/cogvideox_static_pose/cogvideox_text_to_video_pose_sft_unified.py"
+    echo "⚠️  Could not determine script from config name; defaulting to CogVideoX"
+fi
+
+# Base command based on mode
+if [ "$DEBUG_MODE" = true ]; then
+    cmd="python -m ipdb -c continue $SCRIPT_NAME --experiment_config $EXPERIMENT_CONFIG --mode debug --override training.batch_size=1 data.max_validation_videos=1 "
+    echo "🔧 Debug mode command: $cmd"
+    echo "🔧 Debug mode: Batch size overridden to 1, validation videos to 1 for easier debugging"
+else
+    export BATCH_TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+    echo "🚀 Batch mode: BATCH_TIMESTAMP=$BATCH_TIMESTAMP (shared by all processes)"
+    if [ -n "${{CUDA_VISIBLE_DEVICES:-}}" ]; then
+        cmd="accelerate launch --config_file $ACCELERATE_CONFIG_FILE $SCRIPT_NAME --experiment_config $EXPERIMENT_CONFIG --mode batch"
+        echo "🚀 Batch mode command (using CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES): $cmd"
+    else
+        cmd="accelerate launch --config_file $ACCELERATE_CONFIG_FILE --gpu_ids $GPU_IDS $SCRIPT_NAME --experiment_config $EXPERIMENT_CONFIG --mode batch"
+        echo "🚀 Batch mode command (using --gpu_ids=$GPU_IDS): $cmd"
+    fi
+fi
+
+echo ""
+
+# Run training
+if [ "$DEBUG_MODE" = true ]; then
+    echo "===== Running in DEBUG mode ====="
+    echo "Using ipdb for debugging - use Ctrl+C to stop the training"
+    echo ""
+    $cmd
+    EXIT_CODE=$?
+else
+    echo "===== Running Training ====="
+    echo "Using accelerate launch for distributed training"
+    echo ""
+    echo "Command: $cmd"
+    echo ""
+    eval $cmd &
+    ACCELERATE_PID=$!
+    echo "Main process started with PID: $ACCELERATE_PID"
+    echo "Use Ctrl+C to stop the processing"
+    echo ""
+    wait $ACCELERATE_PID
+    EXIT_CODE=$?
+    unset ACCELERATE_PID
+fi
+
+echo ""
+echo "===== Training completed ====="
+if [ $EXIT_CODE -eq 0 ]; then
+    echo "✅ Training completed successfully"
+    echo "Model saved to: $OUTPUT_DIR"
+    echo ""
+    echo "📊 Training Summary:"
+    echo "   Experiment: $EXPERIMENT_NAME"
+    echo "   Training Mode: $TRAINING_MODE"
+    echo "   Learning Rate: $LEARNING_RATE"
+    echo "   Batch Size: $BATCH_SIZE"
+    echo "   Max Steps: $MAX_TRAIN_STEPS"
+    echo "   GPUs Used: $NUM_GPUS"
+else
+    echo "❌ Training failed with exit code: $EXIT_CODE"
+    echo "Check the output above for error details"
+    echo ""
+    echo "🔍 Debugging tips:"
+    echo "   - Check if all data files exist"
+    echo "   - Verify GPU availability"
+    echo "   - Check memory usage"
+    echo "   - Try debug mode with --debug"
+fi
+
+echo ""
+echo "📁 Output files:"
+echo "   - Model: Will be saved to mode-specific directory (debug/batch suffix)"
+echo "   - Logs: Will be saved to mode-specific directory/logs/"
+echo "   - Checkpoints: Will be saved to mode-specific directory/checkpoint-*/"
+"""
+
+    # SLURM tail: --debug, --slurm_test, sbatch, SLURM mode
+    script_tail_slurm = f"""
 
 # Parse command line arguments
 DEBUG_MODE=false
@@ -301,17 +551,12 @@ if [ "$DEBUG_MODE" = true ]; then
     echo "🔧 Debug mode: Using single GPU with ipdb"
 elif [ "$SLURM_TEST_MODE" = true ]; then
     # Test mode - use available GPUs from CUDA_VISIBLE_DEVICES
-    # accelerate launch automatically uses CUDA_VISIBLE_DEVICES, so we don't need --gpu_ids
     if [ -n "$CUDA_VISIBLE_DEVICES" ]; then
-        # Count number of GPUs in CUDA_VISIBLE_DEVICES
-        NUM_GPUS=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | wc -l)
+        NUM_GPUS=$(echo "$CUDA_VISIBLE_DEVICES" | tr ',' '\\n' | wc -l)
     else
-        # Fallback if CUDA_VISIBLE_DEVICES not set
         NUM_GPUS=4
         echo "⚠️  WARNING: CUDA_VISIBLE_DEVICES not set, defaulting to 4 GPUs"
     fi
-    
-    # Use appropriate accelerate config based on GPU count
     if [ $NUM_GPUS -eq 1 ]; then
         ACCELERATE_CONFIG_FILE="accelerate_configs/deepspeed_1.yaml"
     elif [ $NUM_GPUS -eq 2 ]; then
@@ -327,14 +572,10 @@ elif [ "$SLURM_TEST_MODE" = true ]; then
 else
     # SLURM mode - use GPU count from YAML
     NUM_GPUS={slurm.get('gpus_per_node', slurm.get('gpus', 4))}
-    
-    # Use SLURM allocated GPU IDs
     if [ -n "$CUDA_VISIBLE_DEVICES" ]; then
-        # Use actual allocated GPUs in SLURM environment
         GPU_IDS="$CUDA_VISIBLE_DEVICES"
         echo "🔧 Using SLURM allocated GPUs: $GPU_IDS"
     else
-        # Fallback: use sequential GPU IDs starting from 0
         GPU_IDS=""
         for i in $(seq 0 $((NUM_GPUS-1))); do
             if [ $i -eq 0 ]; then
@@ -345,8 +586,6 @@ else
         done
         echo "🔧 Using fallback GPU IDs: $GPU_IDS"
     fi
-    
-    # Accelerate config based on GPU count
     if [ $NUM_GPUS -eq 1 ]; then
         ACCELERATE_CONFIG_FILE="accelerate_configs/deepspeed_2.yaml"
     elif [ $NUM_GPUS -eq 2 ]; then
@@ -408,8 +647,17 @@ fi
 # Create output directory (will be created by the training script based on mode)
 echo "📁 Output directory will be created by training script based on mode"
 
-# Build command
-SCRIPT_NAME="training/cogvideox_static_pose/cogvideox_text_to_video_pose_sft_unified.py"
+# Choose training script based on experiment config file name (cogvideox vs wan)
+if echo "$EXPERIMENT_CONFIG" | grep -qi "cogvideox"; then
+    SCRIPT_NAME="training/cogvideox_static_pose/cogvideox_text_to_video_pose_sft_unified.py"
+    echo "📜 Using CogVideoX training script (config name contains 'cogvideox')"
+elif echo "$EXPERIMENT_CONFIG" | grep -qi "wan"; then
+    SCRIPT_NAME="training/wan_static_pose/train_dwm_wan.py"
+    echo "📜 Using WAN training script (config name contains 'wan')"
+else
+    SCRIPT_NAME="training/cogvideox_static_pose/cogvideox_text_to_video_pose_sft_unified.py"
+    echo "⚠️  Could not determine script from config name; defaulting to CogVideoX"
+fi
 
 # Base command based on mode
 if [ "$DEBUG_MODE" = true ]; then
@@ -502,6 +750,11 @@ echo "   - SLURM output: {slurm.get('output', 'out/%j_default.out')}"
 echo "   - SLURM error: {slurm.get('error', 'out/%j_default.err')}"
 """
 
+    if aicomputing:
+        script_content += script_tail_aicomputing
+    else:
+        script_content += script_tail_slurm
+
     # Write the script to file
     try:
         with open(output_script, 'w') as f:
@@ -528,9 +781,13 @@ echo "   - SLURM error: {slurm.get('error', 'out/%j_default.err')}"
             print(f"   - Mode: AICOMPUTING cluster")
         print(f"")
         print(f"🚀 Usage modes:")
-        print(f"   1. Debug mode:     ./{output_script.name} --debug")
-        print(f"   2. Test mode:      ./{output_script.name} --slurm_test")
-        print(f"   3. SLURM mode:     sbatch {output_script}")
+        if aicomputing:
+            print(f"   1. Debug mode:     ./{output_script.name} --debug")
+            print(f"   2. Batch mode:     ./{output_script.name}")
+        else:
+            print(f"   1. Debug mode:     ./{output_script.name} --debug")
+            print(f"   2. Test mode:      ./{output_script.name} --slurm_test")
+            print(f"   3. SLURM mode:     sbatch {output_script}")
         print(f"")
         print(f"📝 To edit the script:")
         print(f"   nano {output_script}")
