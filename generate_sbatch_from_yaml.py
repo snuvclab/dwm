@@ -82,33 +82,35 @@ def generate_sbatch_script(yaml_file, output_script=None, aicomputing=False):
         if 'gpus' in slurm:
             del slurm['gpus']
         
-        # Convert paths from /virtual_lab/jhb_vclab/ to /fsx/
-        print("🔧 AICOMPUTING mode: Converting paths from /virtual_lab/jhb_vclab/ to /fsx/")
+        # Convert paths from /virtual_lab/jhb_vclab/ to h200-style /home/work/.data/byungjun/
+        print("🔧 AICOMPUTING mode: Converting paths from /virtual_lab/jhb_vclab/ to /home/work/.data/byungjun/ (h200 style)")
+        path_prefix_old = "/virtual_lab/jhb_vclab/"
+        path_prefix_new = "/home/work/.data/byungjun/"
         
         # Update data paths
         if 'data_root' in data:
-            data['data_root'] = data['data_root'].replace('/virtual_lab/jhb_vclab/', '/fsx/')
+            data['data_root'] = data['data_root'].replace(path_prefix_old, path_prefix_new)
 
         if dataset_files_list:
-            dataset_files_list = [path.replace('/virtual_lab/jhb_vclab/', '/fsx/') for path in dataset_files_list]
+            dataset_files_list = [path.replace(path_prefix_old, path_prefix_new) for path in dataset_files_list]
         if validation_files_list:
-            validation_files_list = [path.replace('/virtual_lab/jhb_vclab/', '/fsx/') for path in validation_files_list]
+            validation_files_list = [path.replace(path_prefix_old, path_prefix_new) for path in validation_files_list]
         
         # Update model paths
         if 'output_dir' in model:
-            model['output_dir'] = model['output_dir'].replace('/virtual_lab/jhb_vclab/', '/fsx/')
+            model['output_dir'] = model['output_dir'].replace(path_prefix_old, path_prefix_new)
         if 'base_model_name_or_path' in model:
-            model['base_model_name_or_path'] = model['base_model_name_or_path'].replace('/virtual_lab/jhb_vclab/', '/fsx/')
+            model['base_model_name_or_path'] = model['base_model_name_or_path'].replace(path_prefix_old, path_prefix_new)
         
         # Update experiment output_dir
         if 'output_dir' in experiment:
-            experiment['output_dir'] = experiment['output_dir'].replace('/virtual_lab/jhb_vclab/', '/fsx/')
+            experiment['output_dir'] = experiment['output_dir'].replace(path_prefix_old, path_prefix_new)
         
         # Update SLURM output/error paths
         if 'output' in slurm:
-            slurm['output'] = slurm['output'].replace('/virtual_lab/jhb_vclab/', '/fsx/')
+            slurm['output'] = slurm['output'].replace(path_prefix_old, path_prefix_new)
         if 'error' in slurm:
-            slurm['error'] = slurm['error'].replace('/virtual_lab/jhb_vclab/', '/fsx/')
+            slurm['error'] = slurm['error'].replace(path_prefix_old, path_prefix_new)
     
     # Auto-update paths with extracted date and experiment name
     if date_match != "unknown":
@@ -187,8 +189,8 @@ cleanup() {{
 trap cleanup SIGINT SIGTERM
 
 # Conda environment setup
-source ~/.bashrc
-source $(conda info --base)/etc/profile.d/conda.sh
+cd /home/work/.data/byungjun/world_model
+source /home/work/.data/_shared/use_user_conda.sh 
 conda activate world_model
 
 # Set PYTHONPATH to include the current directory for module imports"""
@@ -249,7 +251,7 @@ conda activate world_model
     if aicomputing:
         script_content = script_start
         script_content += """
-export PYTHONPATH="${PYTHONPATH}:/fsx/byungjun_vclab/world_model"
+export PYTHONPATH="${PYTHONPATH}:$(pwd)"
 """
     else:
         script_content += """
@@ -267,10 +269,10 @@ export OMP_NUM_THREADS={environment.get('omp_num_threads', 16)}
 
 # Configuration from YAML"""
     
-    # Convert YAML path for aicomputing
+    # Convert YAML path for aicomputing (h200-style base path)
     yaml_file_for_script = yaml_file
     if aicomputing:
-        yaml_file_for_script = yaml_file.replace('/virtual_lab/jhb_vclab/', '/fsx/')
+        yaml_file_for_script = yaml_file.replace("/virtual_lab/jhb_vclab/", "/home/work/.data/byungjun/")
     
     if not dataset_files_list:
         dataset_file_env = ''
@@ -792,13 +794,13 @@ echo "   - SLURM error: {slurm.get('error', 'out/%j_default.err')}"
         print(f"📝 To edit the script:")
         print(f"   nano {output_script}")
         
-        # Print path conversion info for aicomputing
+        # Print path conversion info for aicomputing (h200 style)
         if aicomputing:
             print(f"")
-            print(f"🔧 AICOMPUTING Path Conversions:")
-            print(f"   /virtual_lab/jhb_vclab/ → /fsx/")
+            print(f"🔧 AICOMPUTING Path Conversions (h200 style):")
+            print(f"   /virtual_lab/jhb_vclab/ → /home/work/.data/byungjun/")
             print(f"   - Data root: {data.get('data_root', 'N/A')}")
-            print(f"   - PYTHONPATH: /fsx/byungjun_vclab/world_model")
+            print(f"   - Work dir: /home/work/.data/byungjun/world_model")
             print(f"   - YAML config: {yaml_file_for_script}")
         
         return True
