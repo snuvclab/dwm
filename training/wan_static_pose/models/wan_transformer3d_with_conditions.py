@@ -77,8 +77,9 @@ class WanTransformer3DModelWithConcat(WanTransformer3DModel):
         in_dim_ref_conv=16,
         cross_attn_type=None,
         fps: int = 16,
-        # WanTransformer3DModelWithConcat specific parameter
+        # WanTransformer3DModelWithConcat specific parameters
         condition_channels: int = 0,
+        is_wan2_2: bool = False,
     ):
         """
         Initialize WanTransformer3DModelWithConcat.
@@ -86,8 +87,15 @@ class WanTransformer3DModelWithConcat(WanTransformer3DModel):
         Args:
             condition_channels: Number of additional condition channels to concatenate.
                               Default 0 means no extra condition (behaves like parent).
+            is_wan2_2: If True, applies WAN 2.2 specific settings:
+                      - Sets cross_attn_type="cross_attn"
+                      - Removes img_emb (CLIP image encoder)
             Other args: See WanTransformer3DModel.
         """
+        # Apply WAN 2.2 specific settings
+        if is_wan2_2:
+            cross_attn_type = "cross_attn"
+        
         super().__init__(
             model_type=model_type,
             patch_size=patch_size,
@@ -114,7 +122,12 @@ class WanTransformer3DModelWithConcat(WanTransformer3DModel):
             fps=fps,
         )
         
+        # Remove img_emb for WAN 2.2 (no CLIP image encoder)
+        if is_wan2_2 and hasattr(self, "img_emb"):
+            del self.img_emb
+        
         self.condition_channels = condition_channels
+        self.is_wan2_2 = is_wan2_2
         
         if condition_channels > 0:
             self._extend_patch_embedding(condition_channels)
@@ -171,6 +184,7 @@ class WanTransformer3DModelWithConcat(WanTransformer3DModel):
             "has_conditions": self.condition_channels > 0,
             "condition_channels": self.condition_channels,
             "total_input_channels": self.patch_embedding.in_channels,
+            "is_wan2_2": self.is_wan2_2,
         }
     
     def forward(
