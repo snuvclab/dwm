@@ -4261,7 +4261,7 @@ def main():
     # Run initial validation at step 0 (before training starts)
     if data_config.get("validation_set") is not None:
         logger.info("Running initial validation at step 0 (before training starts)")
-        should_run_max_validation = training_config.get("custom_settings", {}).get("should_run_max_validation", False)
+        should_run_max_validation = training_config.get("custom_settings", {}).get("should_run_max_validation", True)
         run_validation(
             config=config,
             accelerator=accelerator,
@@ -4312,6 +4312,11 @@ def main():
     training_start_time = time.time()
     time_based_checkpoint_saved = False  # Track if time-based checkpoint has been saved
     TIME_LIMIT_SECONDS = 47 * 3600 + 45 * 60  # 47 hours 45 minutes
+    # Time-limit checkpoint only when slurm and partition is not h100
+    enable_time_limit_checkpoint = (
+        args.mode == "slurm"
+        and os.environ.get("SLURM_JOB_PARTITION", "") != "h100"
+    )
 
     cond_mode = training_config.get("cond_mode", "i2v")
 
@@ -5274,9 +5279,11 @@ def main():
                 max_validation_steps = data_config.get("max_validation_steps", validation_steps * 2)
                 
                 # Check time-based checkpoint saving (47 hours 45 minutes)
+                # Only when mode is slurm and partition is not h100
                 elapsed_time = time.time() - training_start_time
                 should_save_time_based_checkpoint = (
-                    not time_based_checkpoint_saved 
+                    enable_time_limit_checkpoint
+                    and not time_based_checkpoint_saved
                     and elapsed_time >= TIME_LIMIT_SECONDS
                 )
                 
