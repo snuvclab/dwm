@@ -127,6 +127,23 @@ class VideoDataset(Dataset):
             ]
         )
 
+    def _find_nearest_resolution(self, height: int, width: int) -> Tuple[int, int]:
+        """Pick the nearest (H, W) resolution bucket, optionally aligning W to a multiple of 32.
+
+        Note: alignment is only meaningful when a subclass actually resizes frames to the chosen bucket.
+        """
+        nearest_res = min(self.resolutions, key=lambda x: abs(x[1] - height) + abs(x[2] - width))
+        nearest_h, nearest_w = nearest_res[1], nearest_res[2]
+
+        # For WAN 2.2: align width to 32 for compatibility
+        # 32 = 8 (VAE spatial_compression) * 4, ensures clean division through the pipeline
+        if getattr(self, "align_width_to_32", False):
+            # Always round to nearest multiple of 32, regardless of whether it's in buckets
+            # This ensures WAN 2.2 compatibility even if the aligned value is not in the bucket list
+            nearest_w = round(nearest_w / 32) * 32
+
+        return nearest_h, nearest_w
+
     @staticmethod
     def identity_transform(x):
         return x
@@ -598,20 +615,7 @@ class VideoDatasetWithConditionsAndResizing(VideoDatasetWithConditions):
 
             return image, frames, None
 
-    def _find_nearest_resolution(self, height, width):
-        nearest_res = min(self.resolutions, key=lambda x: abs(x[1] - height) + abs(x[2] - width))
-        nearest_h, nearest_w = nearest_res[1], nearest_res[2]
-        
-        # For WAN 2.2: align width to 32 for compatibility
-        # 32 = 8 (VAE spatial_compression) * 4, ensures clean division through the pipeline
-        if self.align_width_to_32:
-            # Round to nearest multiple of 32
-            nearest_w = round(nearest_w / 32) * 32
-            # Ensure it's still in valid buckets (clamp to nearest valid width)
-            if nearest_w not in self.width_buckets:
-                nearest_w = min(self.width_buckets, key=lambda x: abs(x - nearest_w))
-        
-        return nearest_h, nearest_w
+    # Resolution bucketing (and optional align_width_to_32) is handled by VideoDataset._find_nearest_resolution
 
 
 class VideoDatasetWithConditionsAndResizeAndRectangleCrop(VideoDatasetWithConditions):
@@ -622,7 +626,7 @@ class VideoDatasetWithConditionsAndResizeAndRectangleCrop(VideoDatasetWithCondit
     def __init__(self, video_reshape_mode: str = "center", *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.video_reshape_mode = video_reshape_mode
-
+    
     def _resize_for_rectangle_crop(self, arr, image_size):
         reshape_mode = self.video_reshape_mode
         if arr.shape[3] / arr.shape[2] > image_size[1] / image_size[0]:
@@ -678,9 +682,7 @@ class VideoDatasetWithConditionsAndResizeAndRectangleCrop(VideoDatasetWithCondit
 
             return image, frames, None
 
-    def _find_nearest_resolution(self, height, width):
-        nearest_res = min(self.resolutions, key=lambda x: abs(x[1] - height) + abs(x[2] - width))
-        return nearest_res[1], nearest_res[2]
+    # Resolution bucketing (and optional align_width_to_32) is handled by VideoDataset._find_nearest_resolution
 
 
 class VideoDatasetWithResizing(VideoDataset):
@@ -711,9 +713,7 @@ class VideoDatasetWithResizing(VideoDataset):
 
             return image, frames, None
 
-    def _find_nearest_resolution(self, height, width):
-        nearest_res = min(self.resolutions, key=lambda x: abs(x[1] - height) + abs(x[2] - width))
-        return nearest_res[1], nearest_res[2]
+    # Resolution bucketing (and optional align_width_to_32) is handled by VideoDataset._find_nearest_resolution
 
 
 class VideoDatasetWithResizeAndRectangleCrop(VideoDataset):
@@ -776,9 +776,7 @@ class VideoDatasetWithResizeAndRectangleCrop(VideoDataset):
 
             return image, frames, None
 
-    def _find_nearest_resolution(self, height, width):
-        nearest_res = min(self.resolutions, key=lambda x: abs(x[1] - height) + abs(x[2] - width))
-        return nearest_res[1], nearest_res[2]
+    # Resolution bucketing (and optional align_width_to_32) is handled by VideoDataset._find_nearest_resolution
 
 
 class VideoDatasetWithHumanMotions(VideoDatasetWithConditions):
@@ -927,9 +925,7 @@ class VideoDatasetWithHumanMotionsAndResizing(VideoDatasetWithHumanMotions):
 
             return image, frames, None
 
-    def _find_nearest_resolution(self, height, width):
-        nearest_res = min(self.resolutions, key=lambda x: abs(x[1] - height) + abs(x[2] - width))
-        return nearest_res[1], nearest_res[2]
+    # Resolution bucketing (and optional align_width_to_32) is handled by VideoDataset._find_nearest_resolution
 
 
 class VideoDatasetWithHumanMotionsAndResizeAndRectangleCrop(VideoDatasetWithHumanMotions):
@@ -996,9 +992,7 @@ class VideoDatasetWithHumanMotionsAndResizeAndRectangleCrop(VideoDatasetWithHuma
 
             return image, frames, None
 
-    def _find_nearest_resolution(self, height, width):
-        nearest_res = min(self.resolutions, key=lambda x: abs(x[1] - height) + abs(x[2] - width))
-        return nearest_res[1], nearest_res[2]
+    # Resolution bucketing (and optional align_width_to_32) is handled by VideoDataset._find_nearest_resolution
 
 
 class BucketSampler(Sampler):
