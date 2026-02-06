@@ -299,7 +299,7 @@ MAX_TRAIN_STEPS={training.get('max_train_steps', training.get('num_epochs', 'unk
 DATA_ROOT="{data.get('data_root', 'unknown')}"
 DATASET_FILE="{dataset_file_env}"
 BASE_OUTPUT_DIR="{model.get('output_dir', 'unknown')}"
-SLURM_JOB_NAME="{slurm.get('job_name', 'unknown')}"""
+SLURM_JOB_NAME="{slurm.get('job_name', 'unknown')}\""""
 
     # AICOMPUTING tail: --debug only, batch mode with GPU auto-detect, no SLURM
     script_tail_aicomputing = f"""
