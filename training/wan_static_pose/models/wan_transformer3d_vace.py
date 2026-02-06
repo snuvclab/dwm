@@ -487,7 +487,8 @@ class WanTransformer3DVace(WanTransformer3DModel):
         with amp.autocast(device_type='cuda', dtype=torch.float32):
             e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).float())
             e0 = self.time_projection(e).unflatten(1, (6, self.dim))
-            assert e.dtype == torch.float32 and e0.dtype == torch.float32
+        e0 = e0.to(dtype)
+        e = e.to(dtype)
 
         # Context (text) embedding
         context_lens = None
@@ -544,8 +545,12 @@ class WanTransformer3DVace(WanTransformer3DModel):
 
         # Unpatchify
         x = self.unpatchify(x, grid_sizes)
-
-        return [u.float() for u in x]
+        x = torch.stack(x)
+        if self.teacache is not None and cond_flag:
+            self.teacache.cnt += 1
+            if self.teacache.cnt == self.teacache.num_steps:
+                self.teacache.reset()
+        return x
 
     def get_condition_info(self) -> Dict[str, Any]:
         """Get information about the VACE conditioning setup."""

@@ -273,50 +273,9 @@ def log_validation(
 
         # Determine pretrain mode
         pretrain_mode = training_config.get("pretrain_mode", "t2v")
-
-        # Determine transformer type for validation
         transformer_type = transformer_config.get("class", "WanTransformer3DModelWithConcat")
-        
-        # Create a new transformer for validation
-        if args.train_mode == "lora":
-            if transformer_type == "WanTransformer3DModel":
-                transformer3d_val = WanTransformer3DModel.from_pretrained(
-                    os.path.join(base_model_path, transformer_additional_kwargs.get('transformer_subpath', 'transformer')),
-                    transformer_additional_kwargs=transformer_additional_kwargs,
-                    torch_dtype=weight_dtype,
-                )
-            elif transformer_type == "WanTransformer3DModelWithConcat":
-                transformer3d_val = WanTransformer3DModelWithConcat.from_pretrained(
-                    os.path.join(base_model_path, transformer_additional_kwargs.get('transformer_subpath', 'transformer')),
-                    transformer_additional_kwargs={
-                        "condition_channels": transformer_config.get('condition_channels', args.condition_channels),
-                        "is_wan2_2": is_wan2_2,
-                        **transformer_additional_kwargs,
-                    },
-                    torch_dtype=weight_dtype,
-                )
-            elif transformer_type == "WanTransformer3DVace":
-                vace_layers = transformer_config.get('vace_layers', None)
-                vace_in_dim = transformer_config.get('vace_in_dim', 16)
-                transformer3d_val = WanTransformer3DVace.from_pretrained(
-                    os.path.join(base_model_path, transformer_additional_kwargs.get('transformer_subpath', 'transformer')),
-                    transformer_additional_kwargs={
-                        "vace_layers": vace_layers,
-                        "vace_in_dim": vace_in_dim,
-                        "is_wan2_2": is_wan2_2,
-                        **transformer_additional_kwargs,
-                    },
-                    torch_dtype=weight_dtype,
-                )
-            else:
-                raise ValueError(f"Unsupported transformer type: {transformer_type}")
-            src_sd = accelerator.unwrap_model(transformer3d).state_dict()
-            # Remove LoRA network keys from DeepSpeed/FSDP path that attached to transformer3d
-            src_sd = {k: v for k, v in src_sd.items() if not k.startswith("network.")}
-            missing, unexpected = transformer3d_val.load_state_dict(src_sd, strict=False)
-            logger.info(f"[val] load transformer3d_val: missing={len(missing)}, unexpected={len(unexpected)}")
-        else:
-            transformer3d_val = accelerator.unwrap_model(transformer3d)
+
+        transformer3d_val = accelerator.unwrap_model(transformer3d)
 
         scheduler = FlowMatchEulerDiscreteScheduler(
             **filter_kwargs(FlowMatchEulerDiscreteScheduler, scheduler_kwargs)
@@ -616,8 +575,6 @@ def log_validation(
                     logger.info(f"Validation {i+1}/{len(validation_set)}: {video_name} saved")
 
         del pipeline
-        if args.train_mode == "lora":
-            del transformer3d_val
         gc.collect()
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
@@ -662,6 +619,25 @@ def save_model_sft(output_dir, transformer3d, accelerator):
         model = accelerator.unwrap_model(transformer3d)
         model.save_pretrained(os.path.join(output_dir, "transformer"), safe_serialization=True, max_shard_size="5GB")
         logger.info(f"Saved transformer to {output_dir}/transformer")
+
+
+def save_model_vace(output_dir, transformer3d, accelerator):
+    """Save VACE weights (vace_blocks + vace_patch_embedding only)."""
+    if accelerator.is_main_process:
+        model = accelerator.unwrap_model(transformer3d)
+
+        # Extract only VACE-related weights
+        vace_state_dict = {}
+        for name, param in model.named_parameters():
+            if "vace_blocks" in name or "vace_patch_embedding" in name:
+                vace_state_dict[name] = param.data.clone()
+
+        if vace_state_dict:
+            vace_path = os.path.join(output_dir, "vace_weights.safetensors")
+            save_file(vace_state_dict, vace_path)
+            logger.info(f"Saved VACE weights ({len(vace_state_dict)} params) to {vace_path}")
+        else:
+            logger.warning("No VACE weights found to save!")
 
 
 def main():
@@ -967,6 +943,16 @@ def main():
     else:
         raise ValueError(f"Unsupported transformer type: {transformer_type}")
 
+    # Ensure VACE modules are in the correct dtype (they're not loaded from checkpoint)
+    if transformer_type == "WanTransformer3DVace":
+        if hasattr(transformer3d, 'vace_blocks'):
+            for block in transformer3d.vace_blocks:
+                block.to(weight_dtype)
+            print(f"✅ Converted vace_blocks to {weight_dtype}")
+        if hasattr(transformer3d, 'vace_patch_embedding'):
+            transformer3d.vace_patch_embedding.to(weight_dtype)
+            print(f"✅ Converted vace_patch_embedding to {weight_dtype}")
+
     # Load custom weights if provided
     if args.transformer_path is not None:
         print(f"Loading transformer from: {args.transformer_path}")
@@ -1094,6 +1080,34 @@ def main():
         
         print(f"📊 SFT trainable parameters: {sum(p.numel() for p in trainable_params):,}")
 
+    elif args.train_mode == "vace":
+        print("🔧 Setting up VACE training (backbone frozen, only vace_blocks + vace_patch_embedding trainable)...")
+
+        # Ensure we're using WanTransformer3DVace
+        if transformer_type != "WanTransformer3DVace":
+            raise ValueError(f"VACE training mode requires WanTransformer3DVace, but got {transformer_type}")
+
+        # Freeze everything first (already done above, but be explicit)
+        transformer3d.requires_grad_(False)
+
+        # Enable only VACE-specific modules
+        vace_trainable_params = []
+        for name, param in transformer3d.named_parameters():
+            if "vace_blocks" in name or "vace_patch_embedding" in name:
+                param.requires_grad = True
+                vace_trainable_params.append(param)
+                print(f"   ✓ Enabled: {name}")
+
+        if not vace_trainable_params:
+            raise ValueError("No VACE parameters found to train! Check if transformer has vace_blocks and vace_patch_embedding.")
+
+        trainable_params = vace_trainable_params
+        trainable_params_optim = [
+            {'params': vace_trainable_params, 'lr': args.learning_rate},
+        ]
+
+        print(f"📊 VACE trainable parameters: {sum(p.numel() for p in trainable_params):,}")
+
     # Enable gradient checkpointing (from args or config)
     gradient_checkpointing = args.gradient_checkpointing or training_config.get("custom_settings", {}).get("gradient_checkpointing", False)
     if gradient_checkpointing:
@@ -1205,7 +1219,7 @@ def main():
         shuffle=True,
         drop_last=True,  # Drop last incomplete batch to ensure consistent batch size
         collate_fn=collate_fn,
-        num_workers=data_config.get("dataloader_num_workers", 8),
+        num_workers=data_config.get("dataloader_num_workers", 0),
         pin_memory=data_config.get("pin_memory", True),
     )
 
@@ -1348,6 +1362,13 @@ def main():
                             non_lora_state_dict = load_file(non_lora_path, device=str(accelerator.device))
                             m, u = accelerator.unwrap_model(transformer3d).load_state_dict(non_lora_state_dict, strict=False)
                             print(f"Loaded non-LoRA weights: missing {len(m)}, unexpected {len(u)}")
+                    elif args.train_mode == "vace":
+                        # Load VACE weights (vace_blocks + vace_patch_embedding)
+                        vace_path = os.path.join(checkpoint_path, "vace_weights.safetensors")
+                        if os.path.exists(vace_path):
+                            vace_state_dict = load_file(vace_path, device=str(accelerator.device))
+                            m, u = accelerator.unwrap_model(transformer3d).load_state_dict(vace_state_dict, strict=False)
+                            print(f"Loaded VACE weights: missing {len(m)}, unexpected {len(u)}")
                     else:
                         # Load transformer weights for SFT
                         transformer_path = os.path.join(checkpoint_path, "transformer")
@@ -1405,6 +1426,13 @@ def main():
                                 non_lora_state_dict = load_file(non_lora_path, device=str(accelerator.device))
                                 m, u = accelerator.unwrap_model(transformer3d).load_state_dict(non_lora_state_dict, strict=False)
                                 print(f"Loaded non-LoRA weights: missing {len(m)}, unexpected {len(u)}")
+                        elif args.train_mode == "vace":
+                            # Load VACE weights (vace_blocks + vace_patch_embedding)
+                            vace_path = os.path.join(checkpoint_path, "vace_weights.safetensors")
+                            if os.path.exists(vace_path):
+                                vace_state_dict = load_file(vace_path, device=str(accelerator.device))
+                                m, u = accelerator.unwrap_model(transformer3d).load_state_dict(vace_state_dict, strict=False)
+                                print(f"Loaded VACE weights: missing {len(m)}, unexpected {len(u)}")
                         else:
                             # Load transformer weights for SFT
                             transformer_path = os.path.join(checkpoint_path, "transformer")
@@ -1743,6 +1771,8 @@ def main():
                         
                         if args.train_mode == "lora":
                             save_model_lora(save_path, network, weight_dtype, accelerator, transformer3d, trainable_parameter_patterns)
+                        elif args.train_mode == "vace":
+                            save_model_vace(save_path, transformer3d, accelerator)
                         else:
                             save_model_sft(save_path, transformer3d, accelerator)
 
@@ -1753,16 +1783,19 @@ def main():
                         logger.info(f"Saved accelerator state to {save_path}")
 
                 # Validation (runs if validation_set is defined in config)
-                # Run on all GPUs to distribute validation videos (not just main process)
-                if global_step % validation_steps == 0:
-                    if data_config.get("validation_set"):
-                        if accelerator.is_main_process:
-                            logger.info(f"🎬 Running validation at step {global_step}")
-                        log_validation(
-                            vae, text_encoder, tokenizer, clip_image_encoder,
-                            transformer3d, network, config, args, accelerator,
-                            weight_dtype, global_step
-                        )
+                # Early phase: every init_validation_steps until first checkpoint; then every validation_steps (CogVideoX style)
+                should_run_validation = data_config.get("validation_set") is not None and (
+                    (global_step % init_validation_steps == 0 and global_step < checkpointing_steps)
+                    or global_step % validation_steps == 0
+                )
+                if should_run_validation:
+                    if accelerator.is_main_process:
+                        logger.info(f"🎬 Running validation at step {global_step}")
+                    log_validation(
+                        vae, text_encoder, tokenizer, clip_image_encoder,
+                        transformer3d, network, config, args, accelerator,
+                        weight_dtype, global_step
+                    )
 
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
@@ -1778,6 +1811,8 @@ def main():
 
         if args.train_mode == "lora":
             save_model_lora(save_path, network, weight_dtype, accelerator, transformer3d, trainable_parameter_patterns)
+        elif args.train_mode == "vace":
+            save_model_vace(save_path, transformer3d, accelerator)
         else:
             save_model_sft(save_path, transformer3d, accelerator)
 
