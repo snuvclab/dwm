@@ -35,6 +35,7 @@ import torch
 import torch.amp as amp
 import torch.nn as nn
 from diffusers.configuration_utils import register_to_config
+from diffusers.utils import is_torch_version
 
 from .wan_transformer3d import (
     WanAttentionBlock,
@@ -401,18 +402,33 @@ class WanTransformer3DVace(WanTransformer3DModel):
             for u in c
         ])
 
-        # Process through VACE blocks
+        # Arguments for VACE blocks (same pattern as cogvideox videox_fun/models/wan_transformer3d_vace.py)
+        new_kwargs = dict(
+            x=x,
+            e=e,
+            seq_lens=seq_lens,
+            grid_sizes=grid_sizes,
+            freqs=freqs,
+            context=context,
+            context_lens=context_lens,
+            dtype=dtype,
+        )
+
+        # Process through VACE blocks (with optional gradient checkpointing)
         for block in self.vace_blocks:
-            c = block(
-                c, x,
-                e=e,
-                seq_lens=seq_lens,
-                grid_sizes=grid_sizes,
-                freqs=freqs,
-                context=context,
-                context_lens=context_lens,
-                dtype=dtype,
-            )
+            if torch.is_grad_enabled() and getattr(self, "gradient_checkpointing", False):
+                def create_custom_forward(module, **static_kwargs):
+                    def custom_forward(*inputs):
+                        return module(*inputs, **static_kwargs)
+                    return custom_forward
+                ckpt_kwargs = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
+                c = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(block, **new_kwargs),
+                    c,
+                    **ckpt_kwargs,
+                )
+            else:
+                c = block(c, **new_kwargs)
 
         # Extract hints (all but the last output)
         hints = list(torch.unbind(c))[:-1]
@@ -533,15 +549,51 @@ class WanTransformer3DVace(WanTransformer3DModel):
             )
 
         # Add hints to kwargs
-        kwargs['hints'] = hints
-        kwargs['context_scale'] = vace_context_scale
+        kwargs["hints"] = hints
+        kwargs["context_scale"] = vace_context_scale
 
-        # Process through main blocks with hint injection
+        # Process through main blocks with hint injection (with optional gradient checkpointing)
         for block in self.blocks:
-            x = block(x, **kwargs)
+            if torch.is_grad_enabled() and getattr(self, "gradient_checkpointing", False):
+                def create_custom_forward(module, **static_kwargs):
+                    def custom_forward(*inputs):
+                        return module(*inputs, **static_kwargs)
+                    return custom_forward
+                extra_kwargs = dict(
+                    e=e0,
+                    seq_lens=seq_lens,
+                    grid_sizes=grid_sizes,
+                    freqs=self.freqs,
+                    context=context,
+                    context_lens=context_lens,
+                    dtype=dtype,
+                    hints=hints,
+                    context_scale=vace_context_scale,
+                )
+                ckpt_kwargs = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
+                x = torch.utils.checkpoint.checkpoint(
+                    create_custom_forward(block, **extra_kwargs),
+                    x,
+                    **ckpt_kwargs,
+                )
+            else:
+                x = block(x, **kwargs)
 
-        # Head (final projection)
-        x = self.head(x, e)
+        # Head (final projection) with optional gradient checkpointing
+        if torch.is_grad_enabled() and getattr(self, "gradient_checkpointing", False):
+            def create_custom_forward(module):
+                def custom_forward(*inputs):
+                    return module(*inputs)
+                return custom_forward
+            ckpt_kwargs = {"use_reentrant": False} if is_torch_version(">=", "1.11.0") else {}
+            x = torch.utils.checkpoint.checkpoint(
+                create_custom_forward(self.head),
+                x,
+                e,
+                **ckpt_kwargs,
+            )
+        else:
+            x = self.head(x, e)
 
         # Unpatchify
         x = self.unpatchify(x, grid_sizes)
