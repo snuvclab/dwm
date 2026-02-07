@@ -274,8 +274,51 @@ def log_validation(
         # Determine pretrain mode
         pretrain_mode = training_config.get("pretrain_mode", "t2v")
         transformer_type = transformer_config.get("class", "WanTransformer3DModelWithConcat")
+        is_wan2_2 = "2.2" in pipeline_config.get("type", "")
 
-        transformer3d_val = accelerator.unwrap_model(transformer3d)
+        # Create a separate transformer for validation so merge_lora does not modify training weights in-place
+        transformer_path = os.path.join(
+            base_model_path,
+            transformer_additional_kwargs.get("transformer_subpath", "transformer"),
+        )
+        if transformer_type == "WanTransformer3DModel":
+            transformer3d_val = WanTransformer3DModel.from_pretrained(
+                transformer_path,
+                transformer_additional_kwargs=transformer_additional_kwargs,
+                torch_dtype=weight_dtype,
+            )
+        elif transformer_type == "WanTransformer3DModelWithConcat":
+            transformer3d_val = WanTransformer3DModelWithConcat.from_pretrained(
+                transformer_path,
+                transformer_additional_kwargs={
+                    "condition_channels": getattr(args, "condition_channels", 16),
+                    "is_wan2_2": is_wan2_2,
+                    **transformer_additional_kwargs,
+                },
+                torch_dtype=weight_dtype,
+            )
+        elif transformer_type == "WanTransformer3DVace":
+            vace_layers = transformer_config.get("vace_layers", None)
+            vace_in_dim = transformer_config.get("vace_in_dim", 16)
+            transformer3d_val = WanTransformer3DVace.from_pretrained(
+                transformer_path,
+                transformer_additional_kwargs={
+                    "vace_layers": vace_layers,
+                    "vace_in_dim": vace_in_dim,
+                    "is_wan2_2": is_wan2_2,
+                    **transformer_additional_kwargs,
+                },
+                torch_dtype=weight_dtype,
+            )
+        else:
+            raise ValueError(f"Unsupported transformer type: {transformer_type}")
+        # Sync weights from training transformer (base weights; LoRA will be merged later)
+        training_state = accelerator.unwrap_model(transformer3d).state_dict()
+        m, u = transformer3d_val.load_state_dict(training_state, strict=False)
+        if u:
+            logger.debug(f"Validation transformer: unexpected keys (e.g. LoRA) not loaded: {len(u)}")
+        transformer3d_val = transformer3d_val.to(accelerator.device, dtype=weight_dtype)
+        transformer3d_val.eval()
 
         scheduler = FlowMatchEulerDiscreteScheduler(
             **filter_kwargs(FlowMatchEulerDiscreteScheduler, scheduler_kwargs)
@@ -283,8 +326,7 @@ def log_validation(
 
         # Check pipeline type to select appropriate pipeline
         pipeline_type = pipeline_config.get("type", "")
-        is_wan2_2 = "2.2" in pipeline_type
-        
+
         if is_wan2_2:
             # WAN 2.2: No CLIP encoder needed
             logger.info("🔧 Using WAN 2.2 pipeline for validation")
