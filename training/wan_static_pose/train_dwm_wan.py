@@ -1592,16 +1592,21 @@ def main():
 
                 if static_videos is not None:
                     bs, _, num_frames, height, width = static_videos.size()
-                    # Create mask (all ones for now - full generation)
-                    if pretrain_mode == "v2v":
+                    # Create mask: pretrain_mode (t2v/v2v/i2v) only for WanTransformer3DModel; else always v2v-style (all ones)
+                    if transformer_type == "WanTransformer3DModel":
+                        if pretrain_mode == "v2v":
+                            mask = torch.ones(videos.shape[0], 1, videos.shape[2], videos.shape[3], videos.shape[4],
+                                            device=accelerator.device, dtype=weight_dtype)
+                        elif pretrain_mode == "i2v":
+                            mask = torch.zeros(videos.shape[0], 1, videos.shape[2], videos.shape[3], videos.shape[4],
+                                            device=accelerator.device, dtype=weight_dtype)
+                            mask[:, :, 0:1, :, :] = 1.0
+                        elif pretrain_mode == "t2v":
+                            mask = torch.zeros(videos.shape[0], 1, videos.shape[2], videos.shape[3], videos.shape[4],
+                                            device=accelerator.device, dtype=weight_dtype)
+                    else:
+                        # WithConcat / Vace: full conditioning (v2v-style)
                         mask = torch.ones(videos.shape[0], 1, videos.shape[2], videos.shape[3], videos.shape[4],
-                                        device=accelerator.device, dtype=weight_dtype)
-                    elif pretrain_mode == "i2v":
-                        mask = torch.zeros(videos.shape[0], 1, videos.shape[2], videos.shape[3], videos.shape[4],
-                                        device=accelerator.device, dtype=weight_dtype)
-                        mask[:, :, 0:1, :, :] = 1.0
-                    elif pretrain_mode == "t2v":
-                        mask = torch.zeros(videos.shape[0], 1, videos.shape[2], videos.shape[3], videos.shape[4],
                                         device=accelerator.device, dtype=weight_dtype)
 
                     static_videos = static_videos.to(accelerator.device, dtype=weight_dtype)
