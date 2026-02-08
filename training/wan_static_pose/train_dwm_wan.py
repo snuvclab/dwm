@@ -58,7 +58,7 @@ from PIL import Image
 from torch.utils.data import DataLoader, RandomSampler
 from torchvision import transforms
 from tqdm.auto import tqdm
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, T5Tokenizer
 from transformers.utils import ContextManagers
 import imageio.v3 as iio
 
@@ -194,11 +194,53 @@ def log_validation(
     accelerator,
     weight_dtype,
     global_step,
+    load_tensors: bool = False,
+    vae_path: str = None,
+    vae_kwargs: dict = None,
+    text_encoder_path: str = None,
+    text_encoder_kwargs: dict = None,
+    tokenizer_path: str = None,
 ):
     """Run validation during training using dataset-based validation samples."""
     try:
         logger.info("Running validation...")
-        
+
+        # If load_tensors=True, VAE/text_encoder were deleted during training. Reload them for validation.
+        models_reloaded = False
+        if load_tensors and vae is None:
+            if vae_path is None:
+                logger.warning("load_tensors=True but vae_path not provided. Skipping validation.")
+                return
+            logger.info(f"📦 Reloading models for validation...")
+
+            # Reload VAE
+            logger.info(f"   Loading VAE from {vae_path}...")
+            Choosen_AutoencoderKL = {
+                "AutoencoderKLWan": AutoencoderKLWan,
+                "AutoencoderKLWan3_8": AutoencoderKLWan3_8
+            }[vae_kwargs.get('vae_type', 'AutoencoderKLWan') if vae_kwargs else 'AutoencoderKLWan']
+            vae = Choosen_AutoencoderKL.from_pretrained(
+                vae_path,
+                additional_kwargs=vae_kwargs or {},
+            ).eval()
+            vae = vae.to(accelerator.device, dtype=weight_dtype)
+
+            # Reload text_encoder and tokenizer
+            if text_encoder_path is not None and tokenizer_path is not None:
+                logger.info(f"   Loading text encoder from {text_encoder_path}...")
+                text_encoder = WanT5EncoderModel.from_pretrained(
+                    text_encoder_path,
+                    additional_kwargs=text_encoder_kwargs or {},
+                    torch_dtype=weight_dtype,
+                ).eval()
+                text_encoder = text_encoder.to(accelerator.device)
+
+                logger.info(f"   Loading tokenizer from {tokenizer_path}...")
+                tokenizer = T5Tokenizer.from_pretrained(tokenizer_path)
+
+            models_reloaded = True
+            logger.info("   Models reloaded successfully.")
+
         # Extract config values
         pipeline_config = config.get('pipeline', {})
         training_config = config.get('training', {})
@@ -617,6 +659,14 @@ def log_validation(
                     logger.info(f"Validation {i+1}/{len(validation_set)}: {video_name} saved")
 
         del pipeline
+        # Clean up reloaded models if they were loaded for this validation run
+        if models_reloaded:
+            logger.info("📦 Cleaning up reloaded models after validation...")
+            del vae
+            if text_encoder is not None:
+                del text_encoder
+            if tokenizer is not None:
+                del tokenizer
         gc.collect()
         torch.cuda.empty_cache()
         torch.cuda.ipc_collect()
@@ -911,13 +961,13 @@ def main():
     )
 
     # Load tokenizer
-    tokenizer = AutoTokenizer.from_pretrained(
-        os.path.join(args.pretrained_model_name_or_path, text_encoder_kwargs.get('tokenizer_subpath', 'tokenizer')),
-    )
+    tokenizer_path = os.path.join(args.pretrained_model_name_or_path, text_encoder_kwargs.get('tokenizer_subpath', 'tokenizer'))
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
 
     # Load text encoder
+    text_encoder_path = os.path.join(args.pretrained_model_name_or_path, text_encoder_kwargs.get('text_encoder_subpath', 'text_encoder'))
     text_encoder = WanT5EncoderModel.from_pretrained(
-        os.path.join(args.pretrained_model_name_or_path, text_encoder_kwargs.get('text_encoder_subpath', 'text_encoder')),
+        text_encoder_path,
         additional_kwargs=text_encoder_kwargs,
         torch_dtype=weight_dtype,
     ).eval()
@@ -927,8 +977,9 @@ def main():
         "AutoencoderKLWan": AutoencoderKLWan,
         "AutoencoderKLWan3_8": AutoencoderKLWan3_8
     }[vae_kwargs.get('vae_type', 'AutoencoderKLWan')]
+    vae_path = os.path.join(args.pretrained_model_name_or_path, vae_kwargs.get('vae_subpath', 'vae'))
     vae = Choosen_AutoencoderKL.from_pretrained(
-        os.path.join(args.pretrained_model_name_or_path, vae_kwargs.get('vae_subpath', 'vae')),
+        vae_path,
         additional_kwargs=vae_kwargs,
     ).eval()
 
@@ -1209,19 +1260,26 @@ def main():
         print("📐 WAN 2.2 detected: Aligning width to multiples of 32 for compatibility")
     
     # Setup dataset and dataloader
+    # Read load_tensors from training.custom_settings (same as cogvideox pattern)
+    load_tensors = training_config.get("custom_settings", {}).get("load_tensors", False)
+    if load_tensors:
+        print("📦 Using pre-encoded latents (load_tensors=True)")
+
     dataset_init_kwargs = {
         "data_root": data_config["data_root"],
         "dataset_file": data_config["dataset_file"],
         "max_num_frames": data_config.get("max_num_frames", 49),
-        "load_tensors": data_config.get("load_tensors", False),
+        "load_tensors": load_tensors,
         "random_flip": data_config.get("random_flip", False),
         "height_buckets": data_config.get("height_buckets", 480),
         "width_buckets": data_config.get("width_buckets", 720),
         "frame_buckets": data_config.get("frame_buckets", 49),
         "prompt_subdir": data_config.get("prompt_subdir", "prompts"),
-        "prompt_embeds_subdir": data_config.get("prompt_embeds_subdir", "prompt_embeds"),
+        "prompt_embeds_subdir": data_config.get("prompt_embeds_subdir", "prompt_embeds_ego_fun_rewrite_wan"),
         "hand_video_subdir": data_config.get("hand_video_subdir", "videos_hands"),
-        "hand_video_latents_subdir": data_config.get("hand_video_latents_subdir", "hand_video_latents"),
+        "hand_video_latents_subdir": data_config.get("hand_video_latents_subdir", "hand_video_latents_wan"),
+        "video_latents_subdir": data_config.get("video_latents_subdir", "video_latents_wan"),
+        "static_video_latents_subdir": data_config.get("static_video_latents_subdir", "static_video_latents_wan"),
         "align_width_to_32": align_width_to_32,
     }
     
@@ -1288,12 +1346,30 @@ def main():
         )
 
     # Move models to device (skip transformer3d if already prepared with DeepSpeed/FSDP)
-    vae.to(accelerator.device, dtype=weight_dtype)
+    if not load_tensors:
+        # Only keep VAE on device when encoding videos during training
+        vae.to(accelerator.device, dtype=weight_dtype)
     if not (args.train_mode == "lora" and use_deepspeed_or_fsdp):
         transformer3d.to(accelerator.device, dtype=weight_dtype)
-    text_encoder.to(accelerator.device)
+    if not load_tensors:
+        # Only keep text_encoder on device when encoding prompts during training
+        text_encoder.to(accelerator.device)
     if clip_image_encoder is not None:
         clip_image_encoder.to(accelerator.device, dtype=weight_dtype)
+
+    # Free up memory when using pre-encoded latents
+    if load_tensors:
+        logger.info("📦 load_tensors=True: Deleting VAE and text_encoder to save memory")
+        del vae
+        del text_encoder
+        del tokenizer
+        vae = None
+        text_encoder = None
+        tokenizer = None
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize(accelerator.device)
+        logger.info("   VAE and text_encoder deleted. GPU memory freed.")
 
     # Recalculate training steps
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -1528,7 +1604,10 @@ def main():
         log_validation(
             vae, text_encoder, tokenizer, clip_image_encoder,
             transformer3d, network, config, args, accelerator,
-            weight_dtype, global_step=global_step
+            weight_dtype, global_step=global_step,
+            load_tensors=load_tensors, vae_path=vae_path, vae_kwargs=vae_kwargs,
+            text_encoder_path=text_encoder_path, text_encoder_kwargs=text_encoder_kwargs,
+            tokenizer_path=tokenizer_path,
         )
 
     requires_hand_videos = transformer_type in ["WanTransformer3DModelWithConcat", "WanTransformer3DVace"]
@@ -1556,19 +1635,30 @@ def main():
                 hand_videos = batch.get("hand_videos")
                 static_videos = batch.get("static_videos")
 
-                # Encode videos to latents (using mini-batch for memory efficiency)
-                videos = rearrange(videos, "b f c h w -> b c f h w")
-                with torch.no_grad():
-                    latents = _batch_encode_vae(videos)
+                # ===== Encode videos to latents =====
+                if load_tensors:
+                    # Pre-encoded latents: already [B, C, F', H', W'] from dataset
+                    # encode_with_wan.py already called .sample(), no need for VAE
+                    latents = videos  # Already latents
+                else:
+                    # Raw videos: [B, F, C, H, W] -> encode to latents
+                    videos = rearrange(videos, "b f c h w -> b c f h w")
+                    with torch.no_grad():
+                        latents = _batch_encode_vae(videos)
 
-                # Encode condition videos
+                # ===== Encode condition videos =====
                 dropout_mask = None  # Initialize dropout_mask
                 if requires_hand_videos and hand_videos is not None:
-                    hand_videos = hand_videos.to(accelerator.device, dtype=weight_dtype)
-                    hand_videos = rearrange(hand_videos, "b f c h w -> b c f h w")
-                    with torch.no_grad():
-                        hand_latents = _batch_encode_vae(hand_videos)
-                    
+                    if load_tensors:
+                        # Pre-encoded hand latents: already [B, C, F', H', W']
+                        hand_latents = hand_videos.to(accelerator.device, dtype=weight_dtype)
+                    else:
+                        # Raw hand videos: encode to latents
+                        hand_videos = hand_videos.to(accelerator.device, dtype=weight_dtype)
+                        hand_videos = rearrange(hand_videos, "b f c h w -> b c f h w")
+                        with torch.no_grad():
+                            hand_latents = _batch_encode_vae(hand_videos)
+
                     # Apply hand dropout for classifier-free guidance training
                     # This helps the model learn to generate without hand information
                     hand_dropout_prob = training_config.get("hand_dropout_prob", 0.0)
@@ -1577,12 +1667,12 @@ def main():
                         hand_batch_size = hand_latents.shape[0]
                         # Sample dropout mask: each sample in batch has independent dropout probability
                         dropout_mask = torch.rand(hand_batch_size, device=accelerator.device) < hand_dropout_prob
-                        
+
                         if dropout_mask.any():
                             # Zero out hand latents for dropped samples
                             # hand_latents shape: [B, 16, F, H, W]
                             hand_latents[dropout_mask] = torch.zeros_like(hand_latents[dropout_mask])
-                            
+
                             # Log dropout statistics (only occasionally to avoid spam)
                             if global_step % 100 == 0:
                                 num_dropped = dropout_mask.sum().item()
@@ -1591,58 +1681,91 @@ def main():
                     hand_latents = None
 
                 if static_videos is not None:
-                    bs, _, num_frames, height, width = static_videos.size()
-                    # Create mask: pretrain_mode (t2v/v2v/i2v) only for WanTransformer3DModel; else always v2v-style (all ones)
-                    if transformer_type == "WanTransformer3DModel":
-                        if pretrain_mode == "v2v":
-                            mask = torch.ones(videos.shape[0], 1, videos.shape[2], videos.shape[3], videos.shape[4],
-                                            device=accelerator.device, dtype=weight_dtype)
-                        elif pretrain_mode == "i2v":
-                            mask = torch.zeros(videos.shape[0], 1, videos.shape[2], videos.shape[3], videos.shape[4],
-                                            device=accelerator.device, dtype=weight_dtype)
-                            mask[:, :, 0:1, :, :] = 1.0
-                        elif pretrain_mode == "t2v":
-                            mask = torch.zeros(videos.shape[0], 1, videos.shape[2], videos.shape[3], videos.shape[4],
-                                            device=accelerator.device, dtype=weight_dtype)
+                    if load_tensors:
+                        # Pre-encoded static latents: already [B, C, F', H', W']
+                        static_latents = static_videos.to(accelerator.device, dtype=weight_dtype)
+                        bs, _, latent_frames, latent_height, latent_width = static_latents.size()
+
+                        # Create mask directly in latent space (4 channels for WAN Fun format)
+                        # mask_latents shape: [B, 4, F', H', W']
+                        if transformer_type == "WanTransformer3DModel":
+                            if pretrain_mode == "v2v":
+                                mask_latents = torch.ones(bs, 4, latent_frames, latent_height, latent_width,
+                                                        device=accelerator.device, dtype=weight_dtype)
+                            elif pretrain_mode == "i2v":
+                                mask_latents = torch.zeros(bs, 4, latent_frames, latent_height, latent_width,
+                                                        device=accelerator.device, dtype=weight_dtype)
+                                mask_latents[:, :, 0:1, :, :] = 1.0
+                            elif pretrain_mode == "t2v":
+                                mask_latents = torch.zeros(bs, 4, latent_frames, latent_height, latent_width,
+                                                        device=accelerator.device, dtype=weight_dtype)
+                        else:
+                            # WithConcat / Vace: full conditioning (v2v-style, all ones)
+                            mask_latents = torch.ones(bs, 4, latent_frames, latent_height, latent_width,
+                                                    device=accelerator.device, dtype=weight_dtype)
+
+                        # Create inpaint-style input for WAN Fun (y argument)
+                        inpaint_latents = torch.cat([mask_latents, static_latents], dim=1)  # [b, 4+16=20, f, h, w]
                     else:
-                        # WithConcat / Vace: full conditioning (v2v-style)
-                        mask = torch.ones(videos.shape[0], 1, videos.shape[2], videos.shape[3], videos.shape[4],
-                                        device=accelerator.device, dtype=weight_dtype)
+                        # Raw static videos: encode to latents
+                        # static_videos is [B, F, C, H, W] before rearrange
+                        bs, num_frames, _, height, width = static_videos.size()
 
-                    static_videos = static_videos.to(accelerator.device, dtype=weight_dtype)
-                    static_videos = rearrange(static_videos, "b f c h w -> b c f h w")
-                    static_videos = static_videos * mask
-                    with torch.no_grad():
-                        static_latents = _batch_encode_vae(static_videos)
+                        # Create mask in pixel space: pretrain_mode (t2v/v2v/i2v) only for WanTransformer3DModel
+                        if transformer_type == "WanTransformer3DModel":
+                            if pretrain_mode == "v2v":
+                                mask = torch.ones(latents.shape[0], 1, num_frames, height, width,
+                                                device=accelerator.device, dtype=weight_dtype)
+                            elif pretrain_mode == "i2v":
+                                mask = torch.zeros(latents.shape[0], 1, num_frames, height, width,
+                                                device=accelerator.device, dtype=weight_dtype)
+                                mask[:, :, 0:1, :, :] = 1.0
+                            elif pretrain_mode == "t2v":
+                                mask = torch.zeros(latents.shape[0], 1, num_frames, height, width,
+                                                device=accelerator.device, dtype=weight_dtype)
+                        else:
+                            # WithConcat / Vace: full conditioning (v2v-style)
+                            mask = torch.ones(latents.shape[0], 1, num_frames, height, width,
+                                            device=accelerator.device, dtype=weight_dtype)
 
-                    # Channel layout for WanTransformer3DModelWithConcat:
-                    # x: noisy_latents [b, 16, f, h, w]
-                    # y: inpaint_latents = mask + static_latents [b, 4+16=20, f, h, w] (WAN Fun format)
-                    #    - mask: 4ch (4x temporal compression stacks along channel dim)
-                    #    - static_latents: 16ch (VAE latent)
-                    # condition_latents: hand_latents [b, 16, f, h, w] (extra condition channels)
-                    # 
-                    # Total: 16 + 20 + 16 = 52 channels (condition_channels=16 for hand)
-                    
-                    # Resize mask to match latent dimensions
-                    mask = torch.concat(
-                        [
-                            torch.repeat_interleave(mask[:, :, 0:1], repeats=4, dim=2), 
-                            mask[:, :, 1:]
-                        ], dim=2
-                    )
-                    mask = mask.view(bs, mask.shape[2] // 4, 4, height, width)
-                    mask = mask.transpose(1, 2)
-                    mask_latents = resize_mask(mask, latents, process_first_frame_only=True)
-                
-                    # Create inpaint-style input for WAN Fun (y argument)
-                    inpaint_latents = torch.cat([mask_latents, static_latents], dim=1)  # [b, 4+16=20, f, h, w]
+                        # Encode static videos to latents
+                        static_videos = static_videos.to(accelerator.device, dtype=weight_dtype)
+                        static_videos = rearrange(static_videos, "b f c h w -> b c f h w")
+                        static_videos = static_videos * mask
+                        with torch.no_grad():
+                            static_latents = _batch_encode_vae(static_videos)
+
+                        # Convert mask from pixel space to latent space
+                        # Channel layout for WanTransformer3DModelWithConcat:
+                        # y: inpaint_latents = mask + static_latents [b, 4+16=20, f, h, w] (WAN Fun format)
+                        mask = torch.concat(
+                            [
+                                torch.repeat_interleave(mask[:, :, 0:1], repeats=4, dim=2),
+                                mask[:, :, 1:]
+                            ], dim=2
+                        )
+                        mask = mask.view(bs, mask.shape[2] // 4, 4, height, width)
+                        mask = mask.transpose(1, 2)
+                        mask_latents = resize_mask(mask, latents, process_first_frame_only=True)
+
+                        # Create inpaint-style input for WAN Fun (y argument)
+                        inpaint_latents = torch.cat([mask_latents, static_latents], dim=1)  # [b, 4+16=20, f, h, w]
                 else:
                     inpaint_latents = None
 
                 # Encode prompts
                 with torch.no_grad():
-                    if isinstance(prompts, list):
+                    if load_tensors:
+                        # Pre-encoded embeddings from dataset
+                        # prompts is a list of tensors [seq_len_i, dim] from collate (variable lengths)
+                        # or a stacked tensor [B, seq_len, dim] if same lengths
+                        if isinstance(prompts, torch.Tensor):
+                            # If stacked tensor, convert to list for WAN transformer
+                            prompt_embeds = [p.to(accelerator.device, dtype=weight_dtype) for p in prompts]
+                        else:
+                            # Already a list of tensors
+                            prompt_embeds = [p.to(accelerator.device, dtype=weight_dtype) for p in prompts]
+                    elif isinstance(prompts, list):
                         prompt_ids = tokenizer(
                             prompts,
                             padding="max_length",
@@ -1841,7 +1964,10 @@ def main():
                     log_validation(
                         vae, text_encoder, tokenizer, clip_image_encoder,
                         transformer3d, network, config, args, accelerator,
-                        weight_dtype, global_step
+                        weight_dtype, global_step,
+                        load_tensors=load_tensors, vae_path=vae_path, vae_kwargs=vae_kwargs,
+                        text_encoder_path=text_encoder_path, text_encoder_kwargs=text_encoder_kwargs,
+                        tokenizer_path=tokenizer_path,
                     )
 
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}

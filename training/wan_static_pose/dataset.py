@@ -50,9 +50,11 @@ class VideoDataset(Dataset):
         image_to_video: bool = False,
         use_gray_hand_videos: bool = False,
         prompt_subdir: str = "prompts",
-        prompt_embeds_subdir: str = "prompt_embeds",
+        prompt_embeds_subdir: str = "prompt_embeds_ego_fun_rewrite_wan",
         hand_video_subdir: str = "videos_hands",
-        hand_video_latents_subdir: str = "hand_video_latents",
+        hand_video_latents_subdir: str = "hand_video_latents_wan",
+        video_latents_subdir: str = "video_latents_wan",
+        static_video_latents_subdir: str = "static_video_latents_wan",
         align_width_to_32: bool = False,
     ) -> None:
         super().__init__()
@@ -81,6 +83,8 @@ class VideoDataset(Dataset):
         self.prompt_embeds_subdir = prompt_embeds_subdir
         self.hand_video_subdir = hand_video_subdir
         self.hand_video_latents_subdir = hand_video_latents_subdir
+        self.video_latents_subdir = video_latents_subdir
+        self.static_video_latents_subdir = static_video_latents_subdir
         
         # Ensure buckets are lists
         if not isinstance(self.height_buckets, list):
@@ -332,10 +336,10 @@ class VideoDataset(Dataset):
             pt_filename = f"{filename_without_ext}.pt"
 
             # The current path is something like: /a/b/c/d/videos/00001.mp4
-            # We need to reach: /a/b/c/d/video_latents/00001.pt
+            # We need to reach: /a/b/c/d/video_latents_wan/00001.pt (using configurable subdir)
             image_latents_path = path.parent.parent.joinpath("image_latents")
-            video_latents_path = path.parent.parent.joinpath("video_latents")
-            embeds_path = path.parent.parent.joinpath("prompt_embeds")
+            video_latents_path = path.parent.parent.joinpath(self.video_latents_subdir)
+            embeds_path = path.parent.parent.joinpath(self.prompt_embeds_subdir)
 
             if (
                 not video_latents_path.exists()
@@ -394,7 +398,7 @@ class VideoDatasetWithConditions(VideoDataset):
     - hand_videos: Egocentric hand mesh videos (automatically derived from main video paths)
     - static_videos: Static scene videos (automatically derived from main video paths)
     """
-    
+
     def __init__(
         self,
         data_root: str,
@@ -411,9 +415,11 @@ class VideoDatasetWithConditions(VideoDataset):
         image_to_video: bool = False,
         use_gray_hand_videos: bool = False,
         prompt_subdir: str = "prompts",
-        prompt_embeds_subdir: str = "prompt_embeds",
+        prompt_embeds_subdir: str = "prompt_embeds_ego_fun_rewrite_wan",
         hand_video_subdir: str = "videos_hands",
-        hand_video_latents_subdir: str = "hand_video_latents",
+        hand_video_latents_subdir: str = "hand_video_latents_wan",
+        video_latents_subdir: str = "video_latents_wan",
+        static_video_latents_subdir: str = "static_video_latents_wan",
         align_width_to_32: bool = False,
     ) -> None:
         # Initialize parent class with main video column
@@ -434,9 +440,11 @@ class VideoDatasetWithConditions(VideoDataset):
             prompt_embeds_subdir=prompt_embeds_subdir,
             hand_video_subdir=hand_video_subdir,
             hand_video_latents_subdir=hand_video_latents_subdir,
+            video_latents_subdir=video_latents_subdir,
+            static_video_latents_subdir=static_video_latents_subdir,
             align_width_to_32=align_width_to_32,
         )
-        
+
         # Store the use_gray_hand_videos flag
         self.use_gray_hand_videos = use_gray_hand_videos
         # Store the align_width_to_32 flag (for WAN 2.2 compatibility)
@@ -503,19 +511,21 @@ class VideoDatasetWithConditions(VideoDataset):
         
         # Load condition videos
         if self.load_tensors:
-            # Load preprocessed latents for condition videos
+            # Load preprocessed latents for condition videos (using configurable subdirs)
             try:
                 if self.use_gray_hand_videos:
-                    hand_video_latents = self._load_condition_video_latents(self.hand_video_paths[index], "hand_video_gray_latents")
+                    # Gray hand videos use a different subdir pattern
+                    hand_latents_subdir = self.hand_video_latents_subdir.replace("hand_video", "hand_video_gray")
+                    hand_video_latents = self._load_condition_video_latents(self.hand_video_paths[index], hand_latents_subdir)
                 else:
-                    hand_video_latents = self._load_condition_video_latents(self.hand_video_paths[index], "hand_video_latents")
+                    hand_video_latents = self._load_condition_video_latents(self.hand_video_paths[index], self.hand_video_latents_subdir)
                 main_data["hand_videos"] = hand_video_latents
             except Exception as e:
                 logger.warning(f"Failed to load hand video latents for index {index}: {e}")
                 main_data["hand_videos"] = None
-            
+
             try:
-                static_video_latents = self._load_condition_video_latents(self.static_video_paths[index], "static_video_latents")
+                static_video_latents = self._load_condition_video_latents(self.static_video_paths[index], self.static_video_latents_subdir)
                 main_data["static_videos"] = static_video_latents
             except Exception as e:
                 logger.warning(f"Failed to load static video latents for index {index}: {e}")
