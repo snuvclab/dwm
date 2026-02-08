@@ -1275,7 +1275,7 @@ def main():
         "width_buckets": data_config.get("width_buckets", 720),
         "frame_buckets": data_config.get("frame_buckets", 49),
         "prompt_subdir": data_config.get("prompt_subdir", "prompts"),
-        "prompt_embeds_subdir": data_config.get("prompt_embeds_subdir", "prompt_embeds_ego_fun_rewrite_wan"),
+        "prompt_embeds_subdir": data_config.get("prompt_embeds_subdir", "prompt_embeds_fun_rewrite_wan"),
         "hand_video_subdir": data_config.get("hand_video_subdir", "videos_hands"),
         "hand_video_latents_subdir": data_config.get("hand_video_latents_subdir", "hand_video_latents_wan"),
         "video_latents_subdir": data_config.get("video_latents_subdir", "video_latents_wan"),
