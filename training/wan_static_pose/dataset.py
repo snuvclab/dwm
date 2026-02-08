@@ -56,9 +56,11 @@ class VideoDataset(Dataset):
         video_latents_subdir: str = "video_latents_wan",
         static_video_latents_subdir: str = "static_video_latents_wan",
         align_width_to_32: bool = False,
+        max_prompt_length: int = 512,
     ) -> None:
         super().__init__()
         self.align_width_to_32 = align_width_to_32
+        self.max_prompt_length = max_prompt_length
 
         self.data_root = Path(data_root)
         # Handle dataset_file as list or single path
@@ -378,6 +380,20 @@ class VideoDataset(Dataset):
                 )
                 latents = torch.load(video_latent_filepath, map_location="cpu", weights_only=True)
                 embeds = torch.load(embeds_filepath, map_location="cpu", weights_only=True)
+
+                # Pad prompt embeddings to max_prompt_length for uniform batch sizes
+                # embeds shape: [seq_len, dim] -> pad to [max_prompt_length, dim]
+                if embeds.shape[0] < self.max_prompt_length:
+                    padding = torch.zeros(
+                        self.max_prompt_length - embeds.shape[0],
+                        embeds.shape[1],
+                        dtype=embeds.dtype,
+                    )
+                    embeds = torch.cat([embeds, padding], dim=0)
+                elif embeds.shape[0] > self.max_prompt_length:
+                    # Truncate if longer than max_prompt_length
+                    embeds = embeds[:self.max_prompt_length]
+
             except Exception as e:
                 logger.error(f"Failed to load torch files for {path}: {e}")
                 logger.error(f"image_latent_filepath: {image_latent_filepath if self.image_to_video else 'N/A'}")
@@ -421,6 +437,7 @@ class VideoDatasetWithConditions(VideoDataset):
         video_latents_subdir: str = "video_latents_wan",
         static_video_latents_subdir: str = "static_video_latents_wan",
         align_width_to_32: bool = False,
+        max_prompt_length: int = 512,
     ) -> None:
         # Initialize parent class with main video column
         super().__init__(
@@ -436,6 +453,7 @@ class VideoDatasetWithConditions(VideoDataset):
             load_tensors=load_tensors,
             random_flip=random_flip,
             image_to_video=image_to_video,
+            max_prompt_length=max_prompt_length,
             prompt_subdir=prompt_subdir,
             prompt_embeds_subdir=prompt_embeds_subdir,
             hand_video_subdir=hand_video_subdir,
