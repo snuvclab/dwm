@@ -424,8 +424,8 @@ def log_validation(
                 raise ValueError(f"Unsupported WAN 2.1 pipeline type: {pipeline_type}")
         pipeline = pipeline.to(accelerator.device, dtype=weight_dtype)
 
-        # Merge LoRA weights for validation if using LoRA training
-        if args.train_mode == "lora" and network is not None:
+        # Merge LoRA weights for validation if using LoRA-based training
+        if args.train_mode in ["lora", "vace_lora"] and network is not None:
             pipeline = merge_lora(
                 pipeline, None, 1, accelerator.device,
                 state_dict=accelerator.unwrap_model(network).state_dict(),
@@ -658,7 +658,10 @@ def log_validation(
                     
                     logger.info(f"Validation {i+1}/{len(validation_set)}: {video_name} saved")
 
+        # Explicitly delete all validation-specific objects
         del pipeline
+        del transformer3d_val
+        del scheduler
         # Clean up reloaded models if they were loaded for this validation run
         if models_reloaded:
             logger.info("📦 Cleaning up reloaded models after validation...")
@@ -1076,6 +1079,7 @@ def main():
 
     network = None
     trainable_params = None
+    vace_trainable_params = []
 
     # Get trainable_parameter_patterns from config (for non-LoRA trainable params like patch_embedding)
     trainable_parameter_patterns = training_config.get("trainable_parameter_patterns", [])
@@ -1122,6 +1126,61 @@ def main():
             print(f"📊 Non-LoRA trainable parameters: {sum(p.numel() for p in non_lora_trainable_params):,}")
         
         print(f"📊 LoRA trainable parameters: {sum(p.numel() for p in trainable_params):,}")
+
+    elif args.train_mode == "vace_lora":
+        print("🔧 Setting up VACE + Backbone LoRA training (vace modules trainable + backbone LoRA)...")
+
+        # Ensure we're using WanTransformer3DVace
+        if transformer_type != "WanTransformer3DVace":
+            raise ValueError(f"vace_lora training mode requires WanTransformer3DVace, but got {transformer_type}")
+
+        # Freeze everything first
+        transformer3d.requires_grad_(False)
+
+        # In vace_lora mode, default skip to avoid injecting LoRA into vace_* modules
+        lora_skip_name = args.lora_skip_name if args.lora_skip_name is not None else "vace_"
+        if args.lora_skip_name is None:
+            print("ℹ️  vace_lora mode: lora_skip_name not provided, defaulting to 'vace_'")
+        else:
+            print(f"ℹ️  vace_lora mode: using user-provided lora_skip_name='{args.lora_skip_name}'")
+
+        # Create LoRA network for backbone
+        network = create_network(
+            1.0,
+            args.rank,
+            args.network_alpha,
+            text_encoder,
+            transformer3d,
+            neuron_dropout=None,
+            skip_name=lora_skip_name,
+        )
+        network.apply_to(text_encoder, transformer3d, args.train_text_encoder, True)
+
+        # Enable only VACE-specific full-trainable modules
+        for name, param in transformer3d.named_parameters():
+            if "vace_blocks" in name or "vace_patch_embedding" in name:
+                param.requires_grad = True
+                vace_trainable_params.append(param)
+                print(f"   ✓ VACE enabled: {name}")
+
+        if not vace_trainable_params:
+            raise ValueError("No VACE parameters found to train! Check if transformer has vace_blocks and vace_patch_embedding.")
+
+        # LoRA optimizer params + VACE full-train params
+        trainable_params_optim = network.prepare_optimizer_params(
+            args.learning_rate / 2, args.learning_rate, args.learning_rate
+        )
+        trainable_params_optim.append({
+            'params': vace_trainable_params,
+            'lr': args.learning_rate,
+        })
+
+        lora_trainable_params = list(filter(lambda p: p.requires_grad, network.parameters()))
+        trainable_params = lora_trainable_params + vace_trainable_params
+
+        print(f"📊 LoRA trainable parameters: {sum(p.numel() for p in lora_trainable_params):,}")
+        print(f"📊 VACE trainable parameters: {sum(p.numel() for p in vace_trainable_params):,}")
+        print(f"📊 Total trainable parameters: {sum(p.numel() for p in trainable_params):,}")
 
     elif args.train_mode == "sft":
         print("🔧 Setting up SFT training...")
@@ -1326,7 +1385,7 @@ def main():
     # ========== Prepare with Accelerator ==========
     use_deepspeed_or_fsdp = (fsdp_stage != 0) or (zero_stage != 0)
     
-    if args.train_mode == "lora":
+    if args.train_mode in ["lora", "vace_lora"]:
         if use_deepspeed_or_fsdp:
             # DeepSpeed/FSDP: Attach network to transformer so DeepSpeed can find all params
             transformer3d.network = network
@@ -1334,12 +1393,18 @@ def main():
             transformer3d, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
                 transformer3d, optimizer, train_dataloader, lr_scheduler
             )
-            print(f"📦 Prepared transformer3d with attached LoRA network (DeepSpeed/FSDP mode)")
+            print(f"📦 Prepared transformer3d with attached LoRA network (DeepSpeed/FSDP mode, train_mode={args.train_mode})")
         else:
-            # No DeepSpeed/FSDP: Just prepare network
-            network, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-                network, optimizer, train_dataloader, lr_scheduler
-            )
+            if args.train_mode == "vace_lora":
+                # No DeepSpeed/FSDP: prepare both network and transformer
+                network, transformer3d, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+                    network, transformer3d, optimizer, train_dataloader, lr_scheduler
+                )
+            else:
+                # No DeepSpeed/FSDP: Just prepare network
+                network, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+                    network, optimizer, train_dataloader, lr_scheduler
+                )
     else:
         transformer3d, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
             transformer3d, optimizer, train_dataloader, lr_scheduler
@@ -1349,7 +1414,7 @@ def main():
     if not load_tensors:
         # Only keep VAE on device when encoding videos during training
         vae.to(accelerator.device, dtype=weight_dtype)
-    if not (args.train_mode == "lora" and use_deepspeed_or_fsdp):
+    if not (args.train_mode in ["lora", "vace_lora"] and use_deepspeed_or_fsdp):
         transformer3d.to(accelerator.device, dtype=weight_dtype)
     if not load_tensors:
         # Only keep text_encoder on device when encoding prompts during training
@@ -1487,6 +1552,19 @@ def main():
                             vace_state_dict = load_file(vace_path, device=str(accelerator.device))
                             m, u = accelerator.unwrap_model(transformer3d).load_state_dict(vace_state_dict, strict=False)
                             print(f"Loaded VACE weights: missing {len(m)}, unexpected {len(u)}")
+                    elif args.train_mode == "vace_lora":
+                        # Load LoRA + VACE weights
+                        lora_path = os.path.join(checkpoint_path, "lora_diffusion_pytorch_model.safetensors")
+                        if os.path.exists(lora_path):
+                            state_dict = load_file(lora_path, device=str(accelerator.device))
+                            m, u = accelerator.unwrap_model(network).load_state_dict(state_dict, strict=False)
+                            print(f"Loaded LoRA: missing {len(m)}, unexpected {len(u)}")
+
+                        vace_path = os.path.join(checkpoint_path, "vace_weights.safetensors")
+                        if os.path.exists(vace_path):
+                            vace_state_dict = load_file(vace_path, device=str(accelerator.device))
+                            m, u = accelerator.unwrap_model(transformer3d).load_state_dict(vace_state_dict, strict=False)
+                            print(f"Loaded VACE weights: missing {len(m)}, unexpected {len(u)}")
                     else:
                         # Load transformer weights for SFT
                         transformer_path = os.path.join(checkpoint_path, "transformer")
@@ -1546,6 +1624,18 @@ def main():
                                 print(f"Loaded non-LoRA weights: missing {len(m)}, unexpected {len(u)}")
                         elif args.train_mode == "vace":
                             # Load VACE weights (vace_blocks + vace_patch_embedding)
+                            vace_path = os.path.join(checkpoint_path, "vace_weights.safetensors")
+                            if os.path.exists(vace_path):
+                                vace_state_dict = load_file(vace_path, device=str(accelerator.device))
+                                m, u = accelerator.unwrap_model(transformer3d).load_state_dict(vace_state_dict, strict=False)
+                                print(f"Loaded VACE weights: missing {len(m)}, unexpected {len(u)}")
+                        elif args.train_mode == "vace_lora":
+                            lora_path = os.path.join(checkpoint_path, "lora_diffusion_pytorch_model.safetensors")
+                            if os.path.exists(lora_path):
+                                state_dict = load_file(lora_path, device=str(accelerator.device))
+                                m, u = accelerator.unwrap_model(network).load_state_dict(state_dict, strict=False)
+                                print(f"Loaded LoRA: missing {len(m)}, unexpected {len(u)}")
+
                             vace_path = os.path.join(checkpoint_path, "vace_weights.safetensors")
                             if os.path.exists(vace_path):
                                 vace_state_dict = load_file(vace_path, device=str(accelerator.device))
@@ -1626,7 +1716,12 @@ def main():
         train_loss = 0.0
 
         for step, batch in enumerate(train_dataloader):
-            models_to_accumulate = [network] if args.train_mode == "lora" else [transformer3d]
+            if args.train_mode == "vace_lora":
+                models_to_accumulate = [network, transformer3d]
+            elif args.train_mode == "lora":
+                models_to_accumulate = [network]
+            else:
+                models_to_accumulate = [transformer3d]
 
             with accelerator.accumulate(models_to_accumulate):
                 # Get batch data
@@ -1893,6 +1988,9 @@ def main():
                 if accelerator.sync_gradients:
                     if args.train_mode == "lora":
                         accelerator.clip_grad_norm_(network.parameters(), args.max_grad_norm)
+                    elif args.train_mode == "vace_lora":
+                        clip_params = list(network.parameters()) + vace_trainable_params
+                        accelerator.clip_grad_norm_(clip_params, args.max_grad_norm)
                     else:
                         accelerator.clip_grad_norm_(trainable_params, args.max_grad_norm)
 
@@ -1941,6 +2039,9 @@ def main():
                         
                         if args.train_mode == "lora":
                             save_model_lora(save_path, network, weight_dtype, accelerator, transformer3d, trainable_parameter_patterns)
+                        elif args.train_mode == "vace_lora":
+                            save_model_lora(save_path, network, weight_dtype, accelerator, transformer3d, trainable_parameter_patterns=None)
+                            save_model_vace(save_path, transformer3d, accelerator)
                         elif args.train_mode == "vace":
                             save_model_vace(save_path, transformer3d, accelerator)
                         else:
@@ -1984,6 +2085,9 @@ def main():
 
         if args.train_mode == "lora":
             save_model_lora(save_path, network, weight_dtype, accelerator, transformer3d, trainable_parameter_patterns)
+        elif args.train_mode == "vace_lora":
+            save_model_lora(save_path, network, weight_dtype, accelerator, transformer3d, trainable_parameter_patterns=None)
+            save_model_vace(save_path, transformer3d, accelerator)
         elif args.train_mode == "vace":
             save_model_vace(save_path, transformer3d, accelerator)
         else:
