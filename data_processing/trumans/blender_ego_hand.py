@@ -45,6 +45,8 @@ parser.add_argument("--skip-existing", action="store_true", default=True, help="
 parser.add_argument("--no-skip-existing", action="store_true", help="Disable skipping existing frames")
 parser.add_argument("--frame-skip", type=int, default=3, help="Render every Nth frame")
 parser.add_argument("--stride", type=int, default=25, help="Stride for video sequences (default: 25)")
+parser.add_argument("--clip-length", type=int, default=49, help="Frames per video clip (default: 49)")
+parser.add_argument("--fps", type=float, default=8.0, help="FPS for output videos (default: 8.0)")
 parser.add_argument("--fov", type=float, default=90.0, help="Camera FOV in degrees (perspective)")
 parser.add_argument("--width", type=int, default=720, help="Render width in pixels (default: 720)")
 parser.add_argument("--height", type=int, default=480, help="Render height in pixels (default: 480)")
@@ -201,6 +203,11 @@ def optimize_scene_for_rendering():
         keys = scene.cycles.bl_rna.properties['denoiser'].enum_items.keys()
         if 'OPTIX' in keys: scene.cycles.denoiser = 'OPTIX'
         elif 'OPENIMAGEDENOISE' in keys: scene.cycles.denoiser = 'OPENIMAGEDENOISE'
+
+    # Persistent data caching (Blender 4.x) - improves performance for animation rendering
+    if hasattr(scene.render, "use_persistent_data"):
+        scene.render.use_persistent_data = True
+
     scene.render.resolution_percentage = 100
     scene.render.use_border = False
     scene.render.use_crop_to_border = False
@@ -586,11 +593,11 @@ def render_hands_pytorch3d(camera_obj, hand_objects, render_shape=None, grayscal
         V = Vc.unsqueeze(0)                                        # (1,V,3)
         F = torch.from_numpy(F_np).to(device).unsqueeze(0).long()  # (1,F,3)
 
-        # Improved color scheme (3-channel balanced, diffusion-friendly)
+        # Hand colors (restored from 2025-08/09: vibrant green / deep red)
         if "CC_Hand_L" in obj.name:
-            col = (0.65, 0.80, 0.75)  # soft turquoise green - balanced channels
+            col = (0.5, 0.8, 0.5)   # vibrant green with slight blue tint
         else:
-            col = (0.82, 0.68, 0.70)  # light rose - balanced channels
+            col = (0.8, 0.4, 0.4)   # deep, rich red
         Cverts = torch.tensor(col, device=device).view(1, 1, 3).expand(1, V.shape[1], 3)
         mesh = Meshes(verts=V, faces=F, textures=TexturesVertex(Cverts))
 
@@ -834,7 +841,7 @@ def render_animation_sequence(animation_index, animation_name):
             print(f"  Images: {images_output_path}")
     else:
         # Video mode: save to sequences/videos_hands folder
-        sequences_folder = os.path.join(anim_output_folder, "sequences")
+        sequences_folder = os.path.join(anim_output_folder, "processed2")
         if args.separate:
             # Separate mode: create subfolders for left and right hands
             videos_output_path_left = os.path.join(sequences_folder, "videos_hands_gray_left")
@@ -848,7 +855,7 @@ def render_animation_sequence(animation_index, animation_name):
             print(f"  Temp images: {temp_dir}")
         else:
             # Use different path for grayscale vs color videos
-            video_folder_suffix = "hands_gray" if args.grayscale else "hands_new2"
+            video_folder_suffix = "hands_gray" if args.grayscale else "hands"
             videos_output_path = os.path.join(sequences_folder, f"videos_{video_folder_suffix}")
             os.makedirs(videos_output_path, exist_ok=True)
             print(f"Rendering animation {animation_index}: {animation_name}")
@@ -994,10 +1001,10 @@ def render_animation_sequence(animation_index, animation_name):
             print("="*50)
     else:
         # Video mode: video sequence parameters
-        clip_length = 49  # 49 frames per video
-        stride = args.stride  # Use command line argument
+        clip_length = args.clip_length
+        stride = args.stride
         frame_skip = args.frame_skip
-        fps = 8
+        fps = args.fps
         
         # Calculate video start frames
         effective_stride = stride * frame_skip  # Actual frame stride
@@ -1650,7 +1657,7 @@ for idx, _name in animations_to_render:
     if idx not in [f[0] for f in failed_animations]:
         scene = bpy.context.scene
         # Calculate frames per video sequence
-        clip_length = 49
+        clip_length = args.clip_length
         stride = args.stride
         frame_skip = args.frame_skip
         effective_stride = stride * frame_skip

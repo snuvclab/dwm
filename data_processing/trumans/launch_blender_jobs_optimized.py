@@ -373,7 +373,7 @@ def check_already_rendered(blend_file, save_path, status_report=None, script_pat
                         else:
                             video_type = "static"  # Default
                         
-                        expected_videos = get_expected_video_count(blend_file, item, frame_skip=3, stride=25, clip_length=49)
+                        expected_videos = get_expected_video_count(blend_file, item, frame_skip=frame_skip, stride=clip_stride, clip_length=clip_length)
                         if expected_videos is None:
                             expected_videos = 0
                         
@@ -1290,7 +1290,7 @@ def main():
             cmd.extend(["--height", str(args.height)])
         
         # Add samples option if specified and using scripts that accept it
-        if ('blender_ego_rgb_depth_optimized.py' in args.script_path) or ('blender_ego_static.py' in args.script_path):
+        if ('blender_ego_rgb_depth_optimized.py' in args.script_path) or ('blender_ego_static.py' in args.script_path) or ('blender_ego_hand.py' in args.script_path):
             cmd.extend(["--samples", str(args.samples)])
         
         # Add no-depth option if specified and using blender_ego_rgb_depth_optimized.py
@@ -1323,6 +1323,12 @@ def main():
         
         # Add fps option if using blender_ego_rgb_depth_optimized.py
         if 'blender_ego_rgb_depth_optimized.py' in args.script_path:
+            cmd.extend(["--fps", str(args.fps)])
+        
+        # Add clip-length, stride, fps for blender_ego_hand.py (video clip params)
+        if 'blender_ego_hand.py' in args.script_path:
+            cmd.extend(["--clip-length", str(args.clip_length)])
+            cmd.extend(["--stride", str(args.clip_stride)])
             cmd.extend(["--fps", str(args.fps)])
         
         # Add animation index or name for animation-based jobs
