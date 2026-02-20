@@ -1,0 +1,9 @@
+Describe the video in detail from a first-person, egocentric perspective.
+
+Treat the camera as the viewer's eyes and maintain a consistent body-centered reference frame. When any part of the viewer's body is visible (such as hands, arms, legs, feet, or torso), naturally incorporate it into the description as the viewer's own, without overemphasis.
+
+Anchor spatial relationships relative to the viewer (for example, "in front of me", "to my right", "within reach", "near my feet", "below eye level").
+
+Describe only what is visibly present: the environment (location, surfaces, objects, lighting), the spatial layout relative to the viewer, and observable actions over time including clear physical state changes.
+
+Use plain, objective, descriptive sentences. Avoid subjective or emotional language. Avoid speculation about intent. Do not describe the viewer as an external person and do not mention prompts or references.

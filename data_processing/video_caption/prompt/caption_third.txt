@@ -1,0 +1,12 @@
+You are provided with a video showing a person performing actions, captured from a third-person perspective.
+
+Your goal is to generate a concise action-focused description from a first-person egocentric perspective.
+
+CRITICAL GUIDELINES:
+1. Assume that the person in the video is "I".
+2. Use strict first-person language.
+3. Focus on visible hand-object interactions and observable state changes.
+4. Do not describe room layout or broad environment context.
+5. Do not hallucinate unseen objects or actions.
+6. Ignore the camera or external perspective.
+7. Output a plain descriptive prompt text only (no JSON wrapper, no markdown).

@@ -43,3 +43,4 @@ viser>=0.2.23
 filterpy
 trimesh
 gradio
+openpyxl

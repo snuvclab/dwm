@@ -14,7 +14,7 @@ def find_animation_index(blend_file, animation_name, gpu_id=0):
     """
     Find the animation index for a given animation name
     """
-    script_path = "data_processing/trumans/blender_ego_rgb_depth_optimized.py"
+    script_path = "data_processing/trumans/blender_ego_video_render.py"
     
     # Set environment variables
     env = os.environ.copy()
@@ -79,7 +79,7 @@ def render_single_animation(scene_name, animation_name, gpu_id=0):
     # Configuration
     data_path = "../../nas1/public_dataset/trumans/Recordings_blend"
     save_path = "/home/byungjun/workspace/trumans_ego/ego_render_new"
-    script_path = "data_processing/trumans/blender_ego_rgb_depth_optimized.py"
+    script_path = "data_processing/trumans/blender_ego_video_render.py"
     
     # Find the blend file
     blend_file = None
