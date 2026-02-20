@@ -1,5 +1,0 @@
-work_dirs
-show_dirs
-*__pycache__*
-test_dataloader_*
-*.onnx
