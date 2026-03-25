@@ -1,11 +1,11 @@
-# DWM (Phase 0)
+# DWM
 
-This repository is currently focused on Phase 0 refactoring and data preprocessing setup.
+Standalone DWM refactor for the final CogVideoX static-scene + hand-video concat workflow.
 
 ## Environment Setup
 
 ```bash
-git clone <REPO_URL>
+git clone https://github.com/snuvclab/dwm
 cd dwm
 
 conda create -n dwm python=3.10 -y
@@ -14,12 +14,25 @@ conda activate dwm
 pip install -r requirements.txt
 ```
 
-## Data Processing Guide
+All documented commands assume you run them from the repository root.
 
-- See `data_processing/README.md` for the integrated Trumans + TASTE-Rob preprocessing workflow.
-- Link: [`data_processing/README.md`](data_processing/README.md)
+## System Prerequisites
 
-## Scope Note
+- `ffmpeg` for TASTE-Rob resizing, static-video generation, and some TRUMANS post-processing
+- `blender` for TRUMANS rendering
+- NVIDIA GPU for training / inference
+- Optional extras such as original HaMeR and InternVL2 + `vllm` are documented in the task-specific READMEs below
 
-- Phase 0 covers environment setup and video preprocessing.
-- Latent preparation is planned for Phase 1.
+## Recommended Doc Order
+
+1. [`data_processing/README.md`](data_processing/README.md)
+2. [`training/cogvideox/README.md`](training/cogvideox/README.md)
+
+The public smoke path is:
+
+1. Render or resize sample videos into `data_refactor/`
+2. Generate `videos_static`, `videos_hands`, `prompts`, and `prompts_rewrite`
+3. Preencode videos and prompts
+4. Create dataset files under `data_refactor/dataset_files/`
+5. Train with the public example config in [`training/cogvideox/configs/examples/static_hand_concat_lora_rewrite.yaml`](training/cogvideox/configs/examples/static_hand_concat_lora_rewrite.yaml) or the wrapper in [`training/cogvideox/examples/train_static_hand_concat.sh`](training/cogvideox/examples/train_static_hand_concat.sh)
+6. Run single-video or dataset-file inference with [`training/cogvideox/inference.py`](training/cogvideox/inference.py)
