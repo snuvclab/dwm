@@ -1,26 +1,25 @@
 #!/usr/bin/env python3
-"""Batch render hand-mesh videos via hamer-mediapipe.
+"""Single-GPU batch renderer for hand-mesh videos via hamer-mediapipe.
 
-Input layout (generic):
-  data_root/**/{video_dir_name}/*.mp4
+Design:
+- Single process / single visible GPU (`CUDA_VISIBLE_DEVICES`)
+- Load HaMeR + MediaPipe once
+- Process many videos without reloading model
 
-Output layout:
-  data_root/**/{output_dir_name}/*.mp4
+For multi-GPU, use `launch_render_hands_hamer_multi_gpu.py`.
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
-import multiprocessing as mp
 import os
-import queue
-import shlex
-import subprocess
-import threading
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Iterable
 
 VALID_TYPES = {"SingleHand", "DoubleHand"}
@@ -32,20 +31,7 @@ class Task:
     output_video: str
 
 
-def parse_gpus(raw: str) -> list[int]:
-    vals = []
-    for x in raw.split(","):
-        x = x.strip()
-        if not x:
-            continue
-        vals.append(int(x))
-    if not vals:
-        raise ValueError("--gpus must contain at least one GPU id, e.g. '0' or '0,1'")
-    return vals
-
-
 def discover_videos(data_root: Path, video_dir_name: str) -> Iterable[Path]:
-    # Scan all nested video directories to make this script dataset-agnostic.
     pattern = f"**/{video_dir_name}/*.mp4"
     for video_path in sorted(data_root.glob(pattern)):
         if video_path.is_file():
@@ -87,178 +73,138 @@ def load_video_list_file(data_root: Path, list_file: Path) -> tuple[list[Path], 
                 continue
             videos.append(abs_path)
 
-    # Deduplicate while preserving deterministic order.
-    dedup = sorted(set(videos))
-    return dedup, missing_count
+    return sorted(set(videos)), missing_count
 
 
 def relative_to_root(path: Path, data_root: Path) -> str:
     return str(path.resolve().relative_to(data_root.resolve()))
 
 
-def run_single_task(
-    task: Task,
-    gpu_id: int,
-    python_bin: str,
-    hamer_demo_path: Path,
-    renderer: str,
-    mesh_only: bool,
-    checkpoint: str | None,
-    fps: int | None,
-    hamer_extra_args: list[str],
-) -> tuple[bool, str]:
-    input_video = Path(task.input_video)
-    output_video = Path(task.output_video)
+def load_demo_module(hamer_root: Path):
+    demo_path = hamer_root / "demo_mediapipe.py"
+    if not demo_path.exists():
+        raise FileNotFoundError(f"demo_mediapipe.py not found: {demo_path}")
+
+    # Allow `import hamer...` used inside demo_mediapipe.py
+    sys.path.insert(0, str(hamer_root))
+
+    spec = importlib.util.spec_from_file_location("hamer_demo_mediapipe", demo_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Failed to load module spec from: {demo_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def resolve_checkpoint(hamer_root: Path, override: str | None) -> Path:
+    if override:
+        ckpt = Path(override).resolve()
+        if not ckpt.exists():
+            raise FileNotFoundError(f"Checkpoint override not found: {ckpt}")
+        return ckpt
+
+    new_ckpt = hamer_root / "_DATA" / "hamer_ckpts" / "checkpoints" / "new_hamer_weights.ckpt"
+    old_ckpt = hamer_root / "_DATA" / "hamer_ckpts" / "checkpoints" / "hamer.ckpt"
+    if new_ckpt.exists():
+        return new_ckpt
+    if old_ckpt.exists():
+        return old_ckpt
+    raise FileNotFoundError(
+        "No checkpoint found. Expected one of:\n"
+        f"  - {new_ckpt}\n"
+        f"  - {old_ckpt}\n"
+        "Run `bash third_party/hamer-mediapipe/fetch_demo_data.sh` and place MANO/checkpoints."
+    )
+
+
+def run_video_task(task: Task, demo, model, model_cfg, mp_hands, args) -> tuple[bool, str]:
+    input_video = Path(task.input_video).resolve()
+    output_video = Path(task.output_video).resolve()
     output_dir = output_video.parent
-    output_stem_video = output_dir / f"{input_video.stem}.mp4"
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    cmd = [
-        python_bin,
-        str(hamer_demo_path),
-        "--input",
-        str(input_video),
-        "--out_folder",
-        str(output_dir),
-        "--device",
-        "cuda:0",
-        "--renderer",
-        renderer,
-        "--save_video",
-    ]
+    cap, frame, is_webcam, is_video, total_frames = demo.setup_input_source(str(input_video))
+    if is_webcam or not is_video:
+        if cap is not None:
+            cap.release()
+        raise RuntimeError(f"Expected video input, got: {input_video}")
 
-    if mesh_only:
-        cmd.append("--mesh_only")
-    if checkpoint:
-        cmd.extend(["--checkpoint", checkpoint])
-    if fps is not None:
-        cmd.extend(["--fps", str(fps)])
-    if hamer_extra_args:
-        cmd.extend(hamer_extra_args)
+    img_h, img_w = frame.shape[:2]
+    render_res = (img_w, img_h)
+    renderer = demo.Renderer(model_cfg, faces=model.mano.faces, render_res=render_res)
 
-    env = os.environ.copy()
-    env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    input_fps = cap.get(demo.cv2.CAP_PROP_FPS)
+    output_fps = args.fps if args.fps is not None else (input_fps if input_fps > 0 else 30)
 
-    start = time.time()
-    proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
-    elapsed = time.time() - start
+    ffmpeg_proc, actual_output_path = demo.start_ffmpeg_writer(str(output_dir), input_video.stem, output_fps, img_w, img_h)
 
-    if proc.returncode != 0:
-        stderr = (proc.stderr or "").strip()
-        stdout = (proc.stdout or "").strip()
-        msg = stderr.splitlines()[-1] if stderr else (stdout.splitlines()[-1] if stdout else "command failed")
-        return False, f"rc={proc.returncode}, elapsed={elapsed:.2f}s, err={msg}"
+    render_opts = SimpleNamespace(
+        mesh_only=args.mesh_only,
+        renderer=args.renderer,
+        hand_colors=args.hand_colors,
+    )
 
-    if not output_stem_video.exists():
-        return False, f"rc=0 but output not found: {output_stem_video}"
+    frame_id = 0
+    try:
+        while True:
+            if frame_id > 0:
+                ok, frame = cap.read()
+                if not ok:
+                    break
 
-    if output_stem_video != output_video:
-        output_stem_video.rename(output_video)
+            img_rgb = demo.cv2.cvtColor(frame, demo.cv2.COLOR_BGR2RGB)
+            results = mp_hands.process(img_rgb)
+            bboxes, handed_list = demo.extract_mediapipe_hands(results, frame.shape)
 
-    return True, f"elapsed={elapsed:.2f}s"
+            boxes_np = demo.np.array(bboxes, dtype=demo.np.float32)
+            right_np = demo.np.array(handed_list, dtype=demo.np.float32)
 
+            if boxes_np.ndim != 2 or boxes_np.shape[0] == 0:
+                out_bgr = demo.np.zeros_like(frame) if args.mesh_only else frame
+                ffmpeg_proc.stdin.write(out_bgr.tobytes())
+                frame_id += 1
+                continue
 
-def worker_loop(
-    worker_name: str,
-    gpu_id: int,
-    task_queue: mp.Queue,
-    result_queue: mp.Queue,
-    stop_event: mp.Event,
-    python_bin: str,
-    hamer_demo_path: str,
-    renderer: str,
-    mesh_only: bool,
-    checkpoint: str | None,
-    fps: int | None,
-    hamer_extra_args: list[str],
-) -> None:
-    demo_path = Path(hamer_demo_path)
-    while True:
-        if stop_event.is_set():
-            break
-        try:
-            item = task_queue.get(timeout=0.5)
-        except queue.Empty:
-            continue
+            img_size = demo.np.array(render_res)
+            scaled_focal = model_cfg.EXTRA.FOCAL_LENGTH / model_cfg.MODEL.IMAGE_SIZE * img_size.max()
 
-        if item is None:
-            break
+            batch_dict = demo.make_batch(model_cfg, frame, boxes_np, right_np, args.device_obj)
+            all_verts, all_cam_t, all_right = demo.run_hamer_inference(model, batch_dict, scaled_focal)
 
-        task = Task(**item)
-        ok, detail = run_single_task(
-            task=task,
-            gpu_id=gpu_id,
-            python_bin=python_bin,
-            hamer_demo_path=demo_path,
-            renderer=renderer,
-            mesh_only=mesh_only,
-            checkpoint=checkpoint,
-            fps=fps,
-            hamer_extra_args=hamer_extra_args,
-        )
-        result_queue.put(
-            {
-                "worker": worker_name,
-                "gpu": gpu_id,
-                "input": task.input_video,
-                "output": task.output_video,
-                "status": "ok" if ok else "failed",
-                "detail": detail,
-            }
-        )
+            out_img_rgb = demo.render_frame(
+                renderer,
+                frame,
+                all_verts,
+                all_cam_t,
+                all_right,
+                img_size,
+                scaled_focal,
+                render_opts,
+            )
+            out_bgr = out_img_rgb[:, :, ::-1]
+            ffmpeg_proc.stdin.write(out_bgr.tobytes())
+            frame_id += 1
 
+        ffmpeg_proc.stdin.close()
+        ffmpeg_proc.wait()
+        if ffmpeg_proc.returncode != 0:
+            stderr = ffmpeg_proc.stderr.read().decode(errors="replace")
+            raise RuntimeError(f"ffmpeg failed: {stderr}")
+        ffmpeg_proc.stderr.close()
 
-def thread_worker_loop(
-    worker_name: str,
-    gpu_id: int,
-    task_queue: queue.Queue,
-    result_queue: queue.Queue,
-    stop_event: threading.Event,
-    python_bin: str,
-    hamer_demo_path: str,
-    renderer: str,
-    mesh_only: bool,
-    checkpoint: str | None,
-    fps: int | None,
-    hamer_extra_args: list[str],
-) -> None:
-    demo_path = Path(hamer_demo_path)
-    while True:
-        if stop_event.is_set():
-            break
-        try:
-            item = task_queue.get(timeout=0.5)
-        except queue.Empty:
-            continue
+        produced = output_dir / f"{input_video.stem}.mp4"
+        if not produced.exists():
+            raise RuntimeError(f"output not found: {produced}")
+        if produced != output_video:
+            produced.rename(output_video)
 
-        if item is None:
-            break
-
-        task = Task(**item)
-        ok, detail = run_single_task(
-            task=task,
-            gpu_id=gpu_id,
-            python_bin=python_bin,
-            hamer_demo_path=demo_path,
-            renderer=renderer,
-            mesh_only=mesh_only,
-            checkpoint=checkpoint,
-            fps=fps,
-            hamer_extra_args=hamer_extra_args,
-        )
-        result_queue.put(
-            {
-                "worker": worker_name,
-                "gpu": gpu_id,
-                "input": task.input_video,
-                "output": task.output_video,
-                "status": "ok" if ok else "failed",
-                "detail": detail,
-            }
-        )
+        return True, f"frames={frame_id}, out={actual_output_path}"
+    finally:
+        cap.release()
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Render videos_hands with hamer-mediapipe.")
+    parser = argparse.ArgumentParser(description="Render videos_hands with hamer-mediapipe (single GPU, model cached).")
     parser.add_argument("--data_root", type=Path, default=Path("data/taste_rob_resized"))
     parser.add_argument("--video_dir_name", type=str, default="videos")
     parser.add_argument("--output_dir_name", type=str, default="videos_hands")
@@ -272,9 +218,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scene", nargs="+", default=None, help="Scene names to include, e.g. --scene Dinning Kitchen")
     parser.add_argument("--video_list_file", type=Path, default=None, help="Text file of relative paths from data_root")
     parser.add_argument("--save_video_list", type=Path, default=None, help="Save final selected relative paths")
-    parser.add_argument("--python_bin", type=str, default="python")
-    parser.add_argument("--gpus", type=str, default="0")
-    parser.add_argument("--workers_per_gpu", type=int, default=1)
+    parser.add_argument("--progress_every", type=int, default=10)
 
     skip_group = parser.add_mutually_exclusive_group()
     skip_group.add_argument("--skip_existing", action="store_true", default=True)
@@ -282,59 +226,44 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--fail_fast", action="store_true")
     parser.add_argument("--renderer", type=str, default="pytorch3d", choices=["pyrender", "pytorch3d"])
-    parser.add_argument(
-        "--mesh_only",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Render only mesh on black background (default: true).",
-    )
+    parser.add_argument("--mesh_only", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--hand_colors", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--checkpoint", type=str, default=None)
-    parser.add_argument("--fps", type=int, default=None, help="Optional output fps override")
-    parser.add_argument(
-        "--hamer_extra_args",
-        type=str,
-        default="",
-        help="Extra args appended to demo_mediapipe.py, e.g. '--hand_colors'",
-    )
-    parser.add_argument(
-        "--log_jsonl",
-        type=Path,
-        default=None,
-        help="Default: <data_root>/_logs/hamer_render.jsonl",
-    )
+    parser.add_argument("--fps", type=int, default=None)
+    parser.add_argument("--log_jsonl", type=Path, default=None, help="Default: <data_root>/_logs/hamer_render.jsonl")
+
+    # split options for multi-gpu launcher
+    parser.add_argument("--split_index", type=int, default=0)
+    parser.add_argument("--num_splits", type=int, default=1)
+    parser.add_argument("--enable_split", action="store_true")
+
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
 
-    if not args.data_root.exists():
-        raise SystemExit(f"data_root not found: {args.data_root}")
-    if args.workers_per_gpu < 1:
-        raise SystemExit("workers_per_gpu must be >= 1")
+    data_root = args.data_root.resolve()
+    if not data_root.exists():
+        raise SystemExit(f"data_root not found: {data_root}")
+    if args.progress_every < 1:
+        raise SystemExit("progress_every must be >= 1")
 
     repo_root = Path(__file__).resolve().parents[2]
-    hamer_demo_path = repo_root / "third_party" / "hamer-mediapipe" / "demo_mediapipe.py"
-    if not hamer_demo_path.exists():
-        raise SystemExit(
-            f"hamer-mediapipe demo not found: {hamer_demo_path}\n"
-            "Did you initialize submodules?\n"
-            "  git submodule update --init --recursive"
-        )
+    hamer_root = repo_root / "third_party" / "hamer-mediapipe"
+    if not hamer_root.exists():
+        raise SystemExit(f"hamer-mediapipe not found: {hamer_root}")
 
-    log_jsonl = args.log_jsonl or (args.data_root / "_logs" / "hamer_render.jsonl")
+    log_jsonl = (args.log_jsonl.resolve() if args.log_jsonl else (data_root / "_logs" / "hamer_render.jsonl"))
     log_jsonl.parent.mkdir(parents=True, exist_ok=True)
 
-    gpus = parse_gpus(args.gpus)
-    hamer_extra_args = shlex.split(args.hamer_extra_args) if args.hamer_extra_args else []
-    scene_filter = set(args.scene) if args.scene else None
-
     if args.video_list_file is None:
-        candidates = list(discover_videos(data_root=args.data_root, video_dir_name=args.video_dir_name))
+        candidates = list(discover_videos(data_root=data_root, video_dir_name=args.video_dir_name))
         missing_from_list = 0
     else:
-        candidates, missing_from_list = load_video_list_file(data_root=args.data_root, list_file=args.video_list_file)
+        candidates, missing_from_list = load_video_list_file(data_root=data_root, list_file=args.video_list_file)
 
+    scene_filter = set(args.scene) if args.scene else None
     selected_videos: list[Path] = []
     filtered_out = 0
     for video_path in candidates:
@@ -342,31 +271,50 @@ def main() -> int:
         if args.hand_type != "all" and hand_type != args.hand_type:
             filtered_out += 1
             continue
-
         scene_name = extract_scene(video_path, args.video_dir_name)
         if scene_filter is not None and scene_name not in scene_filter:
             filtered_out += 1
             continue
+        selected_videos.append(video_path.resolve())
 
-        selected_videos.append(video_path)
+    selected_videos = sorted(selected_videos)
+    if args.enable_split:
+        if args.num_splits < 1:
+            raise SystemExit("num_splits must be >= 1 when --enable_split is used")
+        if args.split_index < 0 or args.split_index >= args.num_splits:
+            raise SystemExit("split_index must satisfy 0 <= split_index < num_splits")
+        selected_videos = [v for i, v in enumerate(selected_videos) if (i % args.num_splits) == args.split_index]
 
     if args.save_video_list is not None:
-        args.save_video_list.parent.mkdir(parents=True, exist_ok=True)
-        with args.save_video_list.open("w", encoding="utf-8") as f:
-            for path in sorted(selected_videos):
-                f.write(relative_to_root(path, args.data_root) + "\n")
+        save_list = args.save_video_list.resolve()
+        save_list.parent.mkdir(parents=True, exist_ok=True)
+        with save_list.open("w", encoding="utf-8") as f:
+            for path in selected_videos:
+                f.write(relative_to_root(path, data_root) + "\n")
+
+    print("=== Config ===")
+    print(f"data_root={data_root}")
+    print(f"video_dir_name={args.video_dir_name}")
+    print(f"output_dir_name={args.output_dir_name}")
+    print(f"hand_type={args.hand_type}")
+    print(f"scene_filter={sorted(scene_filter) if scene_filter is not None else 'None'}")
+    print(f"cuda_visible_devices={os.environ.get('CUDA_VISIBLE_DEVICES', 'unset')}")
+    print(f"hamer_root={hamer_root}")
+    print(f"split_enabled={args.enable_split}")
+    if args.enable_split:
+        print(f"split_index={args.split_index}")
+        print(f"num_splits={args.num_splits}")
+    print(f"log_jsonl={log_jsonl}")
 
     all_tasks: list[Task] = []
     skipped_records: list[dict] = []
     for video_path in selected_videos:
         output_video = video_path.parent.parent / args.output_dir_name / video_path.name
-        output_video.parent.mkdir(parents=True, exist_ok=True)
-
         if args.skip_existing and not args.overwrite and output_video.exists():
             skipped_records.append(
                 {
-                    "gpu": None,
-                    "worker": None,
+                    "gpu": os.environ.get("CUDA_VISIBLE_DEVICES", "unset"),
+                    "worker": "single-gpu",
                     "input": str(video_path),
                     "output": str(output_video),
                     "status": "skipped_existing",
@@ -374,7 +322,6 @@ def main() -> int:
                 }
             )
             continue
-
         all_tasks.append(Task(input_video=str(video_path), output_video=str(output_video)))
 
     with log_jsonl.open("a", encoding="utf-8") as f:
@@ -386,130 +333,98 @@ def main() -> int:
         print(f"selected_total={len(selected_videos)}")
         print(f"filtered_out={filtered_out}")
         print(f"missing_from_list={missing_from_list}")
-        print(f"Log: {log_jsonl}")
+        print(f"log_jsonl={log_jsonl}")
         return 0
 
-    workers: list = []
-    worker_slots: list[tuple[int, int]] = []
-    for gpu_id in gpus:
-        for worker_idx in range(args.workers_per_gpu):
-            worker_slots.append((gpu_id, worker_idx))
+    print("=== Plan ===")
+    print(f"selected_total={len(selected_videos)}")
+    print(f"filtered_out={filtered_out}")
+    print(f"missing_from_list={missing_from_list}")
+    print(f"skipped_existing={len(skipped_records)}")
+    print(f"queued={len(all_tasks)}")
 
-    backend = "process"
+    # Make all hamer-relative paths (./_DATA/...) resolve under submodule root.
+    orig_cwd = Path.cwd()
+    os.chdir(hamer_root)
+
+    ok_count = 0
+    failed_count = 0
+    skipped_fail_fast_count = 0
+    total = len(all_tasks)
+    start_time = time.time()
+
     try:
-        ctx = mp.get_context("spawn")
-        task_queue = ctx.Queue()
-        result_queue = ctx.Queue()
-        stop_event = ctx.Event()
-        for gpu_id, worker_idx in worker_slots:
-            worker_name = f"gpu{gpu_id}-w{worker_idx}"
-            p = ctx.Process(
-                target=worker_loop,
-                args=(
-                    worker_name,
-                    gpu_id,
-                    task_queue,
-                    result_queue,
-                    stop_event,
-                    args.python_bin,
-                    str(hamer_demo_path),
-                    args.renderer,
-                    args.mesh_only,
-                    args.checkpoint,
-                    args.fps,
-                    hamer_extra_args,
-                ),
-                daemon=True,
-            )
-            p.start()
-            workers.append(p)
-    except (PermissionError, OSError) as exc:
-        backend = "thread"
-        print(f"[WARN] multiprocessing unavailable ({exc}); fallback to thread backend.")
-        task_queue = queue.Queue()
-        result_queue = queue.Queue()
-        stop_event = threading.Event()
-        workers = []
-        for gpu_id, worker_idx in worker_slots:
-            worker_name = f"gpu{gpu_id}-w{worker_idx}"
-            t = threading.Thread(
-                target=thread_worker_loop,
-                args=(
-                    worker_name,
-                    gpu_id,
-                    task_queue,
-                    result_queue,
-                    stop_event,
-                    args.python_bin,
-                    str(hamer_demo_path),
-                    args.renderer,
-                    args.mesh_only,
-                    args.checkpoint,
-                    args.fps,
-                    hamer_extra_args,
-                ),
-                daemon=True,
-            )
-            t.start()
-            workers.append(t)
+        demo = load_demo_module(hamer_root)
 
-    for task in all_tasks:
-        task_queue.put(task.__dict__)
-    for _ in workers:
-        task_queue.put(None)
+        device_str = "cuda:0" if demo.torch.cuda.is_available() else "cpu"
+        args.device_obj = demo.torch.device(device_str)
 
-    pending_inputs = {t.input_video for t in all_tasks}
-    results: list[dict] = []
-    failed = 0
-    failed_fast_triggered = False
+        # Load models once.
+        demo.download_models(str(hamer_root / "_DATA"))
+        ckpt = resolve_checkpoint(hamer_root, args.checkpoint)
+        model, model_cfg = demo.load_hamer(str(ckpt))
+        model = model.to(args.device_obj).eval()
 
-    while pending_inputs:
-        try:
-            rec = result_queue.get(timeout=1.0)
-        except queue.Empty:
-            if failed_fast_triggered:
-                break
-            if not any(p.is_alive() for p in workers):
-                break
-            continue
+        mp_hands = demo.mp.solutions.hands.Hands(
+            static_image_mode=False,
+            max_num_hands=2,
+            min_detection_confidence=0.5,
+        )
 
-        input_path = rec.get("input")
-        if input_path in pending_inputs:
-            pending_inputs.remove(input_path)
-        results.append(rec)
+        for idx, task in enumerate(all_tasks, start=1):
+            print(f"[START] {idx}/{total} input={Path(task.input_video).name}")
+            try:
+                ok, detail = run_video_task(task, demo, model, model_cfg, mp_hands, args)
+            except Exception as exc:
+                ok = False
+                detail = str(exc)
 
-        if rec.get("status") == "failed":
-            failed += 1
-            if args.fail_fast:
-                failed_fast_triggered = True
-                stop_event.set()
-                for p in workers:
-                    if p.is_alive() and backend == "process":
-                        p.terminate()
-                break
-
-    for p in workers:
-        p.join(timeout=1.0)
-
-    if failed_fast_triggered and pending_inputs:
-        for input_path in sorted(pending_inputs):
             rec = {
-                "gpu": None,
-                "worker": None,
-                "input": input_path,
-                "output": "",
-                "status": "skipped_fail_fast",
-                "detail": "not executed due to fail_fast",
+                "gpu": os.environ.get("CUDA_VISIBLE_DEVICES", "unset"),
+                "worker": "single-gpu",
+                "input": task.input_video,
+                "output": task.output_video,
+                "status": "ok" if ok else "failed",
+                "detail": detail,
             }
-            results.append(rec)
+            with log_jsonl.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
-    with log_jsonl.open("a", encoding="utf-8") as f:
-        for rec in results:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            if ok:
+                ok_count += 1
+            else:
+                failed_count += 1
+                print(f"[FAILED] {idx}/{total} input={Path(task.input_video).name} detail={detail}")
+                if args.fail_fast:
+                    for rem in all_tasks[idx:]:
+                        skip_rec = {
+                            "gpu": os.environ.get("CUDA_VISIBLE_DEVICES", "unset"),
+                            "worker": "single-gpu",
+                            "input": rem.input_video,
+                            "output": rem.output_video,
+                            "status": "skipped_fail_fast",
+                            "detail": "not executed due to fail_fast",
+                        }
+                        with log_jsonl.open("a", encoding="utf-8") as f:
+                            f.write(json.dumps(skip_rec, ensure_ascii=False) + "\n")
+                        skipped_fail_fast_count += 1
+                    break
 
-    ok_count = sum(1 for x in results if x.get("status") == "ok")
-    failed_count = sum(1 for x in results if x.get("status") == "failed")
-    skipped_count = len(skipped_records) + sum(1 for x in results if x.get("status") == "skipped_fail_fast")
+            if idx == 1 or idx % args.progress_every == 0 or idx == total:
+                elapsed = time.time() - start_time
+                print(
+                    f"[PROGRESS] {idx}/{total} done "
+                    f"(ok={ok_count}, failed={failed_count}, skipped_ff={skipped_fail_fast_count}, elapsed={elapsed:.1f}s)"
+                )
+
+        try:
+            mp_hands.close()
+        except Exception:
+            pass
+    finally:
+        os.chdir(orig_cwd)
+
+    skipped_count = len(skipped_records) + skipped_fail_fast_count
 
     print("=== Summary ===")
     print(f"selected_total={len(selected_videos)}")

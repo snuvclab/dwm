@@ -11,8 +11,10 @@ import time
 import traceback
 from datetime import datetime
 from pathlib import Path
+import tempfile
+import shutil
 import torch
-import cv2
+from PIL import Image
 from pytorch3d.structures import Meshes
 from pytorch3d.renderer import (
     PointLights,
@@ -26,6 +28,30 @@ from pytorch3d.renderer import (
     MeshRasterizer,
     TexturesVertex
 )
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from rendering_common import file_ok
+from rendering_strategies import create_video_clip_from_frames, resolve_execution_strategy
+
+
+def write_image(path, image):
+    image = np.asarray(image)
+    if image.dtype != np.uint8:
+        image = np.clip(image, 0, 255).astype(np.uint8)
+
+    if image.ndim == 2:
+        Image.fromarray(image).save(str(path))
+    elif image.ndim == 3 and image.shape[2] == 3:
+        Image.fromarray(image).save(str(path))
+    elif image.ndim == 3 and image.shape[2] == 4:
+        Image.fromarray(image).save(str(path))
+    else:
+        raise ValueError(f"Unsupported image shape for saving: {image.shape}")
+
+    return True
 
 # ---------------------------
 # CLI args
@@ -53,9 +79,21 @@ parser.add_argument("--height", type=int, default=480, help="Render height in pi
 parser.add_argument("--grayscale", action="store_true", help="Render hands in grayscale (black & white)")
 parser.add_argument("--separate", action="store_true", help="Create separate videos for left and right hands (only works with --grayscale)")
 parser.add_argument("--save-images", action="store_true", help="Save individual images instead of creating videos")
+parser.add_argument("--auto-split-clips", action="store_true", help="Render reusable hand frames, then split clips")
+parser.add_argument("--direct-clips", action="store_true", help="Render clips directly for immediate inspection")
 args = parser.parse_args(argv)
 if args.no_skip_existing:
     args.skip_existing = False
+
+try:
+    video_execution_strategy = resolve_execution_strategy(
+        auto_split=args.auto_split_clips,
+        direct_clips=args.direct_clips,
+        default="auto_split",
+    )
+except ValueError as e:
+    print(f"ERROR: {e}")
+    sys.exit(1)
 
 print(f"skip_existing: {args.skip_existing}")
 
@@ -514,7 +552,14 @@ def get_hand_mesh_data(hand_obj):
 
 
 @torch.no_grad()
-def render_hands_pytorch3d(camera_obj, hand_objects, render_shape=None, grayscale=False):
+def render_hands_pytorch3d(
+    camera_obj,
+    hand_objects,
+    render_shape=None,
+    grayscale=False,
+    separate_hands=False,
+    target_hand=None,
+):
     """
     Render CC_Hand_L/CC_Hand_R with simplified lighting for stable conditioning.
     Uses backup version's approach with improved color stability.
@@ -581,6 +626,11 @@ def render_hands_pytorch3d(camera_obj, hand_objects, render_shape=None, grayscal
     for obj in hand_objects:
         if not obj.visible_get():
             continue
+        if separate_hands:
+            if target_hand == "left" and "CC_Hand_L" not in obj.name:
+                continue
+            if target_hand == "right" and "CC_Hand_R" not in obj.name:
+                continue
 
         V_np, F_np = get_hand_mesh_data(obj)  # world space (after modifiers)
         if V_np.size == 0 or F_np.size == 0:
@@ -793,6 +843,107 @@ def setup_lighting_for_hands():
     
     print("✓ Lighting setup complete")
 
+
+def render_video_clips_directly(
+    animation_name,
+    scene,
+    camera_obj,
+    hand_objects,
+    video_start_frames,
+    videos_output_path=None,
+    videos_output_path_left=None,
+    videos_output_path_right=None,
+):
+    print("\n--- DIRECT CLIPS MODE: render clips immediately ---")
+    clips_completed = 0
+    start_time = time.time()
+
+    for video_idx, start_frame_num in enumerate(video_start_frames):
+        video_end_frame = start_frame_num + (args.clip_length - 1) * args.frame_skip
+        frames_for_video = list(range(start_frame_num, video_end_frame + 1, args.frame_skip))
+
+        clip_temp_dir = Path(tempfile.mkdtemp(prefix=f"truman_hand_clip_{video_idx:05d}_"))
+        try:
+            if args.separate:
+                left_video_output_path = os.path.join(videos_output_path_left, f"{video_idx:05d}.mp4")
+                right_video_output_path = os.path.join(videos_output_path_right, f"{video_idx:05d}.mp4")
+
+                left_done = args.skip_existing and file_ok(left_video_output_path, min_size=10240)
+                right_done = args.skip_existing and file_ok(right_video_output_path, min_size=10240)
+                if left_done and right_done:
+                    print(f"  Clip pair {video_idx:05d} already exists, skipping")
+                    clips_completed += 1
+                    continue
+
+                left_frame_files = []
+                right_frame_files = []
+                for seq_idx, frame_num in enumerate(frames_for_video):
+                    scene.frame_set(frame_num)
+                    if not left_done:
+                        left_image, _ = render_hands_pytorch3d(
+                            camera_obj,
+                            hand_objects,
+                            render_shape=(args.height, args.width),
+                            grayscale=args.grayscale,
+                            separate_hands=True,
+                            target_hand="left",
+                        )
+                        left_frame_path = clip_temp_dir / f"left_{seq_idx:04d}.png"
+                        write_image(left_frame_path, left_image)
+                        left_frame_files.append(str(left_frame_path))
+                    if not right_done:
+                        right_image, _ = render_hands_pytorch3d(
+                            camera_obj,
+                            hand_objects,
+                            render_shape=(args.height, args.width),
+                            grayscale=args.grayscale,
+                            separate_hands=True,
+                            target_hand="right",
+                        )
+                        right_frame_path = clip_temp_dir / f"right_{seq_idx:04d}.png"
+                        write_image(right_frame_path, right_image)
+                        right_frame_files.append(str(right_frame_path))
+
+                if not left_done:
+                    create_video_clip_from_frames(left_frame_files, left_video_output_path, fps=args.fps)
+                if not right_done:
+                    create_video_clip_from_frames(right_frame_files, right_video_output_path, fps=args.fps)
+            else:
+                video_output_path = os.path.join(videos_output_path, f"{video_idx:05d}.mp4")
+                if args.skip_existing and file_ok(video_output_path, min_size=10240):
+                    print(f"  Clip {video_idx:05d}.mp4 already exists, skipping")
+                    clips_completed += 1
+                    continue
+
+                frame_files = []
+                for seq_idx, frame_num in enumerate(frames_for_video):
+                    scene.frame_set(frame_num)
+                    image, _ = render_hands_pytorch3d(
+                        camera_obj,
+                        hand_objects,
+                        render_shape=(args.height, args.width),
+                        grayscale=args.grayscale,
+                    )
+                    frame_path = clip_temp_dir / f"frame_{seq_idx:04d}.png"
+                    write_image(frame_path, image)
+                    frame_files.append(str(frame_path))
+
+                create_video_clip_from_frames(frame_files, video_output_path, fps=args.fps)
+
+            clips_completed += 1
+            elapsed = time.time() - start_time
+            avg = elapsed / max(1, clips_completed)
+            remaining = len(video_start_frames) - clips_completed
+            print(
+                f"  Direct clip {video_idx:05d} complete"
+                f" | progress {clips_completed}/{len(video_start_frames)}"
+                f" | ETA {remaining * avg / 60:.1f} min"
+            )
+        finally:
+            shutil.rmtree(clip_temp_dir, ignore_errors=True)
+
+    print(f"[DIRECT CLIPS] Completed {clips_completed} clip windows in {(time.time() - start_time)/60:.1f} min")
+
 # ---------------------------
 # Render sequence
 # ---------------------------
@@ -884,6 +1035,38 @@ def render_animation_sequence(animation_index, animation_name):
     scene = bpy.context.scene
     render_start_frame = scene.frame_start if start_frame is None else start_frame
     render_end_frame   = scene.frame_end   if end_frame   is None else end_frame
+
+    if not args.save_images and video_execution_strategy == "direct_clips":
+        clip_length = args.clip_length
+        stride = args.stride
+        frame_skip = args.frame_skip
+        effective_stride = stride * frame_skip
+        video_start_frames = []
+        current_frame = render_start_frame
+        while current_frame + (clip_length - 1) * frame_skip <= render_end_frame:
+            video_start_frames.append(current_frame)
+            current_frame += effective_stride
+
+        if args.separate:
+            render_video_clips_directly(
+                animation_name,
+                scene,
+                camera_obj,
+                hand_objects,
+                video_start_frames,
+                videos_output_path_left=videos_output_path_left,
+                videos_output_path_right=videos_output_path_right,
+            )
+        else:
+            render_video_clips_directly(
+                animation_name,
+                scene,
+                camera_obj,
+                hand_objects,
+                video_start_frames,
+                videos_output_path=videos_output_path,
+            )
+        return
     
     if args.save_images:
         # Image mode: render all frames directly
@@ -925,11 +1108,10 @@ def render_animation_sequence(animation_index, animation_name):
                 right_image = image.copy()
                 
                 # Save images directly to NAS (images_only mode)
-                import cv2
                 if left_needs_rendering:
-                    cv2.imwrite(left_image_path, cv2.cvtColor(left_image, cv2.COLOR_RGB2BGR))
+                    write_image(left_image_path, left_image)
                 if right_needs_rendering:
-                    cv2.imwrite(right_image_path, cv2.cvtColor(right_image, cv2.COLOR_RGB2BGR))
+                    write_image(right_image_path, right_image)
                 
                 frame_time = time.time() - frame_render_start
                 total_render_time += frame_time
@@ -976,8 +1158,7 @@ def render_animation_sequence(animation_index, animation_name):
                 image, depth = render_hands_pytorch3d(camera_obj, hand_objects, render_shape=(args.height, args.width), grayscale=args.grayscale)
                 
                 # Save image directly to NAS (images_only mode)
-                import cv2
-                cv2.imwrite(image_path, cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+                write_image(image_path, image)
                 
                 frame_time = time.time() - frame_render_start
                 total_render_time += frame_time
@@ -1047,8 +1228,7 @@ def render_animation_sequence(animation_index, animation_name):
             image, depth = render_hands_pytorch3d(camera_obj, hand_objects, render_shape=(args.height, args.width), grayscale=args.grayscale)
             
             # Save image directly to NAS (images_only mode)
-            import cv2
-            cv2.imwrite(image_path, cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+            write_image(image_path, image)
             
             frame_time = time.time() - frame_render_start
             total_render_time += frame_time
@@ -1143,8 +1323,6 @@ def render_animation_sequence(animation_index, animation_name):
                     if frame_idx % 10 == 0 or frame_idx == len(all_frames_sorted) - 1:
                         print(f"  [RENDER] Frame {frame_num} ({frame_idx + 1}/{len(all_frames_sorted)})...")
                     
-                    import cv2
-                    
                     # Render left hand separately
                     if not left_exists:
                         left_image, left_depth = render_hands_pytorch3d(
@@ -1154,7 +1332,7 @@ def render_animation_sequence(animation_index, animation_name):
                             separate_hands=True,
                             target_hand="left"
                         )
-                        cv2.imwrite(str(left_frame_path), cv2.cvtColor(left_image, cv2.COLOR_RGB2BGR))
+                        write_image(left_frame_path, left_image)
                     
                     # Render right hand separately
                     if not right_exists:
@@ -1165,7 +1343,7 @@ def render_animation_sequence(animation_index, animation_name):
                             separate_hands=True,
                             target_hand="right"
                         )
-                        cv2.imwrite(str(right_frame_path), cv2.cvtColor(right_image, cv2.COLOR_RGB2BGR))
+                        write_image(right_frame_path, right_image)
                     
                     frame_time = time.time() - frame_render_start
                     total_render_time += frame_time
@@ -1342,6 +1520,7 @@ def render_animation_sequence(animation_index, animation_name):
         else:
             # Simple mode: smart frame rendering - only render frames needed for incomplete videos
             print(f"\n--- SIMPLE MODE: Smart frame rendering ---")
+            frames_temp_dir = temp_dir / "all_frames"
             
             # Check which videos are already complete
             incomplete_videos = []
@@ -1373,7 +1552,6 @@ def render_animation_sequence(animation_index, animation_name):
                 print(f"Frame range: {all_frames_sorted[0]} to {all_frames_sorted[-1]}")
                 
                 # Create temp directory for frames
-                frames_temp_dir = temp_dir / "all_frames"
                 frames_temp_dir.mkdir(exist_ok=True)
                 
                 frames_rendered_total = 0
@@ -1399,8 +1577,7 @@ def render_animation_sequence(animation_index, animation_name):
                             print(f"    ⚠️  Warning: Empty image for frame {frame_num}")
                             continue
                         
-                        import cv2
-                        success = cv2.imwrite(str(frame_path), cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
+                        success = write_image(frame_path, image)
                         if not success:
                             print(f"    ❌ Failed to save frame {frame_num}")
                             continue
@@ -1420,6 +1597,7 @@ def render_animation_sequence(animation_index, animation_name):
             
             if not incomplete_videos:
                 print("All videos are already complete! Skipping video creation.")
+                videos_completed = len(video_start_frames)
             else:
                 for video_idx, start_frame_num in incomplete_videos:
                     video_end_frame = start_frame_num + (clip_length - 1) * frame_skip
@@ -1431,6 +1609,7 @@ def render_animation_sequence(animation_index, animation_name):
                     # Check if video already exists
                     if args.skip_existing and os.path.exists(video_output_path):
                         print(f"  [VIDEO {video_idx + 1}] SKIPPED: Video already exists")
+                        videos_completed += 1
                         continue
                 
                     print(f"  [VIDEO {video_idx + 1}] Creating video from frames {start_frame_num}..{video_end_frame}")
@@ -1495,6 +1674,7 @@ def render_animation_sequence(animation_index, animation_name):
                             file_size = os.path.getsize(video_output_path)
                             if file_size > 0:
                                 print(f"    ✅ Created video: {video_output_path} ({file_size:,} bytes)")
+                                videos_completed += 1
                             else:
                                 print(f"    ❌ Video file is empty: {video_output_path}")
                         else:
@@ -1515,7 +1695,7 @@ def render_animation_sequence(animation_index, animation_name):
                     except Exception as e:
                         print(f"    ❌ Unexpected error during video creation: {e}")
             
-            print(f"Step 2 Complete: Created {len(video_start_frames)} videos")
+            print(f"Step 2 Complete: Created {videos_completed} videos")
             
             # Keep frame directory for manual cleanup later
             print(f"Step 3: Frame directory preserved for manual cleanup:")

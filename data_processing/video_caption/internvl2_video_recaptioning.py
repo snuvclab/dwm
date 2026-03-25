@@ -214,7 +214,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save_format", type=str, choices=["auto", "json", "txt"], default="auto")
     parser.add_argument("--use_third_person_context", action="store_true")
     parser.add_argument("--third_prompt_dirname", type=str, default="prompts_aux")
+    parser.add_argument("--gpu_memory_utilization", type=float, default=0.9)
+    parser.add_argument("--tensor_parallel_size", type=int, default=None)
     return parser.parse_args()
+
+
+def patch_tokenizer_for_vllm(tokenizer) -> None:
+    cls = tokenizer.__class__
+    if not hasattr(cls, "all_special_tokens_extended"):
+        cls.all_special_tokens_extended = property(lambda self: list(self.all_special_tokens))
+    if not hasattr(tokenizer, "all_special_tokens_extended"):
+        tokenizer.all_special_tokens_extended = list(tokenizer.all_special_tokens)
 
 
 def main() -> None:
@@ -263,14 +273,15 @@ def main() -> None:
 
     os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
-    tp = torch.cuda.device_count() if torch.cuda.is_available() else 1
+    patch_tokenizer_for_vllm(tokenizer)
+    tp = args.tensor_parallel_size or (torch.cuda.device_count() if torch.cuda.is_available() else 1)
     quantization = "awq" if "awq" in args.model_path.lower() else None
     llm = LLM(
         model=args.model_path,
         trust_remote_code=True,
         max_model_len=8192,
         limit_mm_per_prompt={"image": max(1, args.num_sampled_frames)},
-        gpu_memory_utilization=0.9,
+        gpu_memory_utilization=args.gpu_memory_utilization,
         tensor_parallel_size=tp,
         quantization=quantization,
         dtype="float16",

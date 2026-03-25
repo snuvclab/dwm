@@ -1,28 +1,27 @@
-# Video Captioning
+# Video Captioning And Prompt Rewrite
 
-Parts of this pipeline were adapted from VideoX-Fun video captioning:
-- https://github.com/aigc-apps/VideoX-Fun/tree/main/videox_fun/video_caption
+Parts of this path were adapted from VideoX-Fun video captioning.
+
+All commands below assume you run them from the repository root.
 
 ## Goal
 
-Primary goal is to generate ego-video prompts from:
-- `videos/*.mp4` -> `prompts/*.txt`
+Generate prompt text from ego videos and then optionally rewrite it into a cleaner generation-oriented prompt.
 
-`prompts_aux` is **optional, but strongly recommended** as additional hint/context.
+Main stages:
 
-## Build `prompts_aux` (Optional, but Recommended)
+- `videos/*.mp4 -> prompts/*.txt`
+- `prompts/*.txt -> prompts_rewrite/*.txt`
 
-Why:
-- Ego-only captioning can be unstable for occluded/ambiguous actions.
-- `prompts_aux` provides extra action signal.
+`prompts_aux` remains optional additional context.
 
-### TRUMANS `prompts_aux`
+## 1. Build `prompts_aux` (optional)
 
-1. Create third-person clips aligned to ego clips:
+### TRUMANS
 
 ```bash
 python data_processing/trumans/create_videos_third_trumans.py \
-  --root_dir data/trumans/ego_render_fov90 \
+  --root_dir data_refactor/trumans \
   --third_video_root data/trumans/video_render \
   --ego_videos_dirname videos \
   --output_dirname videos_third \
@@ -31,111 +30,122 @@ python data_processing/trumans/create_videos_third_trumans.py \
   --frame_skip 3 \
   --fps 8 \
   --skip_existing
-```
 
-2. Caption third-person clips:
-
-```bash
 bash data_processing/video_caption/run_trumans_caption_third.sh
 ```
 
-3. Attach action hints from `Actions/*.txt`:
-
-```bash
-python data_processing/trumans/build_prompts_aux_trumans.py \
-  --root_dir data/trumans/ego_render_fov90 \
-  --actions_root data/trumans/Actions \
-  --third_prompt_dirname prompts_aux \
-  --third_video_dirname videos_third \
-  --clip_length 49 \
-  --clip_stride 25 \
-  --frame_skip 3 \
-  --skip_existing
-```
-
-Final schema:
-
-```json
-{
-  "prompt": "action-focused description text",
-  "action_hints": ["..."]
-}
-```
-
-### TASTE-Rob `prompts_aux`
-
-For TASTE-Rob, `prompts_aux` is exported from `captions.xlsx`:
+### TASTE-Rob
 
 ```bash
 python data_processing/taste_rob/export_prompts_from_captions_xlsx.py \
-  --data_root data/taste_rob_resized \
-  --captions_xlsx /virtual_lab/dataset/taste_rob/captions.xlsx \
+  --data_root data_refactor/taste_rob_resized \
+  --captions_xlsx /path/to/taste_rob/captions.xlsx \
   --prompt_dir_name prompts_aux
 ```
 
-## Main Pipeline (Ego Prompt Generation)
+## 2. Ego Captioning
+
+### Recommended open-source smoke path: BLIP fallback
+
+This path works with the base `requirements.txt` environment and does not require `vllm`.
 
 ### TRUMANS
 
-Run:
-
 ```bash
+ROOT_DIR="$(pwd)/data_refactor/trumans" \
+CAPTION_BACKEND=blip \
+MODEL_NAME=Salesforce/blip-image-captioning-base \
 bash data_processing/video_caption/run_trumans_caption_ego.sh
 ```
-
-This uses:
-- input prompt: `data_processing/video_caption/prompt/caption_ego.txt`
-- video folder: `videos`
-- output folder: `prompts`
-- context (if exists): `prompts_aux`
 
 ### TASTE-Rob
 
-Run:
-
 ```bash
+ROOT_DIR="$(pwd)/data_refactor/taste_rob_resized" \
+CAPTION_BACKEND=blip \
+MODEL_NAME=Salesforce/blip-image-captioning-base \
 bash data_processing/video_caption/run_taste_rob_caption_ego.sh
 ```
 
-This uses:
-- input prompt: `data_processing/video_caption/prompt/caption_ego.txt`
-- video folder: `videos`
-- output folder: `prompts`
-- context (if exists): `prompts_aux`
+### Optional higher-quality path: InternVL2
 
-## Runtime Options
+This path requires an additional `vllm` installation compatible with your CUDA / torch environment and a larger GPU budget.
 
-The bash runners support environment-variable overrides, for example:
+Example extra install:
 
 ```bash
-ROOT_DIR=/path/to/data/trumans/ego_render_fov90 \
+pip install vllm
+```
+
+### TRUMANS
+
+```bash
+ROOT_DIR="$(pwd)/data_refactor/trumans" \
+CAPTION_BACKEND=internvl2 \
 MODEL_PATH=OpenGVLab/InternVL2-40B-AWQ \
-NUM_SPLITS=8 ARRAY_INDEX=0 \
 bash data_processing/video_caption/run_trumans_caption_ego.sh
 ```
 
-### Multi-GPU
-
-`internvl2_video_recaptioning.py` automatically uses all visible GPUs
-by setting tensor parallel size from visible CUDA devices.
-
-Examples:
+### TASTE-Rob
 
 ```bash
-# Use all visible GPUs
-bash data_processing/video_caption/run_trumans_caption_ego.sh
-
-# Restrict to selected GPUs
-CUDA_VISIBLE_DEVICES=0,1 \
-bash data_processing/video_caption/run_trumans_caption_ego.sh
+ROOT_DIR="$(pwd)/data_refactor/taste_rob_resized" \
+CAPTION_BACKEND=internvl2 \
+MODEL_PATH=OpenGVLab/InternVL2-40B-AWQ \
+bash data_processing/video_caption/run_taste_rob_caption_ego.sh
 ```
 
-## VLM Instruction Prompts
+The runners write `prompts/*.txt` next to the sample videos.
 
-- `data_processing/video_caption/prompt/caption_third.txt`
-  - VLM instruction used when captioning TRUMANS `videos_third` clips to build `prompts_aux`.
-  - Focuses on action-centric description quality for third-person aligned clips.
+## 3. Prompt Rewrite
 
-- `data_processing/video_caption/prompt/caption_ego.txt`
-  - VLM instruction used when captioning ego `videos` clips to build final `prompts`.
-  - Used for both TRUMANS and TASTE-Rob ego prompt generation.
+Rewrite is now supported for both TRUMANS and TASTE-Rob using the same `caption_rewrite.py` backend and `prompt/rewrite.txt` template.
+
+### TASTE-Rob
+
+```bash
+ROOT_DIR="$(pwd)/data_refactor/taste_rob_resized" \
+PROMPT_SUBDIR=prompts \
+OUTPUT_FOLDER_NAME=prompts_rewrite \
+bash data_processing/video_caption/run_rewrite_taste_rob.sh
+```
+
+### TRUMANS
+
+```bash
+ROOT_DIR="$(pwd)/data_refactor/trumans" \
+PROMPT_SUBDIR=prompts \
+OUTPUT_FOLDER_NAME=prompts_rewrite \
+bash data_processing/video_caption/run_rewrite_trumans.sh
+```
+
+Common environment overrides:
+
+```bash
+MODEL_NAME=meta-llama/Meta-Llama-3.1-8B-Instruct
+ENGINE=auto
+NUM_SPLITS=8
+TEMPERATURE=0.7
+MAX_TOKENS=1024
+```
+
+Smoke-tested lightweight fallback:
+
+```bash
+MODEL_NAME=Qwen/Qwen2.5-0.5B-Instruct
+ENGINE=transformers
+NUM_SPLITS=1
+MAX_TOKENS=256
+```
+
+If `SLURM_ARRAY_TASK_ID` is set, the rewrite runners split work by file automatically.
+
+## 4. Output Contract
+
+After rewrite, each sample root may contain:
+
+- `prompts/<stem>.txt`
+- `prompts_rewrite/<stem>.txt`
+- optional `prompts_aux/<stem>.json` or `.txt`
+
+The CogVideoX preencoder in this refactor assumes rewritten prompts are stored in `prompts_rewrite` and writes embeddings to `prompt_embeds_prompts_rewrite`.
