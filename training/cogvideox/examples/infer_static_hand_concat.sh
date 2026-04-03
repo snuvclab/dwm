@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
-CONFIG_PATH="${REPO_ROOT}/training/cogvideox/configs/examples/static_hand_concat_lora_rewrite.yaml"
+CONFIG_PATH="${REPO_ROOT}/training/cogvideox/configs/examples/dwm_cogvideox_5b_lora.yaml"
 INFER_SCRIPT="${REPO_ROOT}/training/cogvideox/inference.py"
 
 source ~/.bashrc || true

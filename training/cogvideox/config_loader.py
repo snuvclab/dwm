@@ -87,7 +87,29 @@ class ExperimentConfigLoader:
         data_root = data_config.get("data_root")
         if isinstance(data_root, str) and data_root and not Path(data_root).is_absolute():
             data_config["data_root"] = str((self.repo_root / data_root).resolve())
+
+        for key in ("dataset_file", "validation_set"):
+            value = data_config.get(key)
+            if value is None:
+                continue
+            data_config[key] = self._resolve_repo_relative_dataset_files(value)
         return resolved
+
+    def _resolve_repo_relative_dataset_files(self, value: Any) -> Any:
+        if isinstance(value, str):
+            return self._resolve_repo_relative_dataset_file(value)
+        if isinstance(value, list):
+            return [self._resolve_repo_relative_dataset_file(item) if isinstance(item, str) else item for item in value]
+        return value
+
+    def _resolve_repo_relative_dataset_file(self, dataset_file: str) -> str:
+        path = Path(dataset_file)
+        if path.is_absolute():
+            return str(path)
+        repo_candidate = (self.repo_root / path).resolve()
+        if repo_candidate.exists():
+            return str(repo_candidate)
+        return dataset_file
 
     def apply_overrides(self, config: Dict[str, Any], overrides: Optional[list[str]]) -> Dict[str, Any]:
         if not overrides:

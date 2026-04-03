@@ -1,8 +1,8 @@
 experiment:
-  name: "static_hand_concat_lora_rewrite"
-  description: "Public example config for DWM CogVideoX static-scene and hand-video concat LoRA training"
-  date: "2026-03-25"
-  author: "Open Source Example"
+  name: "cogvideox_hand_concat_lora_rewrite_prompt"
+  description: "CogVideoX static-scene and hand-video concat LoRA training with rewritten prompts"
+  date: "2026-02-19"
+  author: "Byungjun Kim"
   output_dir: "outputs/"
 
 pipeline:
@@ -62,7 +62,7 @@ data:
   use_gray_hand_videos: false
   split_hands: false
   prompt_subdir: "prompts_rewrite"
-  prompt_embeds_subdir: "prompt_embeds_prompts_rewrite"
+  prompt_embeds_subdir: "prompt_embeds_rewrite"
   hand_video_subdir: "videos_hands"
   hand_video_latents_subdir: "hand_video_latents"
   static_video_subdir: "videos_static"
@@ -73,19 +73,19 @@ model:
   base_model_name_or_path: "alibaba-pai/CogVideoX-Fun-V1.1-5b-InP"
 
 logging:
-  report_to: "none"
-  tracker_name: "static-hand-concat-lora-rewrite"
+  report_to: "wandb"
+  tracker_name: "cogvideox-hand-concat-lora-rewrite-prompt"
   project_name: "dwm"
-  entity_name: ""
+  entity_name: "vclab_2024"
   log_steps: 10
 
 slurm:
-  job_name: "static_hand_concat_lora_rewrite"
+  job_name: "cogvideox_hand_concat_lora_rewrite_prompt"
   nodes: 1
   gpus: 4
   partition: "debug"
-  output: "out/static_hand_concat_lora_rewrite_%j.out"
-  error: "out/static_hand_concat_lora_rewrite_%j.err"
+  output: "out/cogvideox_hand_concat_lora_rewrite_prompt_%j.out"
+  error: "out/cogvideox_hand_concat_lora_rewrite_prompt_%j.err"
 
 environment:
   torch_logs: "+dynamo,recompiles,graph_breaks"

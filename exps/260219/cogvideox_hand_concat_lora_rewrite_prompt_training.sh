@@ -2,8 +2,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
-CONFIG_PATH="${REPO_ROOT}/training/cogvideox/configs/examples/dwm_cogvideox_5b_lora.yaml"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+CONFIG_PATH="${REPO_ROOT}/exps/260219/cogvideox_hand_concat_lora_rewrite_prompt.yaml"
 TRAIN_SCRIPT="${REPO_ROOT}/training/cogvideox/train_dwm_cogvideox.py"
 
 DEBUG_MODE=false
@@ -53,7 +53,9 @@ conda activate dwm
 cd "$REPO_ROOT"
 export PYTHONPATH="${PYTHONPATH:-}:${REPO_ROOT}"
 
-COMMON_OVERRIDES=()
+COMMON_OVERRIDES=(
+  "logging.report_to=none"
+)
 if [[ "$DEBUG_MODE" == true ]]; then
   COMMON_OVERRIDES+=(
     "training.max_train_steps=10"

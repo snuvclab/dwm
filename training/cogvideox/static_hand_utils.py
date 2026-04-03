@@ -238,11 +238,15 @@ def save_non_lora_state_dict(output_dir: str, state_dict: Dict[str, torch.Tensor
 
 
 def load_non_lora_state_dict(model: torch.nn.Module, input_dir: str) -> List[str]:
-    state_path = os.path.join(input_dir, "non_lora_weights.safetensors")
-    if not os.path.exists(state_path):
+    safetensors_path = os.path.join(input_dir, "non_lora_weights.safetensors")
+    pt_path = os.path.join(input_dir, "non_lora_weights.pt")
+    if os.path.exists(safetensors_path):
+        non_lora_state_dict = load_file(safetensors_path)
+    elif os.path.exists(pt_path):
+        non_lora_state_dict = torch.load(pt_path, map_location="cpu")
+    else:
         return []
 
-    non_lora_state_dict = load_file(state_path)
     model_state_dict = model.state_dict()
     loaded_keys: List[str] = []
     for name, value in non_lora_state_dict.items():
@@ -256,15 +260,10 @@ def load_lora_weights_into_transformer(transformer: torch.nn.Module, checkpoint_
     from training.cogvideox.pipeline import CogVideoXFunStaticHandConcatPipeline
 
     lora_state_dict = CogVideoXFunStaticHandConcatPipeline.lora_state_dict(checkpoint_path)
-    transformer_state_dict = {
-        key.replace("transformer.", ""): value
-        for key, value in lora_state_dict.items()
-        if key.startswith("transformer.")
-    }
-    if not transformer_state_dict:
+    if not lora_state_dict:
         return []
 
-    transformer_state_dict = convert_unet_state_dict_to_peft(transformer_state_dict)
+    transformer_state_dict = convert_unet_state_dict_to_peft(lora_state_dict)
     incompatible = set_peft_model_state_dict(transformer, transformer_state_dict, adapter_name="default")
     if incompatible is None:
         return []

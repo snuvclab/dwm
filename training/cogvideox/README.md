@@ -9,7 +9,7 @@ Scope:
 - base model: `CogVideoX-Fun-V1.1-5b-InP`
 - conditioning: static scene video + hand video
 - supported training modes: `lora`, `full`
-- standalone path, without importing `training/cogvideox_static_pose`
+- standalone path
 
 ## Key Files
 
@@ -25,31 +25,55 @@ Scope:
 Recommended public config:
 
 ```bash
-training/cogvideox/configs/examples/static_hand_concat_lora_rewrite.yaml
+training/cogvideox/configs/examples/dwm_cogvideox_5b_lora.yaml
 training/cogvideox/examples/train_static_hand_concat.sh
 training/cogvideox/examples/infer_static_hand_concat.sh
 ```
 
-The public example config resolves `data_root: data_refactor` relative to the repository root.
+The public example config resolves `data_root: data` relative to the repository root.
 
-Internal / advanced template:
+## Base Model
+
+The DWM checkpoint assumes the pretrained `CogVideoX-Fun-V1.1-5b-InP` backbone is available.
+
+Hugging Face download example:
 
 ```bash
-training/cogvideox/configs/experiments/cogvideox_fun_static_hand_concat_lora_rewrite_prompt.yaml
+hf download alibaba-pai/CogVideoX-Fun-V1.1-5b-InP \
+  --local-dir ~/.cache/huggingface/hub/models--alibaba-pai--CogVideoX-Fun-V1.1-5b-InP
 ```
 
-Adapt its dataset paths before using it outside the original internal environment.
+ModelScope download example:
+
+```bash
+modelscope download --model PAI/CogVideoX-Fun-V1.1-5b-InP \
+  --local_dir ~/.cache/modelscope/hub/models/PAI/CogVideoX-Fun-V1.1-5b-InP
+```
+
+If you want to use a downloaded local path instead of the hub id, set `model.base_model_name_or_path` to that directory in the config or via `--override`.
+
+## Example Dataset Files
+
+Example dataset files based on the train and test splits used to train and evaluate the paper models are provided under:
+
+```bash
+dataset_files/
+```
+
+- [`dataset_files/trumans_train.txt`](../../dataset_files/trumans_train.txt)
+- [`dataset_files/taste_rob_train.txt`](../../dataset_files/taste_rob_train.txt)
+- [`dataset_files/trumans_test.txt`](../../dataset_files/trumans_test.txt)
+- [`dataset_files/taste_rob_test.txt`](../../dataset_files/taste_rob_test.txt)
+
+Their entries remain relative to the actual `data_root`, so use absolute paths if you want to point training or inference to these files directly.
 
 ## Training
 
 Plain Python smoke run:
 
 ```bash
-source $(conda info --base)/etc/profile.d/conda.sh
-conda activate dwm
-
 python training/cogvideox/train_dwm_cogvideox.py \
-  --experiment_config training/cogvideox/configs/examples/static_hand_concat_lora_rewrite.yaml \
+  --experiment_config training/cogvideox/configs/examples/dwm_cogvideox_5b_lora.yaml \
   --mode debug \
   --override training.max_train_steps=10 data.dataloader_num_workers=0 logging.report_to=none
 ```
@@ -58,7 +82,7 @@ Single-step smoke run that keeps the public 5B path and produces a checkpoint di
 
 ```bash
 python training/cogvideox/train_dwm_cogvideox.py \
-  --experiment_config training/cogvideox/configs/examples/static_hand_concat_lora_rewrite.yaml \
+  --experiment_config training/cogvideox/configs/examples/dwm_cogvideox_5b_lora.yaml \
   --mode debug \
   --override \
     training.batch_size=1 \
@@ -81,7 +105,7 @@ Torchrun smoke run:
 ```bash
 torchrun --standalone --nproc_per_node=2 \
   training/cogvideox/train_dwm_cogvideox.py \
-  --experiment_config training/cogvideox/configs/examples/static_hand_concat_lora_rewrite.yaml \
+  --experiment_config training/cogvideox/configs/examples/dwm_cogvideox_5b_lora.yaml \
   --mode slurm_test \
   --override training.max_train_steps=10 data.max_validation_videos=0 logging.report_to=none
 ```
@@ -105,26 +129,48 @@ The final trainer expects these sibling paths per sample:
   - `video_latents/<stem>.pt`
   - `static_video_latents/<stem>.pt`
   - `hand_video_latents/<stem>.pt`
-  - `prompt_embeds_prompts_rewrite/<stem>.pt`
+  - `prompt_embeds_rewrite/<stem>.pt`
+
+CogVideoX layout:
+
+```text
+<sample>/
+├── videos/
+├── videos_static/
+├── videos_hands/
+├── prompts_rewrite/
+├── video_latents/
+├── static_video_latents/
+├── hand_video_latents/
+└── prompt_embeds_rewrite/
+```
 
 When `load_tensors: true`, the trainer prefers the `.pt` files.
 
 ## Inference
 
-The examples below assume the public config still points at the repository-local `data_refactor/` tree.
+The examples below assume the public config still points at the repository-local `data/` tree.
 
 `--checkpoint_path` accepts either:
 
 - a training output directory such as `outputs/260219/cogvideox_hand_concat_lora_rewrite_prompt_debug`
 - a `checkpoint-*` subdirectory under that output directory
 
+You can also download the released checkpoint folder from Hugging Face and pass that downloaded directory to `--checkpoint_path`:
+
+- https://huggingface.co/byungjun-kim/DWM-CogVideoX-Fun-5b-LoRA
+
+```bash
+hf download byungjun-kim/DWM-CogVideoX-Fun-5b-LoRA --local-dir /path/to/DWM-CogVideoX-Fun-5b-LoRA
+```
+
 Dataset-file inference:
 
 ```bash
 python training/cogvideox/inference.py \
   --checkpoint_path outputs/<date>/<experiment> \
-  --experiment_config training/cogvideox/configs/examples/static_hand_concat_lora_rewrite.yaml \
-  --dataset_file dataset_files/trumans_smoke/test.txt \
+  --experiment_config training/cogvideox/configs/examples/dwm_cogvideox_5b_lora.yaml \
+  --dataset_file /abs/path/to/dwm/dataset_files/trumans_test.txt \
   --output_dir outputs_infer/dwm_cogvideox_dataset
 ```
 
@@ -133,9 +179,33 @@ Single-video inference:
 ```bash
 python training/cogvideox/inference.py \
   --checkpoint_path outputs/<date>/<experiment> \
-  --experiment_config training/cogvideox/configs/examples/static_hand_concat_lora_rewrite.yaml \
+  --experiment_config training/cogvideox/configs/examples/dwm_cogvideox_5b_lora.yaml \
   --video trumans/<scene>/<action>/videos/00000.mp4 \
   --output_dir outputs_infer/dwm_cogvideox_single
+```
+
+Samples prepared with [`data_processing/custom/prepare_custom_hoi_sample.py`](../../data_processing/custom/prepare_custom_hoi_sample.py) can be used directly here, for example:
+
+```bash
+--video custom_inputs/videos/<sample>.mp4
+```
+
+If you have sufficient VRAM and want better visual quality on custom real-world videos, we recommend DWM WAN 14B first.
+
+A fixed-view raw example for the custom preprocessing path is provided at [`examples/realworld/realworld_fixed/pour_coke.mp4`](../../examples/realworld/realworld_fixed/pour_coke.mp4).
+
+A released dynamic-viewpoint example subset is provided under [`examples/realworld/realworld_dynamic/`](../../examples/realworld/realworld_dynamic). The dynamic-viewpoint data was created with ARIA. For details, please refer to the paper.
+
+The same prepared sample also comes with a one-line dataset file under:
+
+```bash
+data/dataset_files/custom_inputs/<sample>.txt
+```
+
+The released dynamic-viewpoint subset can also be used directly:
+
+```bash
+--data_root examples/realworld --dataset_file examples/realworld/realworld_dynamic.txt
 ```
 
 Example inference launcher:
@@ -143,17 +213,17 @@ Example inference launcher:
 ```bash
 bash training/cogvideox/examples/infer_static_hand_concat.sh \
   --checkpoint_path outputs/<date>/<experiment> \
-  --dataset_file dataset_files/trumans_smoke/test.txt \
+  --dataset_file /abs/path/to/dwm/dataset_files/trumans_test.txt \
   --output_dir outputs_infer/dwm_cogvideox_dataset
 ```
 
-`--dataset_file` and relative `--video` inputs are resolved inside `data_root`. With the public config that means they should be relative to `data_refactor/`, not prefixed with `data_refactor/` again.
+`--dataset_file` can be either an absolute path or a repo-relative path such as `dataset_files/trumans_test.txt`. Relative `--video` inputs are still resolved inside `data_root`.
 
 Common path overrides:
 
 ```bash
-training: --override data.data_root=/abs/path/to/data_refactor
-inference: --data_root /abs/path/to/data_refactor
+training: --override data.data_root=/abs/path/to/data
+inference: --data_root /abs/path/to/data
 ```
 
 Other inference overrides:
