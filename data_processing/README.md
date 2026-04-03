@@ -60,6 +60,13 @@ WAN preencoded siblings:
 
 ## 1. TRUMANS
 
+<p align="center">
+  <img src="../assets/trumans_example.gif" alt="TRUMANS example processed clip" width="100%">
+</p>
+<p align="center">
+  <i>Example TRUMANS clip. Left to right: <code>videos</code>, <code>videos_static</code>, <code>videos_hands</code>.</i>
+</p>
+
 Download TRUMANS first. We follow the dataset release procedure from [`TRUMANS official repo`](https://github.com/jnnan/trumans_utils).
 
 ### 1.1 Blender and HSI addon
@@ -225,6 +232,13 @@ Useful options:
 ```
 
 ## 2. TASTE-Rob
+
+<p align="center">
+  <img src="../assets/taste_rob_example.gif" alt="TASTE-Rob example processed clip" width="100%">
+</p>
+<p align="center">
+  <i>Example TASTE-Rob clip. Left to right: <code>videos</code>, <code>videos_static</code>, <code>videos_hands</code>.</i>
+</p>
 
 Follow the dataset access instructions from the [official TASTE-Rob repository](https://github.com/GAP-LAB-CUHK-SZ/TASTE-Rob).
 
