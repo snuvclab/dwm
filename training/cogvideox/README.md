@@ -153,7 +153,7 @@ The examples below assume the public config still points at the repository-local
 
 `--checkpoint_path` accepts either:
 
-- a training output directory such as `outputs/260219/cogvideox_hand_concat_lora_rewrite_prompt_debug`
+- a training output directory such as `outputs/<run_name>`
 - a `checkpoint-*` subdirectory under that output directory
 
 You can also download the released checkpoint folder from Hugging Face and pass that downloaded directory to `--checkpoint_path`:

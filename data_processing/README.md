@@ -296,12 +296,13 @@ Unlike TRUMANS, TASTE-Rob does not come with hand-only videos. After resizing th
 
 ### 3.1 Install original HaMeR
 
-This repository includes HaMeR under `third_party/hamer` as a submodule. Clone DWM with `--recursive`, or run `git submodule update --init --recursive` if you already cloned the repository.
-
-Then install HaMeR:
+Install the original HaMeR repository under `third_party/`:
 
 ```bash
-cd third_party/hamer
+cd third_party
+git clone --recursive https://github.com/geopavlakos/hamer.git
+
+cd hamer
 pip install --no-build-isolation --no-deps -e .[all]
 pip install --no-deps -v -e third-party/ViTPose/
 ```
