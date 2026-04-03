@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  
+  <!-- Primary Meta Tags -->
+  <meta name="title" content="{{ page.title }}">
+  <meta name="description" content="{{ page.description }}">
+  <meta name="keywords" content="dexterous world model, world model, dwm, video diffusion, embodied AI, egocentric interaction, egocentric video diffusion, human-object interaction, human-scene interaction, 3D scene understanding, action-conditioned video generation, computer vision, machine learning, diffusion models">
+  <meta name="author" content="{% for author in page.authors %}{{ author.name }}{% unless forloop.last %}, {% endunless %}{% endfor %}">
+  <meta name="robots" content="index, follow">
+  <meta name="language" content="English">
+  <link rel="canonical" href="https://snuvclab.github.io/dwm/">
+  
+  <title>{{ page.tab_title | default: page.title }}</title>
+
+  <!-- Open Graph / Facebook -->
+  <meta property="og:type" content="article">
+  <meta property="og:site_name" content="{{ page.title }}">
+  <meta property="og:title" content="{{ page.social_title | default: page.title }}">
+  <meta property="og:description" content="{{ page.social_description | default: page.description }}">
+  <meta property="og:url" content="https://snuvclab.github.io/dwm/">
+  <meta property="og:image" content="https://snuvclab.github.io/dwm/static/image/teaser_final.jpg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="{{ page.title }} - Teaser">
+
+  <!-- Twitter -->
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="{{ page.social_title | default: page.title }}">
+  <meta name="twitter:description" content="{{ page.social_description | default: page.description }}">
+  <meta name="twitter:image" content="https://snuvclab.github.io/dwm/static/image/teaser_final.jpg">
+  <meta name="twitter:image:alt" content="{{ page.title }} - Teaser">
+  
+  <!-- Academic/Research Specific -->
+  <meta name="citation_title" content="{{ page.title }}">
+  {% for author in page.authors %}
+  <meta name="citation_author" content="{{ author.name }}">
+  {% endfor %}
+  {% if page.affiliations %}
+  <meta name="citation_publication_date" content="2025">
+  {% endif %}
+  {% if page.paper %}
+  <meta name="citation_pdf_url" content="https://snuvclab.github.io/dwm/{{ page.paper }}">
+  {% endif %}
+  
+  <!-- Additional SEO -->
+  <meta name="theme-color" content="#2563eb">
+  <meta name="msapplication-TileColor" content="#2563eb">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+
+  <link rel="icon" type="image/x-icon" href="static/image/favicon.ico">
+  <link rel="stylesheet" href="./static/css/bulma.min.css">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/5.15.3/css/all.min.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/jpswalsh/academicons@1/css/academicons.min.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bulma-carousel@4.0.4/dist/css/bulma-carousel.min.css">
+  <link rel="stylesheet" href="./static/css/index.css">
+
+  <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.5.1/jquery.min.js"></script>
+  <script defer src="./static/js/fontawesome.all.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/bulma-carousel@4.0.4/dist/js/bulma-carousel.min.js"></script>
+  <script src="./static/js/index.js"></script>
+
+  <!-- MathJax -->
+  <script>
+    MathJax = {
+      tex: {
+        inlineMath: [ ['$', '$'], ['\\(', '\\)'] ],
+        displayMath: [ ['$$', '$$'], ['\\[', '\\]'] ],
+        processEscapes: true, 
+        tags: 'all',
+      },
+      svg: {
+        fontCache: 'global'
+      }
+    };
+  </script>
+  <script
+    type="text/javascript" id="MathJax-script" async
+    src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js">
+  </script>
+</head>
+<body>
+
+
+<section class="hero">
+  <div class="hero-body">
+    <div class="container is-max-desktop">
+      <div class="columns is-centered">
+        <div class="column has-text-centered">
+          <h1 class="title is-1 publication-title" style="display: flex; align-items: center; justify-content: center; gap: 0.1em;">
+            <img src="static/image/favicon.png" alt="" style="height: 1.2em; width: auto; vertical-align: middle;">
+            {{ page.title }}
+          </h1>
+          {% if page.authors %}
+          <div class="is-size-5 publication-authors">
+            {% for author in page.authors %}
+              <span class="author-block">
+                {% if author.homepage %}<a href="{{ author.homepage }}" target="_blank">{% endif %}{{ author.name }}{% if author.homepage %}</a>{% endif %}{% if author.affiliation %}<sup>{% if author.affiliation.size %}{% for aff in author.affiliation %}{{ aff }}{% unless forloop.last %},{% endunless %}{% endfor %}{% else %}{{ author.affiliation }}{% endif %}</sup>{% endif %}{% if author.equal_contributor %}*{% endif %}{% unless forloop.last %}, {% endunless %}
+              </span>
+            {% endfor %}
+          </div>
+          {% endif %}
+
+          {% if page.affiliations %}
+          <div class="is-size-5 publication-affiliations">
+            {% for affiliation in page.affiliations %}
+              <span class="affiliation-block">
+                <sup>{{ forloop.index }}</sup>{{ affiliation }}{% unless forloop.last %}, {% endunless %}
+              </span>
+            {% endfor %}
+          </div>
+          {% endif %}
+
+          {% if page.venue %}
+          <div class="is-size-4 publication-venue has-text-centered has-text-weight-semibold" style="margin-top: 0.4rem;">
+            {{ page.venue }}
+          </div>
+          {% endif %}
+
+          <div class="column has-text-centered">
+            <div class="publication-links">
+              <!-- PDF Link. -->
+              {% if page.paper %}
+              <span class="link-block">
+                <a href="{{ page.paper }}"
+                   class="external-link button is-normal is-rounded is-dark">
+                  <span class="icon">
+                      <i class="fas fa-file-pdf"></i>
+                  </span>
+                  <span>Paper</span>
+                </a>
+              </span>
+              {% endif %}
+              <!-- Video Link. -->
+              {% if page.video %}
+              <span class="link-block">
+                <a href="{{ page.video }}"
+                   class="external-link button is-normal is-rounded is-dark">
+                  <span class="icon">
+                      <i class="fab fa-youtube"></i>
+                  </span>
+                  <span>Video</span>
+                </a>
+              </span>
+              {% endif %}
+              <!-- arXiv Link. -->
+              {% if page.arxiv or page.arXiv %}
+              <span class="link-block">
+                <a href="{{ page.arxiv | default: page.arXiv }}" target="_blank"
+                   class="external-link button is-normal is-rounded is-dark">
+                  <span class="icon">
+                      <i class="ai ai-arxiv"></i>
+                  </span>
+                  <span>arXiv</span>
+                </a>
+              </span>
+              {% endif %}
+              <!-- Code Link. -->
+              {% if page.code %}
+              <span class="link-block">
+                <a href="{{ page.code }}"
+                   class="external-link button is-normal is-rounded is-dark">
+                  <span class="icon">
+                      <i class="fab fa-github"></i>
+                  </span>
+                  <span>Code</span>
+                  </a>
+              </span>
+              {% endif %}
+              <!-- Dataset Link. -->
+              {% if page.data %}
+              <span class="link-block">
+                <a href="{{ page.data }}"
+                   class="external-link button is-normal is-rounded is-dark">
+                  <span class="icon">
+                      <i class="fas fa-database"></i>
+                  </span>
+                  <span>Data</span>
+                </a>
+              </span>
+              {% endif %}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="section">
+<div class="container is-max-desktop">
+
+<div class="content">
+  {{ content }}
+</div>
+
+</div>
+</section>
+
+<footer class="footer">
+  <div class="container">
+    <div class="columns is-centered">
+      <div class="column is-8">
+        <div class="content">
+          <p>
+            Website template borrowed from <a href="https://github.com/nerfies/nerfies.github.io">NeRFies</a> and <a href="https://github.com/shunzh/project_website">the Jekyll fork</a>.
+          </p>
+        </div>
+      </div>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>

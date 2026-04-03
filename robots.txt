@@ -1,0 +1,5 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://snuvclab.github.io/dwm/sitemap.xml
+
