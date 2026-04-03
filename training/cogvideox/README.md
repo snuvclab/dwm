@@ -192,7 +192,10 @@ Samples prepared with [`data_processing/custom/prepare_custom_hoi_sample.py`](..
 
 If you have sufficient VRAM and want better visual quality on custom real-world videos, we recommend DWM WAN 14B first.
 
-A fixed-view raw example for the custom preprocessing path is provided at [`examples/realworld/realworld_fixed/pour_coke.mp4`](../../examples/realworld/realworld_fixed/pour_coke.mp4).
+Fixed-view raw examples for the custom preprocessing path are provided at:
+
+- [`examples/realworld/realworld_fixed/pour_coke.mp4`](../../examples/realworld/realworld_fixed/pour_coke.mp4)
+- [`examples/realworld/realworld_fixed/lift_tumbler.mp4`](../../examples/realworld/realworld_fixed/lift_tumbler.mp4)
 
 A released dynamic-viewpoint example subset is provided under [`examples/realworld/realworld_dynamic/`](../../examples/realworld/realworld_dynamic). The dynamic-viewpoint data was created with ARIA. For details, please refer to the paper.
 

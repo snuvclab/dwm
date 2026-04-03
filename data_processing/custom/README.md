@@ -18,11 +18,14 @@ All commands below assume you run them from the repository root.
 
 ## Command
 
-A fixed-view raw example is provided at:
+A few fixed-view raw examples are provided at:
 
 ```text
 examples/realworld/realworld_fixed/pour_coke.mp4
+examples/realworld/realworld_fixed/lift_tumbler.mp4
 ```
+
+For example:
 
 ```bash
 python data_processing/custom/prepare_custom_hoi_sample.py \
