@@ -1,6 +1,9 @@
 <div align="center">
 
-# Dexterous World Models
+<h1>
+  <img src="https://snuvclab.github.io/dwm/static/image/favicon.png" alt="DWM icon" height="28">
+  Dexterous World Models
+</h1>
 
 ### CVPR 2026
 
@@ -10,6 +13,21 @@
 </div>
 
 Official implementation of **Dexterous World Models**.
+
+<p align="center">
+  <b>TL;DR:</b> DWM is a scene-action-conditioned video diffusion model for simulating embodied dexterous actions in a given static 3D scene.
+</p>
+
+<p align="center">
+  <a href="https://snuvclab.github.io/dwm/static/videos/DWM_teaserv2_trim.mp4">
+    <img src="assets/dwm_teaser.gif" alt="DWM teaser" width="100%">
+  </a>
+</p>
+
+## 🗞️ News
+
+- `April 3, 2026`: Code release. We also release the DWM WAN version together.
+- `February 21, 2026`: DWM was accepted to `CVPR 2026`.
 
 ## Installation
 
