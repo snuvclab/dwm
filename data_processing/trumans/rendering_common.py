@@ -389,3 +389,91 @@ def set_actor_render_hidden(armature_obj, hidden):
         if obj.parent_bone and obj.parent == armature_obj:
             obj.hide_render = hidden
             print(f"{action} bone-child '{obj.name}' {'from' if hidden else 'in'} rendering")
+
+
+def get_actor_render_objects(armature_obj):
+    if not armature_obj:
+        return []
+
+    actor_objects = []
+    seen = set()
+
+    def add(obj):
+        if obj is None:
+            return
+        try:
+            key = obj.as_pointer()
+        except ReferenceError:
+            return
+        if key in seen:
+            return
+        seen.add(key)
+        actor_objects.append(obj)
+
+    add(armature_obj)
+    for child in armature_obj.children:
+        add(child)
+
+    for obj in bpy.data.objects:
+        if obj.parent_bone and obj.parent == armature_obj:
+            add(obj)
+
+    return actor_objects
+
+
+def suppress_actor_shadow_visibility(armature_obj):
+    shadow_state = []
+    actor_objects = get_actor_render_objects(armature_obj)
+
+    for obj in actor_objects:
+        obj_state = {"object": obj}
+        changed = False
+
+        if hasattr(obj, "visible_shadow"):
+            obj_state["visible_shadow"] = obj.visible_shadow
+            obj.visible_shadow = False
+            changed = True
+
+        cycles_visibility = getattr(obj, "cycles_visibility", None)
+        if cycles_visibility is not None and hasattr(cycles_visibility, "shadow"):
+            obj_state["cycles_visibility_shadow"] = cycles_visibility.shadow
+            cycles_visibility.shadow = False
+            changed = True
+
+        if changed:
+            shadow_state.append(obj_state)
+
+    if shadow_state:
+        print(f"Disabled actor-cast shadows for {len(shadow_state)} actor objects")
+    else:
+        print("No actor shadow visibility properties found to disable")
+
+    return shadow_state
+
+
+def restore_actor_shadow_visibility(shadow_state):
+    restored = 0
+
+    for obj_state in shadow_state:
+        obj = obj_state.get("object")
+        if obj is None:
+            continue
+
+        try:
+            if "visible_shadow" in obj_state and hasattr(obj, "visible_shadow"):
+                obj.visible_shadow = obj_state["visible_shadow"]
+
+            cycles_visibility = getattr(obj, "cycles_visibility", None)
+            if (
+                "cycles_visibility_shadow" in obj_state
+                and cycles_visibility is not None
+                and hasattr(cycles_visibility, "shadow")
+            ):
+                cycles_visibility.shadow = obj_state["cycles_visibility_shadow"]
+
+            restored += 1
+        except ReferenceError:
+            continue
+
+    if shadow_state:
+        print(f"Restored actor shadow visibility for {restored}/{len(shadow_state)} actor objects")

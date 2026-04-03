@@ -8,6 +8,36 @@ import os
 import json
 from pathlib import Path
 
+
+DEFAULT_OUTPUT_BASE = "data/trumans/ego_render_fov90"
+
+
+def is_valid_video_file(video_path, min_size=10240, freshness_sec=2.0):
+    if not os.path.isfile(video_path):
+        return False
+    size = os.path.getsize(video_path)
+    if size < min_size:
+        return False
+    import time
+    mtime = os.path.getmtime(video_path)
+    if time.time() - mtime < freshness_sec:
+        return False
+    return True
+
+
+def get_existing_source_video_count(anim_path, source_subdir="videos", min_size=10240):
+    videos_path = os.path.join(anim_path, source_subdir)
+    if not os.path.isdir(videos_path):
+        return 0
+
+    valid_video_count = 0
+    for video_file in os.listdir(videos_path):
+        if not video_file.endswith(".mp4"):
+            continue
+        if is_valid_video_file(os.path.join(videos_path, video_file), min_size=min_size):
+            valid_video_count += 1
+    return valid_video_count
+
 def get_expected_video_count(blend_file, animation_name, frame_skip=3, stride=25, clip_length=49):
     """Get the expected number of video sequences from a blend file for a specific animation."""
     try:
@@ -134,27 +164,52 @@ except Exception as e:
         print(f"Exception getting video count for {os.path.basename(blend_file)}: {e}")
         return 10  # Default fallback
 
-def check_video_sequence_completeness(anim_path, expected_videos, video_type="static"):
+def resolve_depth_output_subdir(video_type, output_subdir=None, normalization_mode="fixed", sqrt_disparity=True):
+    if output_subdir:
+        return output_subdir
+    if video_type == "static_depth":
+        if normalization_mode == "aether":
+            return "disparity_static_aether" if sqrt_disparity else "disparity_static_aether_linear"
+        return "disparity_static_sqrt" if sqrt_disparity else "disparity_static"
+    if video_type == "hands_depth":
+        if normalization_mode == "aether":
+            return "disparity_hands_aether" if sqrt_disparity else "disparity_hands_aether_linear"
+        return "disparity_hands_sqrt" if sqrt_disparity else "disparity_hands"
+    return None
+
+
+def check_video_sequence_completeness(anim_path, expected_videos, video_type="static", output_subdir=None,
+                                      normalization_mode="fixed", sqrt_disparity=True):
     """
     Check if an animation folder has all expected video sequences rendered.
     Uses filesize threshold to detect incomplete files from interrupted renders.
     """
-    def is_valid_video(video_path, min_size=10240):
-        """Video must exist, have reasonable size, and not be too recent"""
-        if not os.path.isfile(video_path):
-            return False
-        size = os.path.getsize(video_path)
-        if size < min_size:  # Too small = likely incomplete
-            return False
-        # Check if file was modified very recently (< 2 seconds ago)
-        import time
-        mtime = os.path.getmtime(video_path)
-        if time.time() - mtime < 2.0:
-            return False  # File too fresh, might still be writing
-        return True
-    
-    sequences_path = os.path.join(anim_path, "sequences")
-    videos_path = os.path.join(sequences_path, f"videos_{video_type}")
+    if video_type == "static":
+        videos_path = os.path.join(anim_path, "videos_static")
+    elif video_type == "static_depth":
+        videos_path = os.path.join(
+            anim_path,
+            resolve_depth_output_subdir(
+                video_type,
+                output_subdir,
+                normalization_mode=normalization_mode,
+                sqrt_disparity=sqrt_disparity,
+            ),
+        )
+    elif video_type == "hands":
+        videos_path = os.path.join(anim_path, "videos_hands")
+    elif video_type == "hands_depth":
+        videos_path = os.path.join(
+            anim_path,
+            resolve_depth_output_subdir(
+                video_type,
+                output_subdir,
+                normalization_mode=normalization_mode,
+                sqrt_disparity=sqrt_disparity,
+            ),
+        )
+    else:
+        videos_path = os.path.join(anim_path, f"videos_{video_type}")
     
     # Check if videos folder exists
     if not os.path.exists(videos_path):
@@ -165,7 +220,7 @@ def check_video_sequence_completeness(anim_path, expected_videos, video_type="st
     valid_video_count = 0
     for video_file in video_files:
         video_full_path = os.path.join(videos_path, video_file)
-        if is_valid_video(video_full_path, min_size=10240):  # 10KB minimum
+        if is_valid_video_file(video_full_path, min_size=10240):  # 10KB minimum
             valid_video_count += 1
     
     # Check if we have the expected number of valid videos
@@ -254,15 +309,28 @@ except Exception as e:
         print(f"Exception getting animation names for {os.path.basename(blend_file)}: {e}")
         return []
 
-def check_video_rendering_status(frame_skip=3, stride=25, clip_length=49, video_type="static"):
+def check_video_rendering_status(
+    frame_skip=3,
+    stride=25,
+    clip_length=49,
+    video_type="static",
+    output_base=DEFAULT_OUTPUT_BASE,
+    output_subdir=None,
+    normalization_mode="fixed",
+    sqrt_disparity=True,
+):
     """Check what's already rendered in the Trumans dataset for video-based rendering scripts."""
     
     # Configuration
     recordings_path = "data/trumans/Recordings_blend"
-    output_base = "data/trumans/ego_render_fov90_480p_s32"
     
     print(f"Checking video rendering status for {video_type} videos")
     print(f"Using frame skip: {frame_skip}, stride: {stride}, clip length: {clip_length}")
+    if video_type in ("static_depth", "hands_depth"):
+        print(
+            f"Using depth output subdir: "
+            f"{resolve_depth_output_subdir(video_type, output_subdir, normalization_mode, sqrt_disparity)}"
+        )
     
     # Load existing status report if available
     existing_status_report = None
@@ -422,9 +490,17 @@ def check_video_rendering_status(frame_skip=3, stride=25, clip_length=49, video_
                 print(f"  ❌ {clean_anim_name}: Not started")
             else:
                 # Animation has been started, check completeness
-                expected_videos = get_expected_video_count(blend_file, anim_name, frame_skip, stride, clip_length)
+                if video_type in ("static_depth", "hands_depth"):
+                    expected_videos = get_existing_source_video_count(anim_path, source_subdir="videos")
+                else:
+                    expected_videos = get_expected_video_count(blend_file, anim_name, frame_skip, stride, clip_length)
                 is_complete, video_count = check_video_sequence_completeness(
-                    anim_path, expected_videos, video_type
+                    anim_path,
+                    expected_videos,
+                    video_type,
+                    output_subdir=output_subdir,
+                    normalization_mode=normalization_mode,
+                    sqrt_disparity=sqrt_disparity,
                 )
                 
                 if is_complete:
@@ -590,8 +666,17 @@ if __name__ == "__main__":
                        help="Stride value used during video rendering (default: 25)")
     parser.add_argument("--clip-length", type=int, default=49,
                        help="Clip length used during video rendering (default: 49)")
-    parser.add_argument("--video-type", type=str, choices=["static", "hands", "hands_new"], default="static",
-                       help="Type of rendering to check: 'static' for blender_ego_static.py, 'hands' for blender_ego_hand.py (default: static)")
+    parser.add_argument("--video-type", type=str, choices=["static", "static_depth", "hands", "hands_depth", "hands_new"], default="static",
+                       help="Type of rendering to check: 'static', 'static_depth', 'hands', or 'hands_depth' (default: static)")
+    parser.add_argument("--output-base", type=str, default=DEFAULT_OUTPUT_BASE,
+                       help=f"Root output directory to inspect (default: {DEFAULT_OUTPUT_BASE})")
+    parser.add_argument("--output-subdir", type=str,
+                       help="Override output subdir for depth outputs, e.g. disparity_static_sqrt or disparity_hands_aether")
+    parser.add_argument("--normalization-mode", type=str, choices=["fixed", "aether"], default="fixed",
+                       help="Default depth normalization mode when inferring the output subdir")
+    parser.add_argument("--linear-disparity", dest="sqrt_disparity", action="store_false",
+                       help="Check linear disparity outputs instead of sqrt disparity outputs")
+    parser.set_defaults(sqrt_disparity=True)
     
     args = parser.parse_args()
     
@@ -599,5 +684,9 @@ if __name__ == "__main__":
         frame_skip=args.frame_skip,
         stride=args.stride,
         clip_length=args.clip_length,
-        video_type=args.video_type
+        video_type=args.video_type,
+        output_base=args.output_base,
+        output_subdir=args.output_subdir,
+        normalization_mode=args.normalization_mode,
+        sqrt_disparity=args.sqrt_disparity,
     )

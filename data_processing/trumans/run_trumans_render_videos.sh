@@ -9,4 +9,5 @@ python data_processing/trumans/run_trumans_render_batch.py \
   --clip-length 49 \
   --clip-stride 25 \
   --frame-skip 3 \
-  --video-output --scenes trumans_all.txt
+  --video-output --auto-split-clips --scenes trumans_all.txt \
+  "$@"

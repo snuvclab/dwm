@@ -8,13 +8,17 @@ from collections import deque
 from pathlib import Path
 import argparse
 from check_rendering_status import get_animation_frame_count
-from check_video_rendering_status import get_expected_video_count, check_video_sequence_completeness
+from check_video_rendering_status import (
+    check_video_sequence_completeness,
+    get_existing_source_video_count,
+    get_expected_video_count,
+)
 
 # === User Configuration ===
 DEFAULT_RECORDINGS_PATH = "./data/trumans/Recordings_blend"
 # DEFAULT_RECORDINGS_PATH = "./Recordings_blend"
 DEFAULT_SAVE_PATH = "./data/trumans/ego_render_fov90"
-SCRIPT_PATH = "data_processing/trumans/blender_ego_video_render.py"
+SCRIPT_PATH = "dwm/data_processing/trumans/blender_ego_video_render.py"
 NUM_GPUS = 8
 # ===========================
 
@@ -102,6 +106,8 @@ def load_rendering_status_report(report_path=None, script_path=None):
             report_file = "rendering_status_report_static_depth.json"
         elif script_name in ['blender_ego_hand.py']:
             report_file = "rendering_status_report_hands.json"
+        elif script_name in ['blender_ego_hand_depth.py']:
+            report_file = "rendering_status_report_hands_depth.json"
         else:
             report_file = "rendering_status_report.json"  # Default for frame-based rendering
     else:
@@ -203,9 +209,27 @@ except Exception as e:
         print(f"Exception getting animation names for {os.path.basename(blend_file)}: {e}")
         return []
 
-def check_already_rendered(blend_file, save_path, status_report=None, script_path=None, grayscale=False, separate=False, 
+
+def resolve_depth_output_subdir(script_path=None, output_subdir=None, normalization_mode="fixed", sqrt_disparity=True):
+    script_name = os.path.basename(script_path) if script_path else ""
+    if script_name == "blender_ego_static_depth.py":
+        if output_subdir:
+            return output_subdir
+        if normalization_mode == "aether":
+            return "disparity_static_aether" if sqrt_disparity else "disparity_static_aether_linear"
+        return "disparity_static_sqrt" if sqrt_disparity else "disparity_static"
+    if script_name == "blender_ego_hand_depth.py":
+        if output_subdir:
+            return output_subdir
+        if normalization_mode == "aether":
+            return "disparity_hands_aether" if sqrt_disparity else "disparity_hands_aether_linear"
+        return "disparity_hands_sqrt" if sqrt_disparity else "disparity_hands"
+    return output_subdir
+
+def check_already_rendered(blend_file, save_path, status_report=None, script_path=None,
                           only_object=False, auto_split_clips=False, no_depth=False, video_output=False, 
-                          clip_length=49, clip_stride=25, frame_skip=3, static=False):
+                          clip_length=49, clip_stride=25, frame_skip=3, static=False, output_subdir=None,
+                          normalization_mode="fixed", sqrt_disparity=True):
     """Check if a scene has already been rendered using status report if available.
     Returns: (is_complete, rendered_animations, missing_animations, all_animations)"""
     directory_name = os.path.basename(os.path.dirname(blend_file))
@@ -214,8 +238,14 @@ def check_already_rendered(blend_file, save_path, status_report=None, script_pat
     # Determine output format based on script path
     is_video_output = False
     video_type = None
+    script_name = os.path.basename(script_path) if script_path else ""
+    depth_output_subdir = resolve_depth_output_subdir(
+        script_path,
+        output_subdir,
+        normalization_mode=normalization_mode,
+        sqrt_disparity=sqrt_disparity,
+    )
     if script_path:
-        script_name = os.path.basename(script_path)
         if script_name in ['blender_ego_static.py']:
             is_video_output = True
             video_type = "static"
@@ -225,6 +255,9 @@ def check_already_rendered(blend_file, save_path, status_report=None, script_pat
         elif script_name in ['blender_ego_hand.py']:
             is_video_output = True
             video_type = "hands"
+        elif script_name in ['blender_ego_hand_depth.py']:
+            is_video_output = True
+            video_type = "hands_depth"
         elif script_name in ['blender_ego_video_render.py']:
             # For blender_ego_video_render.py, check video_output flag
             is_video_output = video_output
@@ -323,57 +356,42 @@ def check_already_rendered(blend_file, save_path, status_report=None, script_pat
             if os.path.isdir(item_path):
                 if is_video_output:
                     # For video output scripts, check for video sequences
-                    sequences_path = item_path
-                    if not os.path.exists(sequences_path):
-                        continue
-                    
-                    # Check for video files based on script type
                     if script_path and 'blender_ego_static.py' in script_path:
-                        videos_path = os.path.join(sequences_path, "videos_static")
+                        videos_path = os.path.join(item_path, "sequences", "videos_static")
                     elif script_path and 'blender_ego_static_depth.py' in script_path:
-                        videos_path = os.path.join(sequences_path, "depth_static")
+                        videos_path = os.path.join(item_path, depth_output_subdir)
                     elif script_path and 'blender_ego_hand.py' in script_path:
-                        # Use different path based on grayscale and separate options
-                        if grayscale and separate:
-                            # Separate mode: check both left and right video folders
-                            videos_path_left = os.path.join(sequences_path, "videos_hands_gray_left")
-                            videos_path_right = os.path.join(sequences_path, "videos_hands_gray_right")
-                            videos_path = videos_path_left  # Use left as primary for existence check
-                        elif grayscale:
-                            videos_path = os.path.join(sequences_path, "videos_hands_gray")
-                        else:
-                            videos_path = os.path.join(sequences_path, "videos_hands_new2")
+                        videos_path = os.path.join(item_path, "videos_hands")
+                    elif script_path and 'blender_ego_hand_depth.py' in script_path:
+                        videos_path = os.path.join(item_path, depth_output_subdir)
                     else:
-                        videos_path = sequences_path
+                        videos_path = item_path
                     
                     if os.path.exists(videos_path):
-                        # Count video files based on mode
-                        if grayscale and separate and script_path and 'blender_ego_hand.py' in script_path:
-                            # Separate mode: count videos in both left and right folders
-                            left_videos = 0
-                            right_videos = 0
-                            if os.path.exists(videos_path_left):
-                                left_videos = len([f for f in os.listdir(videos_path_left) if f.endswith('.mp4')])
-                            if os.path.exists(videos_path_right):
-                                right_videos = len([f for f in os.listdir(videos_path_right) if f.endswith('.mp4')])
-                            video_files = min(left_videos, right_videos)  # Complete only if both have same count
-                        elif script_path and 'blender_ego_static_depth.py' in script_path:
-                            video_files = len([f for f in os.listdir(videos_path) if f.endswith('.exr')])
-                        else:
-                            # Normal mode: count videos in single folder
-                            video_files = len([f for f in os.listdir(videos_path) if f.endswith('.mp4')])
+                        video_files = len([f for f in os.listdir(videos_path) if f.endswith('.mp4')])
                         
                         # Get expected video count for this specific animation
                         if script_path and ('blender_ego_static.py' in script_path or 'blender_ego_static_depth.py' in script_path):
                             video_type = "static"
-                        elif script_path and 'blender_ego_hand.py' in script_path:
+                        elif script_path and ('blender_ego_hand.py' in script_path or 'blender_ego_hand_depth.py' in script_path):
                             video_type = "hands"
                         else:
                             video_type = "static"  # Default
                         
-                        expected_videos = get_expected_video_count(blend_file, item, frame_skip=frame_skip, stride=clip_stride, clip_length=clip_length)
-                        if expected_videos is None:
-                            expected_videos = 0
+                        if script_path and 'blender_ego_static_depth.py' in script_path:
+                            expected_videos = get_existing_source_video_count(item_path, source_subdir="videos")
+                        elif script_path and 'blender_ego_hand_depth.py' in script_path:
+                            expected_videos = get_existing_source_video_count(item_path, source_subdir="videos")
+                        else:
+                            expected_videos = get_expected_video_count(
+                                blend_file,
+                                item,
+                                frame_skip=frame_skip,
+                                stride=clip_stride,
+                                clip_length=clip_length,
+                            )
+                            if expected_videos is None:
+                                expected_videos = 0
                         
                         # Consider complete if we have the expected number of videos
                         if video_files >= expected_videos:
@@ -519,21 +537,26 @@ def main():
     parser.add_argument("--width", type=int, default=720, help="Render width in pixels (default: 720)")
     parser.add_argument("--height", type=int, default=480, help="Render height in pixels (default: 480)")
     parser.add_argument("--samples", type=int, default=64, help="Cycles samples for rendering (default: 16) - applies to Trumans render scripts")
-    parser.add_argument("--only-object", action="store_true", help="Hide actor/agent and render only objects - only applies to blender_ego_video_render.py")
-    parser.add_argument("--static", action="store_true", help="Freeze all object animations except camera (static scene mode) - only applies to blender_ego_video_render.py")
-    parser.add_argument("--video-output", action="store_true", help="Output video directly instead of individual frames - only applies to blender_ego_video_render.py")
-    parser.add_argument("--auto-split-clips", action="store_true", help="Automatically split video into clips when using --video-output - only applies to blender_ego_video_render.py")
-    parser.add_argument("--direct-clips", action="store_true", help="Create clips on-the-fly as frames are rendered (faster feedback for debugging) - only applies to blender_ego_video_render.py")
-    parser.add_argument("--clip-length", type=int, default=49, help="Number of frames per clip (default: 49) - only applies to blender_ego_video_render.py with --auto-split-clips or --direct-clips")
-    parser.add_argument("--clip-stride", type=int, default=25, help="Frame stride between clips (default: 25) - only applies to blender_ego_video_render.py with --auto-split-clips")
-    parser.add_argument("--fps", type=float, default=8.0, help="FPS for video output (default: 8.0) - only applies to blender_ego_video_render.py")
-    parser.add_argument("--grayscale", action="store_true", help="Render hands in grayscale (black & white) - only applies to blender_ego_hand.py")
+    parser.add_argument("--only-object", action="store_true", help="Hide actor/agent and render only objects - applies to blender_ego_video_render.py")
+    parser.add_argument("--no-actor-shadow", action="store_true", help="Keep actor visible but disable actor-cast shadows - applies to blender_ego_video_render.py")
+    parser.add_argument("--static", action="store_true", help="Legacy convenience flag: route blender_ego_video_render.py requests to blender_ego_static.py")
+    parser.add_argument("--video-output", action="store_true", help="Output video directly instead of individual frames - applies to dynamic scene renderer")
+    parser.add_argument("--auto-split-clips", action="store_true", help="Render reusable frames then split clips - applies to dynamic scene and hand RGB renderers")
+    parser.add_argument("--direct-clips", action="store_true", help="Render clips directly for faster feedback - applies to dynamic scene, static scene, hand RGB, and hand depth renderers")
+    parser.add_argument("--clip-length", type=int, default=49, help="Number of frames per clip (default: 49)")
+    parser.add_argument("--clip-stride", type=int, default=25, help="Frame stride between clips (default: 25)")
+    parser.add_argument("--fps", type=float, default=8.0, help="FPS for video output (default: 8.0)")
+    parser.add_argument("--output-subdir", type=str, help="Override output subdir for depth renderers")
+    parser.add_argument("--normalization-mode", type=str, choices=["fixed", "aether"], default="fixed",
+                        help="Disparity normalization mode for depth renderers (default: fixed)")
+    parser.add_argument("--linear-disparity", dest="sqrt_disparity", action="store_false",
+                        help="Disable sqrt on normalized depth disparity")
     parser.add_argument("--save-images", action="store_true", help="Save individual images instead of creating videos - only applies to blender_ego_hand.py")
-    parser.add_argument("--separate", action="store_true", help="Create separate videos for left and right hands (only works with --grayscale) - only applies to blender_ego_hand.py")
     parser.add_argument("--no-skip-existing", action="store_true", help="Force re-render even if files already exist - only applies to blender_ego_hand.py")
     parser.add_argument("--parallel-animations", action="store_true", help="Launch separate jobs for each animation (faster for single scenes, more blend file overhead)")
     parser.add_argument("--scenes", type=str, nargs='+', help="Specific scene names (directory names) to render. Can also be a path to a .txt file with scene names (one per line, prefix with @, e.g., @scenes.txt)")
     parser.add_argument("--scene-pattern", type=str, help="Pattern to match scene names (e.g., 'scene_*' or '*_walk')")
+    parser.set_defaults(sqrt_disparity=True)
 
     args = parser.parse_args()
     
@@ -577,6 +600,13 @@ def main():
                 processed_scenes.append(scene_arg)
         
         args.scenes = processed_scenes if processed_scenes else None
+
+    if args.static and 'blender_ego_video_render.py' in args.script_path:
+        args.script_path = args.script_path.replace('blender_ego_video_render.py', 'blender_ego_static.py')
+        args.video_output = True
+        args.direct_clips = True
+        args.auto_split_clips = False
+        print("Redirecting legacy --static request to blender_ego_static.py")
     
     # If status-only mode, just show current status
     if args.status_only:
@@ -624,27 +654,27 @@ def main():
     print(f"Resolution: {args.width}x{args.height} pixels")
     if args.samples and ('blender_ego_video_render.py' in args.script_path or 'blender_ego_static.py' in args.script_path):
         print(f"Cycles samples: {args.samples}")
-    if args.grayscale and 'blender_ego_hand.py' in args.script_path:
-        print(f"Grayscale mode: Enabled (hands will be rendered in black & white)")
     if args.save_images and 'blender_ego_hand.py' in args.script_path:
         print(f"Image mode: Enabled (individual images instead of videos)")
-    if args.separate and 'blender_ego_hand.py' in args.script_path:
-        print(f"Separate mode: Enabled (separate videos for left and right hands)")
     if args.no_skip_existing and 'blender_ego_hand.py' in args.script_path:
         print(f"No-skip-existing: Enabled (will force re-render existing files)")
     if 'blender_ego_hand.py' in args.script_path:
         print(f"Hand rendering resolution: {args.width}x{args.height} pixels")
     if args.only_object and 'blender_ego_video_render.py' in args.script_path:
         print(f"Only-object mode: Enabled (hide actor, render objects only)")
-    if args.static and 'blender_ego_video_render.py' in args.script_path:
-        print(f"Static mode: Enabled (freeze all animations except camera)")
+    if args.no_actor_shadow and 'blender_ego_video_render.py' in args.script_path:
+        print("No-actor-shadow mode: Enabled (actor visible, actor-cast shadows disabled)")
+    if args.static and 'blender_ego_static.py' in args.script_path:
+        print("Static mode: Enabled (clip-first freeze renderer)")
     if args.video_output and 'blender_ego_video_render.py' in args.script_path:
         print(f"Video-output mode: Enabled (output video directly instead of frames)")
-    if args.auto_split_clips and 'blender_ego_video_render.py' in args.script_path:
+    if args.output_subdir and ('blender_ego_static_depth.py' in args.script_path or 'blender_ego_hand_depth.py' in args.script_path):
+        print(f"Output subdir override: {args.output_subdir}")
+    if args.auto_split_clips and ('blender_ego_video_render.py' in args.script_path or 'blender_ego_hand.py' in args.script_path or 'blender_ego_hand_depth.py' in args.script_path):
         print(f"Auto-split-clips mode: Enabled (clip length: {args.clip_length}, stride: {args.clip_stride})")
-    if args.direct_clips and 'blender_ego_video_render.py' in args.script_path:
+    if args.direct_clips and ('blender_ego_video_render.py' in args.script_path or 'blender_ego_static.py' in args.script_path or 'blender_ego_static_depth.py' in args.script_path or 'blender_ego_hand.py' in args.script_path or 'blender_ego_hand_depth.py' in args.script_path):
         print(f"Direct-clips mode: Enabled (clip length: {args.clip_length}, stride: {args.clip_stride}) - faster feedback for debugging")
-    if 'blender_ego_video_render.py' in args.script_path:
+    if 'blender_ego_video_render.py' in args.script_path or 'blender_ego_static.py' in args.script_path or 'blender_ego_static_depth.py' in args.script_path or 'blender_ego_hand.py' in args.script_path or 'blender_ego_hand_depth.py' in args.script_path:
         print(f"Video FPS: {args.fps}")
     print(f"Found {len(blend_jobs)} .blend files.")
     
@@ -667,7 +697,7 @@ def main():
         status_report = load_rendering_status_report(args.status_report_path, args.script_path)
         if status_report:
             script_name = os.path.basename(args.script_path)
-            if script_name in ['blender_ego_static.py', 'blender_ego_hand.py']:
+            if script_name in ['blender_ego_static.py', 'blender_ego_hand.py', 'blender_ego_static_depth.py', 'blender_ego_hand_depth.py']:
                 report_source = args.status_report_path if args.status_report_path else "check_video_rendering_status.py"
             else:
                 report_source = args.status_report_path if args.status_report_path else "check_rendering_status.py"
@@ -729,9 +759,15 @@ def main():
                 if script_name in ['blender_ego_static.py']:
                     print(f"💡 To generate a status report for {script_name}, run:")
                     print(f"   python check_video_rendering_status.py --video-type static --stride 25 --clip-length 49")
+                elif script_name in ['blender_ego_static_depth.py']:
+                    print(f"💡 To generate a status report for {script_name}, run:")
+                    print(f"   python check_video_rendering_status.py --video-type static_depth --stride 25 --clip-length 49")
                 elif script_name in ['blender_ego_hand.py']:
                     print(f"💡 To generate a status report for {script_name}, run:")
                     print(f"   python check_video_rendering_status.py --video-type hands --stride 25 --clip-length 49")
+                elif script_name in ['blender_ego_hand_depth.py']:
+                    print(f"💡 To generate a status report for {script_name}, run:")
+                    print(f"   python check_video_rendering_status.py --video-type hands_depth --stride 25 --clip-length 49")
                 else:
                     print(f"💡 To generate a status report for {script_name}, run:")
                     print(f"   python check_rendering_status.py")
@@ -745,10 +781,13 @@ def main():
             print(f"   python check_video_rendering_status.py --video-type static --stride 25 --clip-length 49")
         elif script_name in ['blender_ego_static_depth.py']:
             print(f"💡 To generate a status report for {script_name}, run:")
-            print(f"   python check_video_rendering_status.py --video-type static --stride 25 --clip-length 49")
+            print(f"   python check_video_rendering_status.py --video-type static_depth --stride 25 --clip-length 49")
         elif script_name in ['blender_ego_hand.py']:
             print(f"💡 To generate a status report for {script_name}, run:")
             print(f"   python check_video_rendering_status.py --video-type hands --stride 25 --clip-length 49")
+        elif script_name in ['blender_ego_hand_depth.py']:
+            print(f"💡 To generate a status report for {script_name}, run:")
+            print(f"   python check_video_rendering_status.py --video-type hands_depth --stride 25 --clip-length 49")
         else:
             print(f"💡 To generate a status report for {script_name}, run:")
             print(f"   python check_rendering_status.py")
@@ -765,11 +804,11 @@ def main():
         display_name = directory_name  # For user-friendly display (same as scene_name in this case)
         is_rendered, rendered_anims, missing_anims, all_anims = check_already_rendered(
             blend_file, args.save_path, status_report, args.script_path, 
-            grayscale=args.grayscale, separate=args.separate,
             only_object=args.only_object, auto_split_clips=args.auto_split_clips,
             no_depth=True, video_output=args.video_output,
             clip_length=args.clip_length, clip_stride=args.clip_stride, frame_skip=args.frame_skip,
-            static=args.static
+            static=args.static, output_subdir=args.output_subdir,
+            normalization_mode=args.normalization_mode, sqrt_disparity=args.sqrt_disparity
         )
         
         if is_rendered:
@@ -899,11 +938,11 @@ def main():
                     # Check if this scene has animations
                     _, _, _, all_anims = check_already_rendered(
                         blend_file, args.save_path, status_report, args.script_path,
-                        grayscale=args.grayscale, separate=args.separate,
                         only_object=args.only_object, auto_split_clips=args.auto_split_clips,
                         no_depth=True, video_output=args.video_output,
                         clip_length=args.clip_length, clip_stride=args.clip_stride, frame_skip=args.frame_skip,
-                        static=args.static
+                        static=args.static, output_subdir=args.output_subdir,
+                        normalization_mode=args.normalization_mode, sqrt_disparity=args.sqrt_disparity
                     )
                     if not all_anims:
                         no_animations += 1
@@ -1009,11 +1048,11 @@ def main():
                     # Force real-time Blender query instead of using status report for accuracy
                     _, _, missing_anims, all_anims = check_already_rendered(
                         blend_file, args.save_path, None, args.script_path,
-                        grayscale=args.grayscale, separate=args.separate,
                         only_object=args.only_object, auto_split_clips=args.auto_split_clips,
                         no_depth=True, video_output=args.video_output,
                         clip_length=args.clip_length, clip_stride=args.clip_stride, frame_skip=args.frame_skip,
-                        static=args.static
+                        static=args.static, output_subdir=args.output_subdir,
+                        normalization_mode=args.normalization_mode, sqrt_disparity=args.sqrt_disparity
                     )  # Pass None to force Blender query
                     if all_anims:  # Scene has animations
                         actual_missing_total += len(missing_anims)
@@ -1056,11 +1095,11 @@ def main():
                     # Force real-time Blender query for accuracy
                     _, _, _, all_anims = check_already_rendered(
                         blend_file, args.save_path, None, args.script_path,
-                        grayscale=args.grayscale, separate=args.separate,
                         only_object=args.only_object, auto_split_clips=args.auto_split_clips,
                         no_depth=True, video_output=args.video_output,
                         clip_length=args.clip_length, clip_stride=args.clip_stride, frame_skip=args.frame_skip,
-                        static=args.static
+                        static=args.static, output_subdir=args.output_subdir,
+                        normalization_mode=args.normalization_mode, sqrt_disparity=args.sqrt_disparity
                     )  # Pass None to force Blender query
                     if not all_anims:
                         scenes_with_no_anims.append(directory_name)
@@ -1123,11 +1162,11 @@ def main():
                     # Force real-time Blender query for accuracy
                     _, _, missing_anims, all_anims = check_already_rendered(
                         blend_file, args.save_path, None, args.script_path,
-                        grayscale=args.grayscale, separate=args.separate,
                         only_object=args.only_object, auto_split_clips=args.auto_split_clips,
                         no_depth=True, video_output=args.video_output,
                         clip_length=args.clip_length, clip_stride=args.clip_stride, frame_skip=args.frame_skip,
-                        static=args.static
+                        static=args.static, output_subdir=args.output_subdir,
+                        normalization_mode=args.normalization_mode, sqrt_disparity=args.sqrt_disparity
                     )  # Pass None to force Blender query
                     if all_anims and missing_anims:  # Scene has animations but some are missing
                         scenes_with_missing_anims += 1
@@ -1263,17 +1302,9 @@ def main():
             "--height", str(args.height)
         ]
         
-        # Add grayscale option if specified and using blender_ego_hand.py
-        if args.grayscale and 'blender_ego_hand.py' in args.script_path:
-            cmd.append("--grayscale")
-        
         # Add save-images option if specified and using blender_ego_hand.py
         if args.save_images and 'blender_ego_hand.py' in args.script_path:
             cmd.append("--save-images")
-        
-        # Add separate option if specified and using blender_ego_hand.py
-        if args.separate and 'blender_ego_hand.py' in args.script_path:
-            cmd.append("--separate")
         
         # Add no-skip-existing option if specified and using blender_ego_hand.py
         if args.no_skip_existing and 'blender_ego_hand.py' in args.script_path:
@@ -1291,36 +1322,41 @@ def main():
         # Add only-object option if specified and using blender_ego_video_render.py
         if args.only_object and 'blender_ego_video_render.py' in args.script_path:
             cmd.append("--only-object")
-        
-        # Add static option if specified and using blender_ego_video_render.py
-        if args.static and 'blender_ego_video_render.py' in args.script_path:
-            cmd.append("--static")
+
+        # Add no-actor-shadow option if specified and using blender_ego_video_render.py
+        if args.no_actor_shadow and 'blender_ego_video_render.py' in args.script_path:
+            cmd.append("--no-actor-shadow")
         
         # Add video-output option if specified and using blender_ego_video_render.py
         if args.video_output and 'blender_ego_video_render.py' in args.script_path:
             cmd.append("--video-output")
         
-        # Add auto-split-clips option if specified and using blender_ego_video_render.py
-        if args.auto_split_clips and 'blender_ego_video_render.py' in args.script_path:
+        # Add auto-split-clips option for reusable-frame renderers
+        if args.auto_split_clips and ('blender_ego_video_render.py' in args.script_path or 'blender_ego_hand.py' in args.script_path):
             cmd.append("--auto-split-clips")
-            cmd.extend(["--clip-length", str(args.clip_length)])
-            cmd.extend(["--clip-stride", str(args.clip_stride)])
         
-        # Add direct-clips option if specified and using blender_ego_video_render.py
-        if args.direct_clips and 'blender_ego_video_render.py' in args.script_path:
+        # Add direct-clips option for clip-first renderers
+        if args.direct_clips and ('blender_ego_video_render.py' in args.script_path or 'blender_ego_static.py' in args.script_path or 'blender_ego_static_depth.py' in args.script_path or 'blender_ego_hand.py' in args.script_path or 'blender_ego_hand_depth.py' in args.script_path):
             cmd.append("--direct-clips")
+        
+        # Add clip/video timing arguments for video-capable renderers
+        if 'blender_ego_video_render.py' in args.script_path or 'blender_ego_static.py' in args.script_path or 'blender_ego_static_depth.py' in args.script_path:
             cmd.extend(["--clip-length", str(args.clip_length)])
             cmd.extend(["--clip-stride", str(args.clip_stride)])
-        
-        # Add fps option if using blender_ego_video_render.py
-        if 'blender_ego_video_render.py' in args.script_path:
             cmd.extend(["--fps", str(args.fps)])
         
         # Add clip-length, stride, fps for blender_ego_hand.py (video clip params)
-        if 'blender_ego_hand.py' in args.script_path:
+        if 'blender_ego_hand.py' in args.script_path or 'blender_ego_hand_depth.py' in args.script_path:
             cmd.extend(["--clip-length", str(args.clip_length)])
             cmd.extend(["--stride", str(args.clip_stride)])
             cmd.extend(["--fps", str(args.fps)])
+
+        if args.output_subdir and ('blender_ego_static_depth.py' in args.script_path or 'blender_ego_hand_depth.py' in args.script_path):
+            cmd.extend(["--output-subdir", args.output_subdir])
+        if 'blender_ego_static_depth.py' in args.script_path or 'blender_ego_hand_depth.py' in args.script_path:
+            cmd.extend(["--normalization-mode", args.normalization_mode])
+            if not args.sqrt_disparity:
+                cmd.append("--linear-disparity")
         
         # Add animation index or name for animation-based jobs
         if job.get('job_type') == 'animation':

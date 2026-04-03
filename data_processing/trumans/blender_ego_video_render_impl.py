@@ -34,8 +34,10 @@ from rendering_common import (  # noqa: E402
     optimize_scene_for_cycles,
     parse_blender_argv,
     reset_armature_pose,
+    restore_actor_shadow_visibility,
     resolve_animations_to_render,
     set_actor_render_hidden,
+    suppress_actor_shadow_visibility,
     strip_animation_extension,
 )
 from rendering_strategies import (  # noqa: E402
@@ -72,6 +74,11 @@ def build_parser():
     parser.add_argument("--height", type=int, default=480, help="Render height")
     parser.add_argument("--only-object", action="store_true", help="Hide actor and render only objects")
     parser.add_argument(
+        "--no-actor-shadow",
+        action="store_true",
+        help="Keep the actor visible but disable actor-cast shadows",
+    )
+    parser.add_argument(
         "--static",
         action="store_true",
         help="Deprecated. Use blender_ego_static.py for static scene rendering.",
@@ -101,6 +108,9 @@ def main():
     if not args.video_output and (args.auto_split_clips or args.direct_clips):
         print("ERROR: --auto-split-clips and --direct-clips require --video-output")
         sys.exit(1)
+
+    if args.only_object and args.no_actor_shadow:
+        print("WARNING: --no-actor-shadow has no effect with --only-object because the actor is hidden.")
 
     try:
         execution_strategy = resolve_execution_strategy(
@@ -443,8 +453,11 @@ def main():
         )
 
     def render_animation_sequence(animation_name):
+        actor_shadow_state = []
         if args.only_object:
             set_actor_render_hidden(armature_obj, True)
+        elif args.no_actor_shadow:
+            actor_shadow_state = suppress_actor_shadow_visibility(armature_obj)
         try:
             if not args.video_output:
                 render_frame_sequence(animation_name)
@@ -457,6 +470,8 @@ def main():
         finally:
             if args.only_object:
                 set_actor_render_hidden(armature_obj, False)
+            elif actor_shadow_state:
+                restore_actor_shadow_visibility(actor_shadow_state)
 
     animation_sets = get_animation_sets()
     if not animation_sets:

@@ -2,12 +2,11 @@
 set -euo pipefail
 
 python data_processing/trumans/run_trumans_render_batch.py \
-  --script-path data_processing/trumans/blender_ego_video_render.py \
+  --script-path data_processing/trumans/blender_ego_static.py \
   --save-path ./data/trumans/ego_render_fov90/ \
   --fps 8 --width 720 --height 480 \
   --samples 64 \
   --clip-length 49 \
   --clip-stride 25 \
   --frame-skip 3 \
-  --static --direct-clips \
-  --video-output --scenes trumans_all.txt
+  --direct-clips --scenes trumans_all.txt
