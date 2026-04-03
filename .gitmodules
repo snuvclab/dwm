@@ -1,0 +1,3 @@
+[submodule "third_party/hamer-mediapipe"]
+	path = third_party/hamer-mediapipe
+	url = https://github.com/bjkim95/hamer-mediapipe

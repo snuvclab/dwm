@@ -1,0 +1,45 @@
+pipeline:
+  class: "CogVideoXFunStaticToVideoPipeline"
+  transformer_class: "CogVideoXFunTransformer3DModelWithConcat"
+  condition_channels: 12  # 12 for compressed SMPL pos map (3 channels * 4 temporal), 16 for VAE latents
+
+training_modes:
+  full:
+    description: "Full fine-tuning of all parameters"
+    supported: true
+    default: true
+    
+  lora:
+    description: "LoRA fine-tuning with projection layer"
+    supported: true
+    default: false
+    parameters:
+      lora_rank: 64
+      lora_alpha: 64
+      freeze_projection: false
+
+validation:
+  enabled: true
+  steps: 500
+  epochs: 1
+  max_videos: 4
+
+notes: |
+  This pipeline uses SMPL position map (smpl_pos_map_egoallo) as condition instead of hand videos.
+  
+  Key differences from cogvideox_fun_static_to_video_pose_concat:
+  - Uses SMPL pos map instead of hand videos
+  - condition_channels: 12 (compressed) or 16 (VAE latents)
+  - compress_smpl_pos_map_temporal: true/false in data config
+  
+  Data config should include:
+    use_smpl_pos_map: true
+    compress_smpl_pos_map_temporal: true  # Recommended for faster loading
+    
+  Transformer input channels:
+    - noisy_latents: 16
+    - mask: 1
+    - static_latents: 16
+    - smpl_pos_map_latents: 12 (compressed) or 16 (VAE)
+    Total: 45 (compressed) or 49 (VAE)
+

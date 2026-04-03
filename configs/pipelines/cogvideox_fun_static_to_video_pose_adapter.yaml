@@ -1,0 +1,29 @@
+pipeline:
+  class: "CogVideoXFunStaticToVideoPipeline"
+  transformer_class: "CogVideoXFunTransformer3DModelWithAdapter"
+  condition_channels: 16
+  use_adapter: true
+
+training_modes:
+  full:
+    description: "Full fine-tuning of all parameters"
+    supported: true
+    default: true
+    
+  lora:
+    description: "LoRA fine-tuning with adapter"
+    supported: true
+    default: false
+    parameters:
+      lora_rank: 64
+      lora_alpha: 32
+      non_lora_lr_scale: 5.0 
+      freeze_projection: false
+      trainable_parameter_patterns:
+        - "patch_embed.cond_proj.*" 
+
+validation:
+  enabled: true
+  steps: 500
+  epochs: 1
+  max_videos: 4

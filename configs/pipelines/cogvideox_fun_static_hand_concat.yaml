@@ -1,0 +1,25 @@
+pipeline:
+  class: "CogVideoXFunStaticHandConcatPipeline"
+  transformer_class: "CogVideoXFunStaticHandConcatTransformer3DModel"
+  condition_channels: 16
+
+training_modes:
+  full:
+    description: "Full fine-tuning of all parameters"
+    supported: true
+    default: true
+
+  lora:
+    description: "LoRA fine-tuning with projection layer"
+    supported: true
+    default: false
+    parameters:
+      lora_rank: 64
+      lora_alpha: 32
+      freeze_projection: false
+
+validation:
+  enabled: true
+  steps: 500
+  epochs: 1
+  max_videos: 4

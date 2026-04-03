@@ -1,0 +1,55 @@
+pipeline:
+  class: "CogVideoXFunStaticToVideoPipeline"
+  transformer_class: "CogVideoXFunTransformer3DModelWithConcat"
+  condition_channels: 0  # No channel concat (using adapter instead)
+  adapter_version: "v1"  # Can be v1, v2, v3, or v4
+
+training_modes:
+  full:
+    description: "Full fine-tuning of all parameters"
+    supported: true
+    default: true
+    
+  lora:
+    description: "LoRA fine-tuning with control adapter"
+    supported: true
+    default: false
+    parameters:
+      lora_rank: 64
+      lora_alpha: 64
+      freeze_projection: false
+
+validation:
+  enabled: true
+  steps: 500
+  epochs: 1
+  max_videos: 4
+
+notes: |
+  This pipeline uses SMPL position map (smpl_pos_map_egoallo) as adapter control.
+  
+  Key differences from cogvideox_fun_static_to_video_posmap_concat:
+  - Uses SimpleAdapter (PixelUnshuffle + Conv) instead of channel concatenation
+  - condition_channels: 0 (no concat)
+  - Spatial resolution preserved: vae_scale_factor_spatial = 1
+  - Control signal processed through adapter and added to embeddings
+  
+  Data config should include:
+    use_smpl_pos_map: true
+    compress_smpl_pos_map_temporal: true  # Recommended
+    vae_scale_factor_temporal: 4          # Temporal compression
+    vae_scale_factor_spatial: 1           # NO spatial compression (adapter handles it)
+    
+  Transformer architecture:
+    - Input channels: 16 (base) + 1 (mask) + 16 (static) = 33
+    - Adapter input: 12 channels (3 RGB * 4 temporal)
+    - Adapter processes: PixelUnshuffle(8x) + Conv2d + ResidualBlocks
+    - Adapter output: hidden_dim (1920 for 5B model)
+    - Adapter features added to hidden states after patch embedding
+  
+  Transformer input channels:
+    - noisy_latents: 16
+    - mask: 1
+    - static_latents: 16
+    Total: 33 (no SMPL pos map concat, uses adapter instead)
+
