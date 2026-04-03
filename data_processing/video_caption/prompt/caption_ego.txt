@@ -1,9 +1,17 @@
-Describe the video in detail from a first-person, egocentric perspective.
+Describe the video from a first-person, egocentric perspective.
 
-Treat the camera as the viewer's eyes and maintain a consistent body-centered reference frame. When any part of the viewer's body is visible (such as hands, arms, legs, feet, or torso), naturally incorporate it into the description as the viewer's own, without overemphasis.
+Treat the camera as the viewer’s eyes and maintain a consistent body-centered viewpoint. Do not describe the viewer as an external person.
 
-Anchor spatial relationships relative to the viewer (for example, "in front of me", "to my right", "within reach", "near my feet", "below eye level").
+When any part of the viewer’s body is visible (hands, arms, legs, feet, torso), naturally describe it as the viewer’s own (e.g., "my right hand", "my legs") and integrate it into the action. Do not describe body parts in isolation. Include visual details such as clothing, color, or texture only when clearly visible and directly relevant to the interaction.
 
-Describe only what is visibly present: the environment (location, surfaces, objects, lighting), the spatial layout relative to the viewer, and observable actions over time including clear physical state changes.
+Include:
+(a) the visible environment (location, surfaces, objects, lighting),
+(c) observable actions over time with clear physical state changes (e.g., opened/closed, moved/shifted, picked up/put down, aligned/misaligned).
 
-Use plain, objective, descriptive sentences. Avoid subjective or emotional language. Avoid speculation about intent. Do not describe the viewer as an external person and do not mention prompts or references.
+Keep the description strictly visual and objective. Do not speculate about intent or emotion. Do not invent unseen details.
+
+Example 1 (hand–object interaction):
+A wooden desk fills the space in front of me under soft indoor lighting. A closed silver laptop rests slightly to the left, and a white ceramic mug sits near the center. My right hand, partially covered by a dark sleeve, reaches forward and wraps around the mug’s handle. The mug slides slightly across the desk as I pull it closer. I lift it off the surface, tilt it toward me, then lower it back down, releasing the handle so it remains upright near its previous position.
+
+Example 2 (full-body involvement with visible legs):
+A wooden chair stands a short distance in front of me on a light-colored floor under steady indoor lighting. I step closer until the armrests are within reach. My hands grip both armrests and pull the chair toward me, causing it to shift across the floor. As I lean forward during the motion, my legs in blue jeans become visible below, briefly crossing in the lower part of the frame. The chair ends up positioned directly in front of my body.

@@ -21,7 +21,7 @@ DEFAULT_REQUIRED_SUBDIRS = [
     "video_latents",
     "hand_video_latents",
     "static_video_latents",
-    "prompt_embeds_prompts_rewrite",
+    "prompt_embeds_rewrite",
 ]
 
 

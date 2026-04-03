@@ -93,11 +93,12 @@ def encode_prompt(tokenizer, text_encoder, prompt: str, device: torch.device, ma
 
 def build_jobs(data_root: Path, dataset_type: str, modalities: List[str], prompt_subdir: str = "prompts_rewrite") -> Dict[str, List[Dict[str, str]]]:
     jobs: Dict[str, List[Dict[str, str]]] = {mod: [] for mod in modalities}
+    prompt_embed_subdir = "prompt_embeds_rewrite" if prompt_subdir == "prompts_rewrite" else f"prompt_embeds_{prompt_subdir}"
     modality_mapping = {
         "videos": ("videos", "video_latents"),
         "static_videos": ("videos_static", "static_video_latents"),
         "hand_videos": ("videos_hands", "hand_video_latents"),
-        "prompts": (prompt_subdir, f"prompt_embeds_{prompt_subdir}"),
+        "prompts": (prompt_subdir, prompt_embed_subdir),
     }
 
     if dataset_type == "trumans":

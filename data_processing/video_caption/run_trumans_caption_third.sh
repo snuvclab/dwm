@@ -15,10 +15,17 @@ SCENE_FILTER_FILE="${SCENE_FILTER_FILE:-}"
 ARRAY_INDEX="${ARRAY_INDEX:-0}"
 NUM_SPLITS="${NUM_SPLITS:-1}"
 ATTACH_ACTION_HINTS="${ATTACH_ACTION_HINTS:-1}"
+GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.9}"
+TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-}"
 
 SCENE_FILTER_ARG=()
 if [[ -n "${SCENE_FILTER_FILE}" ]]; then
   SCENE_FILTER_ARG=(--scene_filter_file "${SCENE_FILTER_FILE}")
+fi
+
+TP_ARGS=()
+if [[ -n "${TENSOR_PARALLEL_SIZE}" ]]; then
+  TP_ARGS=(--tensor_parallel_size "${TENSOR_PARALLEL_SIZE}")
 fi
 
 python "${PROJECT_ROOT}/data_processing/video_caption/internvl2_video_recaptioning.py" \
@@ -37,6 +44,8 @@ python "${PROJECT_ROOT}/data_processing/video_caption/internvl2_video_recaptioni
   --array_index "${ARRAY_INDEX}" \
   --num_splits "${NUM_SPLITS}" \
   --split_by action \
+  --gpu_memory_utilization "${GPU_MEMORY_UTILIZATION}" \
+  "${TP_ARGS[@]}" \
   --skip_existing \
   "${SCENE_FILTER_ARG[@]}"
 

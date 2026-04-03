@@ -23,6 +23,7 @@ from pathlib import Path
 
 import numpy as np
 from decord import VideoReader, cpu
+from PIL import Image
 
 
 @dataclass
@@ -103,10 +104,103 @@ def sample_frames(video_path: Path, num_sampled_frames: int, sample_method: str)
     return frames
 
 
+def to_pil_images(frames: np.ndarray) -> list[Image.Image]:
+    images: list[Image.Image] = []
+    for frame in frames:
+        if frame.dtype != np.uint8:
+            frame = np.clip(frame, 0, 255).astype(np.uint8)
+        images.append(Image.fromarray(frame))
+    return images
+
+
 def build_chat_prompt(tokenizer, base_prompt: str, num_frames: int) -> str:
     placeholders = "".join(f"Frame{i}: <image>\n" for i in range(1, num_frames + 1))
     messages = [{"role": "user", "content": f"{placeholders}{base_prompt}"}]
     return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
+
+def parse_action_file(path: Path) -> list[tuple[int, int, str]]:
+    if not path.exists():
+        return []
+    anns: list[tuple[int, int, str]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        try:
+            start = int(parts[0])
+            end = int(parts[1])
+        except ValueError:
+            continue
+        desc = parts[2].strip()
+        if desc:
+            anns.append((start, end, desc))
+    return anns
+
+
+def clip_frame_range(clip_id: int, clip_length: int, clip_stride: int, frame_skip: int) -> tuple[int, int]:
+    start_seq = clip_id * clip_stride
+    end_seq = start_seq + clip_length - 1
+    return start_seq * frame_skip, end_seq * frame_skip
+
+
+def build_action_hints(
+    anns: list[tuple[int, int, str]],
+    start_frame: int,
+    end_frame: int,
+    clip_length: int,
+) -> list[str]:
+    overlaps = []
+    for ann_start, ann_end, ann_desc in anns:
+        if end_frame < ann_start or start_frame > ann_end:
+            continue
+        overlap_start = max(start_frame, ann_start)
+        overlap_end = min(end_frame, ann_end)
+        overlap_duration = overlap_end - overlap_start + 1
+        overlap_ratio = overlap_duration / max(1, clip_length)
+        overlaps.append((overlap_ratio, ann_desc))
+
+    overlaps.sort(key=lambda x: x[0], reverse=True)
+    hints = []
+    seen = set()
+    for _ratio, desc in overlaps:
+        if desc in seen:
+            continue
+        seen.add(desc)
+        hints.append(desc)
+    return hints
+
+
+def load_action_hints_for_ego(
+    actions_root: Path | None,
+    action_name: str,
+    clip_stem: str,
+    clip_length: int,
+    clip_stride: int,
+    frame_skip: int,
+) -> list[str]:
+    if actions_root is None or not clip_stem.isdigit():
+        return []
+    action_file = actions_root / f"{action_name}.txt"
+    anns = parse_action_file(action_file)
+    if not anns:
+        return []
+    clip_id = int(clip_stem)
+    start_frame, end_frame = clip_frame_range(
+        clip_id=clip_id,
+        clip_length=clip_length,
+        clip_stride=clip_stride,
+        frame_skip=frame_skip,
+    )
+    return build_action_hints(
+        anns=anns,
+        start_frame=start_frame,
+        end_frame=end_frame,
+        clip_length=clip_length,
+    )
 
 
 def load_third_context_for_ego(action_dir: Path, clip_stem: str, third_prompt_dirname: str):
@@ -147,6 +241,19 @@ def build_ego_prompt_with_context(
             + "\n".join(chunks).strip()
         )
     return build_chat_prompt(tokenizer, prompt_text, num_frames=num_frames)
+
+
+def merge_action_hints(*hint_lists: list[str]) -> list[str]:
+    merged = []
+    seen = set()
+    for hints in hint_lists:
+        for hint in hints:
+            hint = str(hint).strip()
+            if not hint or hint in seen:
+                continue
+            seen.add(hint)
+            merged.append(hint)
+    return merged
 
 
 def iter_action_dirs(root_dir: Path, scene_filter: set[str] | None):
@@ -214,6 +321,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save_format", type=str, choices=["auto", "json", "txt"], default="auto")
     parser.add_argument("--use_third_person_context", action="store_true")
     parser.add_argument("--third_prompt_dirname", type=str, default="prompts_aux")
+    parser.add_argument("--actions_root", type=Path, default=None)
+    parser.add_argument("--clip_length", type=int, default=49)
+    parser.add_argument("--clip_stride", type=int, default=25)
+    parser.add_argument("--frame_skip", type=int, default=3)
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.9)
     parser.add_argument("--tensor_parallel_size", type=int, default=None)
     return parser.parse_args()
@@ -315,18 +426,30 @@ def main() -> None:
                 num_sampled_frames=args.num_sampled_frames,
                 sample_method=args.frame_sample_method,
             )
-            if args.video_type == "egocentric" and args.use_third_person_context:
-                third_prompt, action_hints = load_third_context_for_ego(
-                    action_dir=job.video_path.parent.parent,
+            if args.video_type == "egocentric":
+                third_prompt = None
+                prompt_aux_hints: list[str] = []
+                if args.use_third_person_context:
+                    third_prompt, prompt_aux_hints = load_third_context_for_ego(
+                        action_dir=job.video_path.parent.parent,
+                        clip_stem=job.video_path.stem,
+                        third_prompt_dirname=args.third_prompt_dirname,
+                    )
+                action_hints = load_action_hints_for_ego(
+                    actions_root=args.actions_root,
+                    action_name=job.action,
                     clip_stem=job.video_path.stem,
-                    third_prompt_dirname=args.third_prompt_dirname,
+                    clip_length=args.clip_length,
+                    clip_stride=args.clip_stride,
+                    frame_skip=args.frame_skip,
                 )
+                merged_action_hints = merge_action_hints(prompt_aux_hints, action_hints)
                 prompt = build_ego_prompt_with_context(
                     tokenizer=tokenizer,
                     base_prompt=base_prompt,
                     num_frames=max(1, frames.shape[0]),
                     third_prompt=third_prompt,
-                    action_hints=action_hints,
+                    action_hints=merged_action_hints,
                 )
             else:
                 prompt = build_chat_prompt(
@@ -339,7 +462,7 @@ def main() -> None:
                 [
                     {
                         "prompt": prompt,
-                        "multi_modal_data": {"image": frames},
+                        "multi_modal_data": {"image": to_pil_images(frames)},
                     }
                 ],
                 sampling_params=sampling_params,

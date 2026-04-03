@@ -1,19 +1,29 @@
-# Video Captioning And Prompt Rewrite
-
-Parts of this path were adapted from VideoX-Fun video captioning.
+# Video Captioning
 
 All commands below assume you run them from the repository root.
 
-## Goal
+The examples below assume processed data is stored under `data/`.
 
-Generate prompt text from ego videos and then optionally rewrite it into a cleaner generation-oriented prompt.
+This pipeline adapts the video caption workflow from [VideoX-Fun](https://github.com/aigc-apps/VideoX-Fun).
 
-Main stages:
+`prompts_aux` is optional auxiliary text for caption generation. It is not the main training prompt. Instead, it provides extra context that can be used when generating or refining `prompts/`.
 
-- `videos/*.mp4 -> prompts/*.txt`
-- `prompts/*.txt -> prompts_rewrite/*.txt`
+For TRUMANS ego captioning, the pipeline also uses action annotations from `data/trumans/Actions/` to inject clip-level action hints. This does not require `prompts_aux`.
 
-`prompts_aux` remains optional additional context.
+Typical use cases:
+
+- TRUMANS: captions from third-person view videos
+- TASTE-Rob: text exported from the provided caption annotations
+
+For TRUMANS, the third-person view videos can be taken from `data/trumans/video_render/`.
+
+The main prompt flow is:
+
+```text
+videos/*.mp4 -> prompts/*.txt -> prompts_rewrite/*.txt
+```
+
+If `prompts_aux` is available, the captioning pipeline can use it as additional context on top of the TRUMANS action annotations.
 
 ## 1. Build `prompts_aux` (optional)
 
@@ -21,7 +31,7 @@ Main stages:
 
 ```bash
 python data_processing/trumans/create_videos_third_trumans.py \
-  --root_dir data_refactor/trumans \
+  --root_dir data/trumans \
   --third_video_root data/trumans/video_render \
   --ego_videos_dirname videos \
   --output_dirname videos_third \
@@ -38,50 +48,21 @@ bash data_processing/video_caption/run_trumans_caption_third.sh
 
 ```bash
 python data_processing/taste_rob/export_prompts_from_captions_xlsx.py \
-  --data_root data_refactor/taste_rob_resized \
+  --data_root data/taste_rob \
   --captions_xlsx /path/to/taste_rob/captions.xlsx \
   --prompt_dir_name prompts_aux
 ```
 
 ## 2. Ego Captioning
 
-### Recommended open-source smoke path: BLIP fallback
-
-This path works with the base `requirements.txt` environment and does not require `vllm`.
+InternVL2 captioning requires `vllm`. It is part of the repository dependencies installed by `pip install -r requirements.txt`.
 
 ### TRUMANS
 
-```bash
-ROOT_DIR="$(pwd)/data_refactor/trumans" \
-CAPTION_BACKEND=blip \
-MODEL_NAME=Salesforce/blip-image-captioning-base \
-bash data_processing/video_caption/run_trumans_caption_ego.sh
-```
-
-### TASTE-Rob
+TRUMANS ego captioning reads clip videos under `data/trumans/.../videos/` and uses the matching action annotation files under `data/trumans/Actions/`.
 
 ```bash
-ROOT_DIR="$(pwd)/data_refactor/taste_rob_resized" \
-CAPTION_BACKEND=blip \
-MODEL_NAME=Salesforce/blip-image-captioning-base \
-bash data_processing/video_caption/run_taste_rob_caption_ego.sh
-```
-
-### Optional higher-quality path: InternVL2
-
-This path requires an additional `vllm` installation compatible with your CUDA / torch environment and a larger GPU budget.
-
-Example extra install:
-
-```bash
-pip install vllm
-```
-
-### TRUMANS
-
-```bash
-ROOT_DIR="$(pwd)/data_refactor/trumans" \
-CAPTION_BACKEND=internvl2 \
+ROOT_DIR="$(pwd)/data/trumans" \
 MODEL_PATH=OpenGVLab/InternVL2-40B-AWQ \
 bash data_processing/video_caption/run_trumans_caption_ego.sh
 ```
@@ -89,22 +70,17 @@ bash data_processing/video_caption/run_trumans_caption_ego.sh
 ### TASTE-Rob
 
 ```bash
-ROOT_DIR="$(pwd)/data_refactor/taste_rob_resized" \
-CAPTION_BACKEND=internvl2 \
+ROOT_DIR="$(pwd)/data/taste_rob" \
 MODEL_PATH=OpenGVLab/InternVL2-40B-AWQ \
 bash data_processing/video_caption/run_taste_rob_caption_ego.sh
 ```
-
-The runners write `prompts/*.txt` next to the sample videos.
 
 ## 3. Prompt Rewrite
 
-Rewrite is now supported for both TRUMANS and TASTE-Rob using the same `caption_rewrite.py` backend and `prompt/rewrite.txt` template.
-
 ### TASTE-Rob
 
 ```bash
-ROOT_DIR="$(pwd)/data_refactor/taste_rob_resized" \
+ROOT_DIR="$(pwd)/data/taste_rob" \
 PROMPT_SUBDIR=prompts \
 OUTPUT_FOLDER_NAME=prompts_rewrite \
 bash data_processing/video_caption/run_rewrite_taste_rob.sh
@@ -113,7 +89,7 @@ bash data_processing/video_caption/run_rewrite_taste_rob.sh
 ### TRUMANS
 
 ```bash
-ROOT_DIR="$(pwd)/data_refactor/trumans" \
+ROOT_DIR="$(pwd)/data/trumans" \
 PROMPT_SUBDIR=prompts \
 OUTPUT_FOLDER_NAME=prompts_rewrite \
 bash data_processing/video_caption/run_rewrite_trumans.sh
@@ -129,23 +105,14 @@ TEMPERATURE=0.7
 MAX_TOKENS=1024
 ```
 
-Smoke-tested lightweight fallback:
-
-```bash
-MODEL_NAME=Qwen/Qwen2.5-0.5B-Instruct
-ENGINE=transformers
-NUM_SPLITS=1
-MAX_TOKENS=256
-```
-
-If `SLURM_ARRAY_TASK_ID` is set, the rewrite runners split work by file automatically.
-
 ## 4. Output Contract
 
-After rewrite, each sample root may contain:
-
-- `prompts/<stem>.txt`
-- `prompts_rewrite/<stem>.txt`
-- optional `prompts_aux/<stem>.json` or `.txt`
-
-The CogVideoX preencoder in this refactor assumes rewritten prompts are stored in `prompts_rewrite` and writes embeddings to `prompt_embeds_prompts_rewrite`.
+```text
+<sample>/
+├── prompts/
+│   └── <stem>.txt
+├── prompts_rewrite/
+│   └── <stem>.txt
+└── prompts_aux/
+    └── <stem>.txt
+```
