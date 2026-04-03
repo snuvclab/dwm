@@ -296,13 +296,12 @@ Unlike TRUMANS, TASTE-Rob does not come with hand-only videos. After resizing th
 
 ### 3.1 Install original HaMeR
 
-Install the original HaMeR repository under `third_party/`:
+This repository includes HaMeR under `third_party/hamer` as a submodule. Clone DWM with `--recursive`, or run `git submodule update --init --recursive` if you already cloned the repository.
+
+Then install HaMeR:
 
 ```bash
-cd third_party
-git clone --recursive https://github.com/geopavlakos/hamer.git
-
-cd hamer
+cd third_party/hamer
 pip install --no-build-isolation --no-deps -e .[all]
 pip install --no-deps -v -e third-party/ViTPose/
 ```
@@ -342,12 +341,7 @@ python data_processing/hands/render_videos_hands_hamer_original.py \
 
 ### 3.3 Faster mediapipe option
 
-If you want faster processing, you can use the mediapipe-based HaMeR pipeline from [`bjkim95/hamer-mediapipe`](https://github.com/bjkim95/hamer-mediapipe):
-
-```bash
-cd third_party
-git clone https://github.com/bjkim95/hamer-mediapipe.git
-```
+If you want faster processing, you can use the mediapipe-based HaMeR pipeline from [`bjkim95/hamer-mediapipe`](https://github.com/bjkim95/hamer-mediapipe). This repository already includes it under `third_party/hamer-mediapipe` when cloned with `--recursive`.
 
 This backend can be faster, but the output quality may be worse than the original HaMeR backend.
 

@@ -14,8 +14,11 @@ Official implementation of **Dexterous World Models**.
 ## Installation
 
 ```bash
-git clone https://github.com/snuvclab/dwm
+git clone --recursive https://github.com/snuvclab/dwm
 cd dwm
+
+# If you already cloned without submodules, run:
+# git submodule update --init --recursive
 
 conda create -n dwm python=3.10 -y
 

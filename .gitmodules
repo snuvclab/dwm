@@ -1,3 +1,6 @@
 [submodule "third_party/hamer-mediapipe"]
 	path = third_party/hamer-mediapipe
 	url = https://github.com/bjkim95/hamer-mediapipe
+[submodule "third_party/hamer"]
+	path = third_party/hamer
+	url = https://github.com/geopavlakos/hamer.git
