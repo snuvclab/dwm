@@ -354,21 +354,6 @@ python data_processing/hands/render_videos_hands_hamer_original.py \
   --skip_existing
 ```
 
-### 3.3 Faster mediapipe option
-
-If you want faster processing, you can use the mediapipe-based HaMeR pipeline from [`bjkim95/hamer-mediapipe`](https://github.com/bjkim95/hamer-mediapipe). This repository already includes it under `third_party/hamer-mediapipe` when cloned with `--recursive`.
-
-This backend can be faster, but the output quality may be worse than the original HaMeR backend.
-
-To use it, change the backend flag:
-
-```bash
-bash data_processing/hands/run_render_hands_hamer.sh \
-  --backend mediapipe \
-  --data_root data/taste_rob \
-  --skip_existing
-```
-
 ## 4. Custom Videos
 
 For a single custom hand-object interaction video, use:

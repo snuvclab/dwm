@@ -31,6 +31,6 @@ case "$BACKEND" in
 esac
 
 python "$SCRIPT" \
-  --data_root ./data_refactor/taste_rob_resized \
+  --data_root ./data/taste_rob \
   --skip_existing \
   "${FORWARD_ARGS[@]}"
