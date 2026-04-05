@@ -6,11 +6,12 @@ deepspeed
 diffusers>=0.32.2
 easydict>=1.13
 einops>=0.8.0
-transformers>=4.48.0
-huggingface-hub>=0.27.1
+transformers==4.51.3
+huggingface-hub==0.30.2
 hf_transfer>=0.1.8
 peft>=0.13.0
 decord>=0.6.0
+vllm==0.8.5
 wandb
 pandas
 pillow>=11.1.0
@@ -21,12 +22,11 @@ python-dotenv>=1.0.1
 PyYAML>=6.0.2
 torch==2.6.0
 torchvision>=0.20.1
-torchao>=0.7.0
 sentencepiece>=0.2.0
 imageio>=2.33.1
 imageio-ffmpeg>=0.5.1
 iopath>=0.1.10
-numpy>=1.26.4,<2.0.0
+numpy==1.26.4
 opencv-python==4.9.0.80
 matplotlib>=3.10.0
 rich>=13.9.4
@@ -35,7 +35,7 @@ safetensors>=0.5.2
 scikit-image>=0.25.0
 scipy>=1.15.0
 six>=1.17.0
-tokenizers>=0.21.0
+tokenizers==0.21.1
 tqdm>=4.67.1
 triton>=3.1.0
 typer>=0.15.1

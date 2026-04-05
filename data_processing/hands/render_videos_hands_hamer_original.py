@@ -70,7 +70,7 @@ def relative_to_root(path: Path, data_root: Path) -> str:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Render videos_hands with original HaMeR (single GPU, model cached).")
-    parser.add_argument("--data_root", type=Path, default=Path("data_refactor/taste_rob_resized"))
+    parser.add_argument("--data_root", type=Path, default=Path("data/taste_rob"))
     parser.add_argument("--video_dir_name", type=str, default="videos")
     parser.add_argument("--output_dir_name", type=str, default="videos_hands")
     parser.add_argument("--hamer_root", type=Path, default=Path("third_party/hamer"))
