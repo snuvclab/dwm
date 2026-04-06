@@ -6,8 +6,12 @@ import torch
 import torch.cuda.amp as amp
 import torch.nn as nn
 import torch.nn.functional as F
+
+from ..diffusers_compat import disable_problematic_optional_backends
+
+disable_problematic_optional_backends()
+
 from diffusers.configuration_utils import ConfigMixin, register_to_config
-from diffusers.loaders.single_file_model import FromOriginalModelMixin
 from diffusers.models.autoencoders.vae import (DecoderOutput,
                                                DiagonalGaussianDistribution)
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
@@ -889,7 +893,7 @@ def _video_vae(pretrained_path=None, z_dim=16, dim=160, device="cpu", **kwargs):
     return model
 
 
-class AutoencoderKLWan3_8(ModelMixin, ConfigMixin, FromOriginalModelMixin):
+class AutoencoderKLWan3_8(ModelMixin, ConfigMixin):
 
     @register_to_config
     def __init__(

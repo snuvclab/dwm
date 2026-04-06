@@ -20,7 +20,12 @@ from einops import rearrange
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-from training.wan.models import AutoencoderKLWan, AutoencoderKLWan3_8, WanT5EncoderModel
+# Import only the components needed for preencoding. Importing the full
+# training.wan.models package also pulls in transformer modules and optional
+# DeepSpeed-related paths that are not needed here and can break fresh-env runs.
+from training.wan.models.wan_text_encoder import WanT5EncoderModel
+from training.wan.models.wan_vae import AutoencoderKLWan
+from training.wan.models.wan_vae3_8 import AutoencoderKLWan3_8
 
 try:
     from dataset_layout_utils import iter_taste_rob_sample_dirs, iter_trumans_action_dirs
@@ -374,9 +379,17 @@ def main() -> None:
     else:
         rank, world_size = 0, 1
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    if device.type == "cuda":
-        torch.cuda.set_device(device)
+    if torch.cuda.is_available():
+        local_device_index = rank % torch.cuda.device_count()
+        device = torch.device(f"cuda:{local_device_index}")
+        # Explicit device binding is only needed when multiple ranks share a node.
+        if world_size > 1:
+            torch.cuda.set_device(local_device_index)
+        # Warm up CUDA once before large model `.to()` calls. In the validated
+        # release env this avoids intermittent lazy-init crashes on fresh runs.
+        _ = torch.empty(1, device=device)
+    else:
+        device = torch.device("cpu")
 
     selected_clip_keys = load_selected_clip_keys(args.dataset_files) if args.dataset_files else None
     all_jobs = build_jobs(

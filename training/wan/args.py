@@ -180,7 +180,7 @@ def _get_optimizer_args(parser: argparse.ArgumentParser) -> None:
     """Optimizer arguments."""
     parser.add_argument("--optimizer", type=str, default="adamw", choices=["adam", "adamw", "prodigy", "came"],
                         help="Optimizer type.")
-    parser.add_argument("--use_8bit_adam", action="store_true", help="Use 8-bit Adam from bitsandbytes.")
+    parser.add_argument("--use_8bit_adam", action="store_true", help="Use the optional 8-bit Adam variant.")
     parser.add_argument("--beta1", type=float, default=0.9, help="Adam beta1.")
     parser.add_argument("--beta2", type=float, default=0.95, help="Adam beta2.")
     parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay.")

@@ -16,9 +16,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from training.cogvideox.diffusers_compat import disable_broken_torchao
+from training.cogvideox.diffusers_compat import disable_problematic_optional_backends
 
-disable_broken_torchao()
+disable_problematic_optional_backends()
 
 import torch
 from diffusers.utils import export_to_video

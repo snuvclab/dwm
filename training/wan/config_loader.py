@@ -169,26 +169,31 @@ class ExperimentConfigLoader:
             
             # Set the value
             target_key = keys[-1]
-            
-            # Try to convert value to appropriate type
-            try:
-                # Try to convert to float
-                if "." in value or "e" in value.lower():
-                    current[target_key] = float(value)
-                # Try to convert to int
-                elif value.isdigit():
-                    current[target_key] = int(value)
-                # Try to convert to bool
-                elif value.lower() in ["true", "false"]:
-                    current[target_key] = value.lower() == "true"
-                else:
-                    current[target_key] = value
-            except ValueError:
-                current[target_key] = value
+
+            current[target_key] = self._parse_override_value(value)
                 
             print(f"   {key} = {current[target_key]}")
         
         return config
+
+    @staticmethod
+    def _parse_override_value(value: str) -> Any:
+        """Parse CLI overrides with stable primitive handling.
+
+        `yaml.safe_load` correctly handles values like:
+        - `false` -> False
+        - `0` -> 0
+        - `1e-4` -> 0.0001
+        - `[]` -> []
+        - `{}` -> {}
+        while keeping plain strings as strings.
+        """
+        try:
+            parsed = yaml.safe_load(value)
+        except Exception:
+            return value
+
+        return value if parsed is None and value.strip().lower() not in {"null", "~"} else parsed
     
     def print_config_summary(self, config: Dict[str, Any]):
         """Print a summary of the configuration."""

@@ -15,8 +15,12 @@ import torch
 import torch.amp as amp
 import torch.nn as nn
 import torch.nn.functional as F
+
+from ..diffusers_compat import disable_problematic_optional_backends
+
+disable_problematic_optional_backends()
+
 from diffusers.configuration_utils import ConfigMixin, register_to_config
-from diffusers.loaders.single_file_model import FromOriginalModelMixin
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.utils import is_torch_version, logging
 from torch import nn
@@ -794,7 +798,7 @@ class MLPProj(torch.nn.Module):
 
 
 
-class WanTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
+class WanTransformer3DModel(ModelMixin, ConfigMixin):
     r"""
     Wan diffusion backbone supporting both text-to-video and image-to-video.
     """
