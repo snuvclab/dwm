@@ -7,10 +7,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as T
 
+from ..diffusers_compat import disable_problematic_optional_backends
+
+disable_problematic_optional_backends()
+
 from .wan_transformer3d import attention, flash_attention
 from .wan_xlm_roberta import XLMRoberta
 from diffusers.configuration_utils import ConfigMixin
-from diffusers.loaders.single_file_model import FromOriginalModelMixin
 from diffusers.models.modeling_utils import ModelMixin
 
 
@@ -500,7 +503,7 @@ def clip_xlm_roberta_vit_h_14(
     return _clip(pretrained, pretrained_name, XLMRobertaCLIP, **cfg)
 
 
-class CLIPModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
+class CLIPModel(ModelMixin, ConfigMixin):
 
     def __init__(self):
         super(CLIPModel, self).__init__()

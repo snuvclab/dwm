@@ -23,9 +23,9 @@ import torch.nn.functional as F
 from typing import Optional, Union, Tuple, Dict, Any
 from safetensors.torch import load_file
 
-from training.cogvideox.diffusers_compat import disable_broken_torchao
+from training.cogvideox.diffusers_compat import disable_problematic_optional_backends
 
-disable_broken_torchao()
+disable_problematic_optional_backends()
 
 from diffusers.models import ModelMixin
 from diffusers.configuration_utils import ConfigMixin, register_to_config

@@ -166,7 +166,7 @@ class Args:
     optimizer (`str`, defaults to `adamw`):
         The optimizer type to use. Choose between ['adam', 'adamw'].
     use_8bit_bnb (`bool`, defaults to `False`):
-        Whether to use 8bit variant of the `optimizer` using `bitsandbytes`.
+        Whether to use the optional 8-bit variant of the `optimizer`.
     lr (`float`, defaults to `1e-4`):
         Initial learning rate (after the potential warmup period) to use.
     scale_lr (`bool`, defaults to `False`):
@@ -852,7 +852,7 @@ def _add_optimizer_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--use_8bit_bnb",
         action="store_true",
-        help=("Whether to use 8bit variant of the `--optimizer` using `bitsandbytes`."),
+        help=("Whether to use the optional 8-bit variant of the `--optimizer`."),
     )
     parser.add_argument(
         "--beta1",

@@ -1,71 +1,52 @@
-import importlib.util
+from importlib import import_module
+from typing import Dict, Tuple
 
-from transformers import AutoTokenizer, T5EncoderModel, T5Tokenizer
+_EXPORTS: Dict[str, Tuple[str, str]] = {
+    "AutoTokenizer": ("transformers", "AutoTokenizer"),
+    "T5Tokenizer": ("transformers", "T5Tokenizer"),
+    "CLIPModel": (".wan_image_encoder", "CLIPModel"),
+    "WanT5EncoderModel": (".wan_text_encoder", "WanT5EncoderModel"),
+    "Wan2_2Transformer3DModel": (".wan_transformer3d", "Wan2_2Transformer3DModel"),
+    "WanSelfAttention": (".wan_transformer3d", "WanSelfAttention"),
+    "WanTransformer3DModel": (".wan_transformer3d", "WanTransformer3DModel"),
+    "CausalWanTransformer3DModelWithConcat": (
+        ".wan_causal_transformer3d_with_conditions",
+        "CausalWanTransformer3DModelWithConcat",
+    ),
+    "WanTransformer3DModelWithConcat": (
+        ".wan_transformer3d_with_conditions",
+        "WanTransformer3DModelWithConcat",
+    ),
+    "MultiViewWanTransformer3DModelWithConcat": (
+        ".wan_transformer3d_multiview",
+        "MultiViewWanTransformer3DModelWithConcat",
+    ),
+    "WanI2VTransformer3DModelWithConcat": (
+        ".wan_transformer3d_i2v_with_conditions",
+        "WanI2VTransformer3DModelWithConcat",
+    ),
+    "WanTransformer3DVace": (".wan_transformer3d_vace", "WanTransformer3DVace"),
+    "VaceWanAttentionBlock": (".wan_transformer3d_vace", "VaceWanAttentionBlock"),
+    "BaseWanAttentionBlock": (".wan_transformer3d_vace", "BaseWanAttentionBlock"),
+    "AutoencoderKLWan": (".wan_vae", "AutoencoderKLWan"),
+    "AutoencoderKLWan_": (".wan_vae", "AutoencoderKLWan_"),
+    "AutoencoderKLWan3_8": (".wan_vae3_8", "AutoencoderKLWan3_8"),
+    "AutoencoderKLWan2_2_": (".wan_vae3_8", "AutoencoderKLWan2_2_"),
+}
 
-# from .cogvideox_transformer3d import CogVideoXTransformer3DModel
-# from .cogvideox_vae import AutoencoderKLCogVideoX
-from .wan_image_encoder import CLIPModel
-from .wan_text_encoder import WanT5EncoderModel
-from .wan_transformer3d import (Wan2_2Transformer3DModel, WanSelfAttention,
-                                WanTransformer3DModel)
-from .wan_causal_transformer3d_with_conditions import (
-    CausalWanTransformer3DModelWithConcat,
-)
-from .wan_transformer3d_with_conditions import WanTransformer3DModelWithConcat
-from .wan_transformer3d_multiview import MultiViewWanTransformer3DModelWithConcat
-from .wan_transformer3d_i2v_with_conditions import WanI2VTransformer3DModelWithConcat
-from .wan_transformer3d_vace import (
-    WanTransformer3DVace,
-    VaceWanAttentionBlock,
-    BaseWanAttentionBlock,
-)
-from .wan_vae import AutoencoderKLWan, AutoencoderKLWan_
-from .wan_vae3_8 import AutoencoderKLWan3_8, AutoencoderKLWan2_2_
+__all__ = sorted(_EXPORTS)
 
-# # The pai_fuser is an internally developed acceleration package, which can be used on PAI.
-# if importlib.util.find_spec("pai_fuser") is not None:
-#     # The simple_wrapper is used to solve the problem about conflicts between cython and torch.compile
-#     def simple_wrapper(func):
-#         def inner(*args, **kwargs):
-#             return func(*args, **kwargs)
-#         return inner
 
-#     from ..dist import parallel_magvit_vae
-#     AutoencoderKLWan_.decode = simple_wrapper(parallel_magvit_vae(0.4, 8)(AutoencoderKLWan_.decode))
-#     AutoencoderKLWan2_2_.decode = simple_wrapper(parallel_magvit_vae(0.4, 16)(AutoencoderKLWan2_2_.decode))
+def __getattr__(name):
+    if name not in _EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
-#     import torch
-#     from pai_fuser.core.attention import wan_sparse_attention_wrapper
-    
-#     WanSelfAttention.forward = simple_wrapper(wan_sparse_attention_wrapper()(WanSelfAttention.forward))
-#     print("Import Sparse Attention")
+    module_name, attr_name = _EXPORTS[name]
+    module = import_module(module_name, __name__) if module_name.startswith(".") else import_module(module_name)
+    value = getattr(module, attr_name)
+    globals()[name] = value
+    return value
 
-#     WanTransformer3DModel.forward = simple_wrapper(WanTransformer3DModel.forward)
 
-#     import os
-#     from pai_fuser.core import (cfg_skip_turbo, disable_cfg_skip,
-#                                 enable_cfg_skip)
-
-#     WanTransformer3DModel.enable_cfg_skip = enable_cfg_skip()(WanTransformer3DModel.enable_cfg_skip)
-#     WanTransformer3DModel.disable_cfg_skip = disable_cfg_skip()(WanTransformer3DModel.disable_cfg_skip)
-#     print("Import CFG Skip Turbo")
-
-#     from pai_fuser.core.rope import ENABLE_KERNEL, fast_rope_apply_qk
-
-#     if ENABLE_KERNEL:
-#         import types
-#         from . import wan_transformer3d
-
-#         def deepcopy_function(f):
-#             return types.FunctionType(f.__code__, f.__globals__, name=f.__name__, argdefs=f.__defaults__,closure=f.__closure__)
-
-#         local_rope_apply_qk = deepcopy_function(wan_transformer3d.rope_apply_qk)
-#         def adaptive_fast_rope_apply_qk(q, k, grid_sizes, freqs):
-#             if torch.is_grad_enabled():
-#                 return local_rope_apply_qk(q, k, grid_sizes, freqs)
-#             else:
-#                 return fast_rope_apply_qk(q, k, grid_sizes, freqs)
-            
-#         wan_transformer3d.rope_apply_qk = adaptive_fast_rope_apply_qk
-#         rope_apply_qk = adaptive_fast_rope_apply_qk
-#         print("Import PAI Fast rope")
+def __dir__():
+    return sorted(set(globals()) | set(__all__))

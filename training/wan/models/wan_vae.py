@@ -5,8 +5,12 @@ from typing import Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from ..diffusers_compat import disable_problematic_optional_backends
+
+disable_problematic_optional_backends()
+
 from diffusers.configuration_utils import ConfigMixin, register_to_config
-from diffusers.loaders.single_file_model import FromOriginalModelMixin
 from diffusers.models.autoencoders.vae import (DecoderOutput,
                                                DiagonalGaussianDistribution)
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
@@ -617,7 +621,7 @@ def _video_vae(z_dim=None, **kwargs):
     return model
 
 
-class AutoencoderKLWan(ModelMixin, ConfigMixin, FromOriginalModelMixin):
+class AutoencoderKLWan(ModelMixin, ConfigMixin):
 
     @register_to_config
     def __init__(

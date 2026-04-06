@@ -27,9 +27,9 @@ from datetime import datetime as dt, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from training.wan.diffusers_compat import disable_broken_torchao
+from training.wan.diffusers_compat import disable_problematic_optional_backends
 
-disable_broken_torchao()
+disable_problematic_optional_backends()
 
 from safetensors.torch import load_file, save_file
 
@@ -2505,7 +2505,7 @@ def main():
             import bitsandbytes as bnb
             optimizer_cls = bnb.optim.AdamW8bit
         except ImportError:
-            raise ImportError("Please install bitsandbytes: pip install bitsandbytes")
+            raise ImportError("Requested optional 8-bit optimizer support, but the required package is unavailable.")
     else:
         optimizer_cls = torch.optim.AdamW
 

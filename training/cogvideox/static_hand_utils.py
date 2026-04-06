@@ -11,9 +11,9 @@ import decord
 import torch
 import torch.nn.functional as F
 
-from training.cogvideox.diffusers_compat import disable_broken_torchao
+from training.cogvideox.diffusers_compat import disable_problematic_optional_backends
 
-disable_broken_torchao()
+disable_problematic_optional_backends()
 
 from diffusers.utils import convert_unet_state_dict_to_peft
 from peft import LoraConfig, get_peft_model_state_dict, set_peft_model_state_dict

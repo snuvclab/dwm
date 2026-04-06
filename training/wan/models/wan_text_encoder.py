@@ -6,8 +6,12 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from ..diffusers_compat import disable_problematic_optional_backends
+
+disable_problematic_optional_backends()
+
 from diffusers.configuration_utils import ConfigMixin
-from diffusers.loaders.single_file_model import FromOriginalModelMixin
 from diffusers.models.modeling_utils import ModelMixin
 
 
@@ -253,7 +257,7 @@ class T5RelativeEmbedding(nn.Module):
         rel_buckets += torch.where(rel_pos < max_exact, rel_pos, rel_pos_large)
         return rel_buckets
 
-class WanT5EncoderModel(ModelMixin, ConfigMixin, FromOriginalModelMixin):
+class WanT5EncoderModel(ModelMixin, ConfigMixin):
     def __init__(self,
                  vocab,
                  dim,

@@ -24,9 +24,9 @@ import PIL
 import PIL.Image
 import torch
 import torch.nn.functional as F
-from training.cogvideox.diffusers_compat import disable_broken_torchao
+from training.cogvideox.diffusers_compat import disable_problematic_optional_backends
 
-disable_broken_torchao()
+disable_problematic_optional_backends()
 
 from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
 from diffusers.image_processor import VaeImageProcessor
