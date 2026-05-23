@@ -139,7 +139,7 @@ python training/cogvideox/inference.py \
 
 ## Acknowledgements
 
-We thank the contributors to [VideoX-Fun](https://github.com/aigc-apps/VideoX-Fun), [finetrainers](https://github.com/huggingface/finetrainers), [CogVideo](https://github.com/zai-org/CogVideo), and [Wan](https://github.com/Wan-Video/Wan2.1) for open-sourcing their work.
+We thank the contributors of [VideoX-Fun](https://github.com/aigc-apps/VideoX-Fun), [finetrainers](https://github.com/huggingface/finetrainers), [CogVideo](https://github.com/zai-org/CogVideo), and [Wan](https://github.com/Wan-Video/Wan2.1) for open-sourcing their work.
 
 ## Citation
 
